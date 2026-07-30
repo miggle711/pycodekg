@@ -50,6 +50,25 @@ class TestSerializeSeedSection:
         assert result["seed"]["module"] == ""
         assert result["seed"]["filepath"] == ""
 
+    def test_seed_does_not_include_decorators(self):
+        """decorators is redundant with source_code (it's the line directly
+        above the 'def', already included verbatim there) and isn't read by
+        kg-test-generation's prompt builder -- dropped from the seed
+        section entirely rather than serialized and ignored
+        (kg_construction#108).
+        """
+        seed_node = {
+            "id": "n1",
+            "label": "send",
+            "type": "method",
+            "metadata": {"decorators": ["staticmethod"], "source_code": "def send(self): ..."},
+        }
+        result = LLMSerializer().serialize(
+            {"seeds": [seed_node], "context_nodes": [], "edges": [], "test_nodes": []}
+        )
+
+        assert "decorators" not in result["seed"]
+
     def test_seed_exceptions_reads_from_raises_metadata_key(self):
         """_build_func_metadata (ast/helpers.py) stores raised exceptions
         under the 'raises' key (never 'exceptions') -- the seed section's
