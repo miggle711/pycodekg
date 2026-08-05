@@ -8,6 +8,7 @@ docs/PAPER.md
 scripts/*
 !scripts/validate_testgeneval_sample.py
 !scripts/build_kgs_for_instances.py
+!scripts/build_kg_prompts.py
 
 # kg_output
 kg_output/
