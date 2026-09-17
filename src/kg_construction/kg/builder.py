@@ -20,7 +20,7 @@ Output format:
     {
         "nodes": [{"id": ..., "type": ..., "label": ..., "metadata": {...}}, ...],
         "edges": [{"source": ..., "target": ..., "relation": ..., "metadata": {...}}, ...],
-        "metadata": {"repo": ..., "base_commit": ..., "file_count": ..., "parse_mode": "source", "schema_version": ...,
+        "metadata": {"repo": ..., "base_commit": ..., "file_count": ..., "total_lines_of_code": ..., "parse_mode": "source", "schema_version": ...,
                      "build_time_parsing_s": ..., "build_time_resolution_s": ...}
     }
 
@@ -720,6 +720,7 @@ class RepoASTParser:
         """
         parse_start = time.perf_counter()
         file_args = self._collect_files(repo, repo_dir)
+        total_lines_of_code = self._count_lines(file_args)
         results = self._run_parallel_parse(file_args)
         parsing_time_s = time.perf_counter() - parse_start
 
@@ -738,6 +739,7 @@ class RepoASTParser:
             'metadata': {
                 'repo': repo,
                 'file_count': len(file_args),
+                'total_lines_of_code': total_lines_of_code,
                 'parse_mode': 'source',
                 'build_time_parsing_s': round(parsing_time_s, 3),
                 'build_time_resolution_s': round(resolution_time_s, 3),
@@ -812,6 +814,28 @@ class RepoASTParser:
         # vary between separate builds of the same repo+commit.
         file_args.sort(key=lambda args: args[1])
         return file_args
+
+    def _count_lines(self, file_args: List[Tuple[str, str, str]]) -> int:
+        """Sum real line counts across every file _collect_files returned.
+
+        RQ4 instrumentation (docs/EXPERIMENT_PLAN.md's RQ4 instrumentation
+        section): build timing is only meaningful normalized against real
+        code size, not file_count alone (a 50-line file and a 5000-line
+        file both count as '1' there). Read synchronously in the main
+        process, not part of _run_parallel_parse's worker pool -- this is
+        a plain line count, no AST work, and keeping it out of the
+        parallel path avoids touching that pool's existing behavior.
+        A file that fails to decode (rare, e.g. real encoding issues)
+        contributes 0 rather than aborting the whole count.
+        """
+        total = 0
+        for _repo, _rel_path, abs_path in file_args:
+            try:
+                with open(abs_path, 'r', encoding='utf-8', errors='ignore') as f:
+                    total += sum(1 for _ in f)
+            except OSError:
+                continue
+        return total
 
     def _run_parallel_parse(self, file_args: List[Tuple[str, str, str]]) -> List[Dict]:
         """Run _parse_file in parallel via ProcessPoolExecutor.
