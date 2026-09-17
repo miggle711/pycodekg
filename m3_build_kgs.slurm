@@ -76,4 +76,17 @@ KG_BUILD_END=$(date +%s)
 echo "KG build time: $((KG_BUILD_END - KG_BUILD_START))s"
 
 echo "Done. kg_output/ is in $SLURM_SUBMIT_DIR"
+
+# Non-fatal: aggregate_build_times.py summarizes real per-repo build
+# timing already saved in kg_output/'s own KG files (build_time_parsing_s/
+# build_time_resolution_s, RQ4 instrumentation), nothing this job's own
+# success depends on. Piped through `|| true` deliberately -- this
+# script's own sys.exit(...) on "no timing data found" would otherwise
+# propagate under this file's `set -euo pipefail` above and mark the
+# whole job FAILED in sacct, even though the real, valuable work (KG
+# building) already succeeded cleanly.
+echo "---- Aggregating build times ----"
+PYTHONPATH=src python3 scripts/aggregate_build_times.py \
+  --kg-dir kg_output --out build_times.csv || echo "  (aggregation skipped/failed, not fatal -- run it manually if needed)"
+
 echo "Next: submit m3_build_kg_prompts.slurm (once per depth you want)."
