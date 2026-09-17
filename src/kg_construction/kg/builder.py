@@ -20,7 +20,8 @@ Output format:
     {
         "nodes": [{"id": ..., "type": ..., "label": ..., "metadata": {...}}, ...],
         "edges": [{"source": ..., "target": ..., "relation": ..., "metadata": {...}}, ...],
-        "metadata": {"repo": ..., "base_commit": ..., "file_count": ..., "parse_mode": "source", "schema_version": ...}
+        "metadata": {"repo": ..., "base_commit": ..., "file_count": ..., "parse_mode": "source", "schema_version": ...,
+                     "build_time_parsing_s": ..., "build_time_resolution_s": ...}
     }
 
 Usage:
@@ -44,6 +45,7 @@ import ast
 import json
 import re
 import tempfile
+import time
 from pathlib import Path
 from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor
@@ -700,6 +702,15 @@ class RepoASTParser:
             Pass 2 (sequential): Aggregate nodes, build name→id indices,
                 resolve edges, add call context.
 
+        Timing (RQ4 instrumentation, docs/EXPERIMENT_PLAN.md's RQ4
+        instrumentation section): 'build_time_parsing_s' covers file
+        discovery plus Pass 1 (the parallel AST-parse);
+        'build_time_resolution_s' covers everything after (Pass 1.5 if
+        infer_types is on, plus Pass 2's aggregation/edge-resolution/
+        call-context steps). Wall-clock via time.perf_counter(), not CPU
+        time, so Pass 1's real parallelism is reflected (multiple worker
+        processes overlapping) rather than summed as if sequential.
+
         Args:
             repo: Repository name (e.g. 'psf/requests').
             repo_dir: Root of extracted source tree.
@@ -707,15 +718,19 @@ class RepoASTParser:
         Returns:
             KG dict: {'nodes': [...], 'edges': [...], 'metadata': {...}}
         """
+        parse_start = time.perf_counter()
         file_args = self._collect_files(repo, repo_dir)
         results = self._run_parallel_parse(file_args)
+        parsing_time_s = time.perf_counter() - parse_start
 
+        resolution_start = time.perf_counter()
         if self.infer_types:
             self._inject_inferred_uses_edges(results, repo_dir)
 
         all_nodes, all_edges, indices = self._aggregate_and_index(results)
         all_edges = self._resolve_edges(all_nodes, all_edges, indices)
         self._add_call_context(all_nodes, all_edges)
+        resolution_time_s = time.perf_counter() - resolution_start
 
         return {
             'nodes': all_nodes,
@@ -724,6 +739,8 @@ class RepoASTParser:
                 'repo': repo,
                 'file_count': len(file_args),
                 'parse_mode': 'source',
+                'build_time_parsing_s': round(parsing_time_s, 3),
+                'build_time_resolution_s': round(resolution_time_s, 3),
             }
         }
 

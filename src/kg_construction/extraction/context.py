@@ -16,6 +16,7 @@ Works generically across any dataset with the standard schema.
 
 import ast
 import json
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Dict, Optional, Set, Tuple
@@ -56,6 +57,12 @@ class TestContext:
             stored, pre-patch value). Empty in the normal case -- non-empty
             means a real run should look into why, not just that this one
             instance's seed source is stale.
+        retrieval_time_s: Wall-clock seconds TestContextExtractor.extract()
+            took for this one instance (RQ4 instrumentation, docs/
+            EXPERIMENT_PLAN.md's RQ4 instrumentation section -- per-instance
+            retrieval overhead, distinct from KG build.builder.py's one-time
+            build_time_parsing_s/build_time_resolution_s). None if this
+            TestContext was constructed some other way (e.g. load()).
     """
     seeds: List[Dict]
     context_nodes: List[Dict]
@@ -64,6 +71,7 @@ class TestContext:
     repo: str
     base_commit: str
     stale_seed_labels: List[str] = field(default_factory=list)
+    retrieval_time_s: Optional[float] = None
 
     def save(self, path: str) -> None:
         """Save subgraph to JSON for debugging.
@@ -83,7 +91,8 @@ class TestContext:
                 'num_context_nodes': len(self.context_nodes),
                 'num_edges': len(self.edges),
                 'num_test_nodes': len(self.test_nodes),
-            }
+            },
+            'retrieval_time_s': self.retrieval_time_s,
         }
         Path(path).write_text(json.dumps(data, indent=2))
         print(f"✓ Saved subgraph to {path}")
@@ -106,6 +115,7 @@ class TestContext:
             test_nodes=data['test_nodes'],
             repo=data['repo'],
             base_commit=data['base_commit'],
+            retrieval_time_s=data.get('retrieval_time_s'),
         )
 
     def summary(self) -> str:
@@ -161,6 +171,34 @@ class TestContextExtractor:
         self.repo_manager = repo_manager or RepoManager()
 
     def extract(
+        self,
+        instance: Dict,
+        depth: int = 2,
+        edge_filter: Optional[Set[str]] = None,
+        include_seed_imports: bool = True,
+    ) -> TestContext:
+        """Extract a KG subgraph from a dataset instance.
+
+        Thin timing wrapper around _extract_impl (RQ4 instrumentation,
+        docs/EXPERIMENT_PLAN.md's RQ4 instrumentation section --
+        per-instance retrieval overhead). Wraps rather than inlines so
+        both _extract_impl's own return path and the
+        _extract_for_new_file early-exit path (kg_construction#93) get
+        timed identically, from one place, without duplicating a
+        start/stop pair into each. See _extract_impl for the real
+        argument/return documentation, unchanged below.
+        """
+        start = time.perf_counter()
+        result = self._extract_impl(
+            instance,
+            depth=depth,
+            edge_filter=edge_filter,
+            include_seed_imports=include_seed_imports,
+        )
+        result.retrieval_time_s = round(time.perf_counter() - start, 4)
+        return result
+
+    def _extract_impl(
         self,
         instance: Dict,
         depth: int = 2,
