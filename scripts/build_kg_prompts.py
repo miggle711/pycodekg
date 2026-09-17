@@ -187,6 +187,13 @@ def main():
     # nothing downstream that reads the main kg_prompts_depthN.json schema
     # needs to change.
     retrieval_times = {}
+    # RQ2 instrumentation (docs/EXPERIMENT_PLAN.md, miggle711/pycodekg#147):
+    # localization_outcome/node_count/edge_count/cross_file_node_proportion/
+    # relationship_type_counts are all computed by extractor.extract() below,
+    # same reasoning as retrieval_times above -- recorded for any instance
+    # where extract() itself completed, even if serialization later fails
+    # that instance out of `prompts`.
+    localization_stats = {}
 
     for row in rows:
         repo_slug = _repo_slug(row["repo"])
@@ -210,6 +217,13 @@ def main():
             }
             context = extractor.extract(instance, depth=args.depth)
             retrieval_times[row["id"]] = context.retrieval_time_s
+            localization_stats[row["id"]] = {
+                "localization_outcome": context.localization_outcome,
+                "node_count": context.node_count,
+                "edge_count": context.edge_count,
+                "cross_file_node_proportion": context.cross_file_node_proportion,
+                "relationship_type_counts": context.relationship_type_counts,
+            }
             if context.stale_seed_labels:
                 stale_seed_instances.append((row["id"], context.stale_seed_labels))
             context_dict = {
@@ -247,6 +261,12 @@ def main():
     with open(retrieval_times_path, "w") as f:
         json.dump(retrieval_times, f, indent=2)
 
+    localization_stats_path = Path(args.output).with_name(
+        Path(args.output).stem + "_localization_stats.json"
+    )
+    with open(localization_stats_path, "w") as f:
+        json.dump(localization_stats, f, indent=2)
+
     print(f"\n{len(prompts)}/{len(rows)} prompts built -> {args.output}")
     if retrieval_times:
         values = list(retrieval_times.values())
@@ -254,6 +274,34 @@ def main():
             f"{len(retrieval_times)} retrieval times -> {retrieval_times_path} "
             f"(mean {sum(values) / len(values):.4f}s, "
             f"min {min(values):.4f}s, max {max(values):.4f}s)"
+        )
+    if localization_stats:
+        outcome_counts = {}
+        node_counts = []
+        edge_counts = []
+        cross_file_props = []
+        for stats in localization_stats.values():
+            outcome = stats["localization_outcome"]
+            outcome_counts[outcome] = outcome_counts.get(outcome, 0) + 1
+            node_counts.append(stats["node_count"])
+            edge_counts.append(stats["edge_count"])
+            cross_file_props.append(stats["cross_file_node_proportion"])
+        print(
+            f"{len(localization_stats)} localization/retrieval stats -> "
+            f"{localization_stats_path}"
+        )
+        print(f"  localization_outcome: {outcome_counts}")
+        print(
+            f"  node_count: mean {sum(node_counts) / len(node_counts):.1f}  "
+            f"min {min(node_counts)}  max {max(node_counts)}"
+        )
+        print(
+            f"  edge_count: mean {sum(edge_counts) / len(edge_counts):.1f}  "
+            f"min {min(edge_counts)}  max {max(edge_counts)}"
+        )
+        print(
+            f"  cross_file_node_proportion: mean "
+            f"{sum(cross_file_props) / len(cross_file_props):.3f}"
         )
     if failures:
         print(f"{len(failures)} failures:")
