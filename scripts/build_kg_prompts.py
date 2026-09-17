@@ -177,6 +177,16 @@ def main():
     failures = []
     stale_seed_instances = []
     multi_seed_instances = []
+    # RQ4 instrumentation (docs/EXPERIMENT_PLAN.md's RQ4 instrumentation
+    # section, per-instance retrieval overhead): TestContext.retrieval_time_s
+    # is computed by extractor.extract() below regardless of what happens
+    # afterward, so it's recorded for any instance where extract() itself
+    # completed, even if serialization later fails that instance out of
+    # `prompts` -- retrieval work still genuinely happened and took real
+    # time. Written to a sidecar file, not merged into `prompts` itself, so
+    # nothing downstream that reads the main kg_prompts_depthN.json schema
+    # needs to change.
+    retrieval_times = {}
 
     for row in rows:
         repo_slug = _repo_slug(row["repo"])
@@ -199,6 +209,7 @@ def main():
                 "test_file": row["test_file"],
             }
             context = extractor.extract(instance, depth=args.depth)
+            retrieval_times[row["id"]] = context.retrieval_time_s
             if context.stale_seed_labels:
                 stale_seed_instances.append((row["id"], context.stale_seed_labels))
             context_dict = {
@@ -230,7 +241,20 @@ def main():
     with open(args.output, "w") as f:
         json.dump(prompts, f, indent=2)
 
+    retrieval_times_path = Path(args.output).with_name(
+        Path(args.output).stem + "_retrieval_times.json"
+    )
+    with open(retrieval_times_path, "w") as f:
+        json.dump(retrieval_times, f, indent=2)
+
     print(f"\n{len(prompts)}/{len(rows)} prompts built -> {args.output}")
+    if retrieval_times:
+        values = list(retrieval_times.values())
+        print(
+            f"{len(retrieval_times)} retrieval times -> {retrieval_times_path} "
+            f"(mean {sum(values) / len(values):.4f}s, "
+            f"min {min(values):.4f}s, max {max(values):.4f}s)"
+        )
     if failures:
         print(f"{len(failures)} failures:")
         for instance_id, err in failures:
