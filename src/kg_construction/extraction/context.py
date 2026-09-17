@@ -63,6 +63,26 @@ class TestContext:
             retrieval overhead, distinct from KG build.builder.py's one-time
             build_time_parsing_s/build_time_resolution_s). None if this
             TestContext was constructed some other way (e.g. load()).
+        localization_outcome: RQ2 instrumentation (docs/EXPERIMENT_PLAN.md,
+            miggle711/pycodekg#147) -- 'all'/'some'/'none' of the patch's
+            changed entities resolved to a real KG node as a seed ('none'
+            also covers the patch naming no entities at all -- seed_ids
+            falls back to the whole code_file as a single seed either
+            way, this field is what tells the two cases apart), or
+            'new_file' when the patch creates the file itself
+            (kg_construction#93) -- there's no pre-existing KG entry to
+            resolve against at all in that case, a fundamentally
+            different situation from a failed resolution.
+        node_count: Total subgraph size (len(seeds) + len(context_nodes)).
+        edge_count: Total subgraph edges (len(edges)).
+        cross_file_node_proportion: Fraction of context_nodes (not seeds,
+            which are always in the focal file by construction) whose
+            filepath differs from the seed's own code_file. 0.0 if
+            context_nodes is empty.
+        relationship_type_counts: Count of subgraph edges per relation
+            type (e.g. {'calls': 12, 'contains': 8, ...}) -- the source
+            data for the paper's callers/callees/siblings/class-related
+            breakdown.
     """
     seeds: List[Dict]
     context_nodes: List[Dict]
@@ -72,6 +92,11 @@ class TestContext:
     base_commit: str
     stale_seed_labels: List[str] = field(default_factory=list)
     retrieval_time_s: Optional[float] = None
+    localization_outcome: Optional[str] = None
+    node_count: Optional[int] = None
+    edge_count: Optional[int] = None
+    cross_file_node_proportion: Optional[float] = None
+    relationship_type_counts: Optional[Dict[str, int]] = None
 
     def save(self, path: str) -> None:
         """Save subgraph to JSON for debugging.
@@ -93,6 +118,11 @@ class TestContext:
                 'num_test_nodes': len(self.test_nodes),
             },
             'retrieval_time_s': self.retrieval_time_s,
+            'localization_outcome': self.localization_outcome,
+            'node_count': self.node_count,
+            'edge_count': self.edge_count,
+            'cross_file_node_proportion': self.cross_file_node_proportion,
+            'relationship_type_counts': self.relationship_type_counts,
         }
         Path(path).write_text(json.dumps(data, indent=2))
         print(f"✓ Saved subgraph to {path}")
@@ -116,6 +146,11 @@ class TestContext:
             repo=data['repo'],
             base_commit=data['base_commit'],
             retrieval_time_s=data.get('retrieval_time_s'),
+            localization_outcome=data.get('localization_outcome'),
+            node_count=data.get('node_count'),
+            edge_count=data.get('edge_count'),
+            cross_file_node_proportion=data.get('cross_file_node_proportion'),
+            relationship_type_counts=data.get('relationship_type_counts'),
         )
 
     def summary(self) -> str:
@@ -309,6 +344,7 @@ class TestContextExtractor:
         # (str, Optional[str]) tuple would raise TypeError comparing
         # None to str, so sort on a key that substitutes "" for None.
         seed_ids: List[str] = []
+        resolved_entity_count = 0
         for name, enclosing_class in sorted(changed, key=lambda pair: (pair[0], pair[1] or "")):
             funcs = self.engine.find_function_by_name(name)
             # Filter to only those in the code_file
@@ -347,8 +383,18 @@ class TestContextExtractor:
                     if cls['metadata'].get('filepath') == instance['code_file']
                 ]
 
+            if matches:
+                resolved_entity_count += 1
             for func in matches:
                 seed_ids.append(func['id'])
+
+        total_changed_entities = len(changed)
+        if total_changed_entities == 0 or resolved_entity_count == 0:
+            localization_outcome = "none"
+        elif resolved_entity_count == total_changed_entities:
+            localization_outcome = "all"
+        else:
+            localization_outcome = "some"
 
         # If no changed functions found, use the code_file itself as seed
         if not seed_ids:
@@ -421,6 +467,25 @@ class TestContextExtractor:
                 stale_seed_labels.append(n['label'])
         context_nodes = [n for n in subgraph_nodes if n['id'] not in seed_node_ids]
 
+        # RQ2 instrumentation (miggle711/pycodekg#147): node metadata
+        # spells the file path differently depending on node type --
+        # 'filepath' for function/method/class/test_function nodes,
+        # 'path' for file/test_file nodes themselves (see builder.py's
+        # node construction) -- checking both covers every node type
+        # that can end up in context_nodes.
+        cross_file_nodes = sum(
+            1 for n in context_nodes
+            if (n.get('metadata', {}).get('filepath') or n.get('metadata', {}).get('path'))
+            not in (None, instance['code_file'])
+        )
+        cross_file_node_proportion = (
+            cross_file_nodes / len(context_nodes) if context_nodes else 0.0
+        )
+        relationship_type_counts: Dict[str, int] = {}
+        for edge in subgraph_edges:
+            rel = edge['relation']
+            relationship_type_counts[rel] = relationship_type_counts.get(rel, 0) + 1
+
         return TestContext(
             seeds=seed_nodes,
             context_nodes=context_nodes,
@@ -429,6 +494,11 @@ class TestContextExtractor:
             repo=instance['repo'],
             base_commit=instance['base_commit'],
             stale_seed_labels=stale_seed_labels,
+            localization_outcome=localization_outcome,
+            node_count=len(seed_nodes) + len(context_nodes),
+            edge_count=len(subgraph_edges),
+            cross_file_node_proportion=cross_file_node_proportion,
+            relationship_type_counts=relationship_type_counts,
         )
 
     def _refresh_seed_source(
@@ -544,6 +614,11 @@ class TestContextExtractor:
             test_nodes=[],
             repo=instance['repo'],
             base_commit=instance['base_commit'],
+            localization_outcome="new_file",
+            node_count=len(seed_nodes),
+            edge_count=0,
+            cross_file_node_proportion=0.0,
+            relationship_type_counts={},
         )
 
     def _add_seed_imports(

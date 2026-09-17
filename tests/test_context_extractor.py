@@ -699,3 +699,333 @@ class TestNestedSeedSourceIsPostPatch:
         assert "NEW_VALUE" in seed["metadata"]["source_code"]
         assert "OLD_VALUE" not in seed["metadata"]["source_code"]
         assert context.stale_seed_labels == []
+
+
+class _FixedContentRepoManager(RepoManager):
+    """Returns a fixed source string for read_file_at_commit regardless of
+    repo/commit/path -- used to simulate the KG being built from a
+    DIFFERENT (older/shorter) version of a file than what patch parsing
+    resolves changed entities against, so a real, correctly-identified
+    changed entity can still fail KG lookup deterministically.
+    """
+
+    def __init__(self, source: str):
+        self._source = source
+
+    def read_file_at_commit(self, repo: str, commit: str, path: str) -> str:
+        return self._source
+
+
+class TestLocalizationOutcome:
+    """RQ2 instrumentation (miggle711/pycodekg#147): localization_outcome
+    reports whether all, some, or none of a patch's changed entities
+    resolved to a real KG node, distinct from seed_ids' own fallback
+    behavior (which always produces at least one seed, the whole file,
+    even when nothing resolved -- localization_outcome is what actually
+    distinguishes "nothing to resolve" from "resolution genuinely failed").
+    """
+
+    def test_outcome_is_all_when_every_changed_entity_resolves(self, tmp_path):
+        repo_dir = _write_repo(tmp_path)
+        parser = RepoASTParser(max_workers=1)
+        kg = parser.parse_repo("test/repo", repo_dir)
+
+        engine = KGQueryEngine(kg)
+        extractor = TestContextExtractor(engine, repo_manager=_LocalFileRepoManager(repo_dir))
+
+        patch = (
+            "--- a/mod.py\n"
+            "+++ b/mod.py\n"
+            "@@ -2,3 +2,3 @@\n"
+            "     def build(self):\n"
+            "-        return self.helper()\n"
+            "+        return self.helper() + 1\n"
+        )
+        instance = {
+            "repo": "test/repo",
+            "base_commit": "deadbeef",
+            "patch": patch,
+            "code_file": "mod.py",
+            "test_file": "test_mod.py",
+        }
+
+        context = extractor.extract(instance, depth=2)
+        assert context.localization_outcome == "all"
+
+    def test_outcome_is_none_when_patch_names_no_entities_in_code_file(self, tmp_path):
+        # Same shape as TestSeedSourceIsPostPatch's stale-seed-labels test:
+        # the patch has hunks only for a different file, so
+        # extract_changed_functions_with_scope finds nothing for mod.py --
+        # seed_ids still falls back to the file itself, but
+        # localization_outcome must report "none", not "all".
+        repo_dir = self._write_pre_patch_repo(tmp_path)
+        parser = RepoASTParser(max_workers=1)
+        kg = parser.parse_repo("test/repo", repo_dir)
+
+        engine = KGQueryEngine(kg)
+        extractor = TestContextExtractor(engine, repo_manager=_LocalFileRepoManager(repo_dir))
+
+        patch = (
+            "--- a/other.py\n"
+            "+++ b/other.py\n"
+            "@@ -1,1 +1,1 @@\n"
+            "-old\n"
+            "+new\n"
+        )
+        instance = {
+            "repo": "test/repo",
+            "base_commit": "deadbeef",
+            "patch": patch,
+            "code_file": "mod.py",
+            "test_file": "test_mod.py",
+        }
+
+        context = extractor.extract(instance, depth=2)
+        assert context.localization_outcome == "none"
+
+    def _write_pre_patch_repo(self, tmp_path: Path) -> Path:
+        (tmp_path / "mod.py").write_text(
+            "class Widget:\n"
+            "    def build(self):\n"
+            "        return 1\n"
+        )
+        return tmp_path
+
+    def test_outcome_is_some_when_kg_is_missing_one_of_two_changed_entities(self, tmp_path):
+        # The KG is built from a SHORTER version of mod.py (only 'build'),
+        # simulating real drift between the KG's build-time snapshot and
+        # the live source patch parsing resolves against (RepoManager
+        # here returns an EXTENDED version with a second real function,
+        # 'extra_func', that the KG genuinely has no node for). Both
+        # entities are real, correctly-identified changed entities --
+        # 'build' resolves, 'extra_func' cannot, deterministically.
+        repo_dir = tmp_path
+        (repo_dir / "mod.py").write_text(
+            "class Widget:\n"
+            "    def build(self):\n"
+            "        return 1\n"
+        )
+        parser = RepoASTParser(max_workers=1)
+        kg = parser.parse_repo("test/repo", repo_dir)
+
+        extended_source = (
+            "class Widget:\n"
+            "    def build(self):\n"
+            "        return 1\n"
+            "\n"
+            "def extra_func():\n"
+            "    return 2\n"
+        )
+        engine = KGQueryEngine(kg)
+        extractor = TestContextExtractor(
+            engine, repo_manager=_FixedContentRepoManager(extended_source)
+        )
+
+        patch = (
+            "--- a/mod.py\n"
+            "+++ b/mod.py\n"
+            "@@ -2,3 +2,3 @@\n"
+            "     def build(self):\n"
+            "-        return 1\n"
+            "+        return 10\n"
+            "@@ -5,3 +5,3 @@\n"
+            " def extra_func():\n"
+            "-    return 2\n"
+            "+    return 20\n"
+        )
+        instance = {
+            "repo": "test/repo",
+            "base_commit": "deadbeef",
+            "patch": patch,
+            "code_file": "mod.py",
+            "test_file": "test_mod.py",
+        }
+
+        context = extractor.extract(instance, depth=2)
+        assert context.localization_outcome == "some"
+
+    def test_outcome_is_new_file_for_a_newly_created_file(self, tmp_path):
+        repo_dir = _write_repo(tmp_path)
+        parser = RepoASTParser(max_workers=1)
+        kg = parser.parse_repo("test/repo", repo_dir)
+
+        engine = KGQueryEngine(kg)
+        extractor = TestContextExtractor(engine, repo_manager=_LocalFileRepoManager(repo_dir))
+
+        patch = (
+            "diff --git a/new_mod.py b/new_mod.py\n"
+            "new file mode 100644\n"
+            "index 0000000..1234567\n"
+            "--- /dev/null\n"
+            "+++ b/new_mod.py\n"
+            "@@ -0,0 +1,2 @@\n"
+            "+def brand_new():\n"
+            "+    return 1\n"
+        )
+        instance = {
+            "repo": "test/repo",
+            "base_commit": "deadbeef",
+            "patch": patch,
+            "code_file": "new_mod.py",
+            "test_file": "test_new_mod.py",
+        }
+
+        context = extractor.extract(instance, depth=2)
+        assert context.localization_outcome == "new_file"
+        # The new-file path does no KG lookup/BFS at all -- these must be
+        # trivially empty/zero, not left as None.
+        assert context.node_count == len(context.seeds)
+        assert context.edge_count == 0
+        assert context.cross_file_node_proportion == 0.0
+        assert context.relationship_type_counts == {}
+
+
+class TestRetrievedSubgraphStats:
+    """RQ2 instrumentation (miggle711/pycodekg#147): node_count/edge_count/
+    relationship_type_counts/cross_file_node_proportion describe what the
+    BFS subgraph actually retrieved, for the paper's per-instance
+    retrieval-quality reporting.
+    """
+
+    def test_node_and_edge_counts_are_positive_and_consistent(self, tmp_path):
+        repo_dir = _write_repo(tmp_path)
+        parser = RepoASTParser(max_workers=1)
+        kg = parser.parse_repo("test/repo", repo_dir)
+
+        engine = KGQueryEngine(kg)
+        extractor = TestContextExtractor(engine, repo_manager=_LocalFileRepoManager(repo_dir))
+
+        patch = (
+            "--- a/mod.py\n"
+            "+++ b/mod.py\n"
+            "@@ -2,3 +2,3 @@\n"
+            "     def build(self):\n"
+            "-        return self.helper()\n"
+            "+        return self.helper() + 1\n"
+        )
+        instance = {
+            "repo": "test/repo",
+            "base_commit": "deadbeef",
+            "patch": patch,
+            "code_file": "mod.py",
+            "test_file": "test_mod.py",
+        }
+
+        context = extractor.extract(instance, depth=2)
+
+        # node_count/edge_count must reflect the real subgraph size, not
+        # placeholder values -- helper (a real callee) is guaranteed
+        # reachable at depth 2 (see TestContextExtractorEndToEnd), so
+        # there must be at least the seed itself plus that one context node.
+        assert context.node_count == len(context.seeds) + len(context.context_nodes)
+        assert context.node_count >= 2
+        assert context.edge_count == len(context.edges)
+        assert context.edge_count > 0
+
+    def test_relationship_type_counts_matches_real_edges(self, tmp_path):
+        repo_dir = _write_repo(tmp_path)
+        parser = RepoASTParser(max_workers=1)
+        kg = parser.parse_repo("test/repo", repo_dir)
+
+        engine = KGQueryEngine(kg)
+        extractor = TestContextExtractor(engine, repo_manager=_LocalFileRepoManager(repo_dir))
+
+        patch = (
+            "--- a/mod.py\n"
+            "+++ b/mod.py\n"
+            "@@ -2,3 +2,3 @@\n"
+            "     def build(self):\n"
+            "-        return self.helper()\n"
+            "+        return self.helper() + 1\n"
+        )
+        instance = {
+            "repo": "test/repo",
+            "base_commit": "deadbeef",
+            "patch": patch,
+            "code_file": "mod.py",
+            "test_file": "test_mod.py",
+        }
+
+        context = extractor.extract(instance, depth=2)
+
+        assert sum(context.relationship_type_counts.values()) == len(context.edges)
+        # build() calls helper() -- a real 'calls' edge is guaranteed here.
+        assert context.relationship_type_counts.get("calls", 0) >= 1
+
+    def test_cross_file_node_proportion_is_zero_when_everything_in_one_file(self, tmp_path):
+        repo_dir = _write_repo(tmp_path)
+        parser = RepoASTParser(max_workers=1)
+        kg = parser.parse_repo("test/repo", repo_dir)
+
+        engine = KGQueryEngine(kg)
+        extractor = TestContextExtractor(engine, repo_manager=_LocalFileRepoManager(repo_dir))
+
+        patch = (
+            "--- a/mod.py\n"
+            "+++ b/mod.py\n"
+            "@@ -2,3 +2,3 @@\n"
+            "     def build(self):\n"
+            "-        return self.helper()\n"
+            "+        return self.helper() + 1\n"
+        )
+        instance = {
+            "repo": "test/repo",
+            "base_commit": "deadbeef",
+            "patch": patch,
+            "code_file": "mod.py",
+            "test_file": "test_mod.py",
+        }
+
+        context = extractor.extract(instance, depth=2)
+        assert context.cross_file_node_proportion == 0.0
+
+    def test_cross_file_node_proportion_is_positive_when_context_spans_files(self, tmp_path):
+        # Inheritance across two files -- 'inherits' edges resolve by a
+        # simple repo-wide class-name lookup (builder.py's
+        # class_label_to_ids), not an import-map heuristic, so this is a
+        # reliable way to guarantee a real cross-file context node
+        # (BaseWidget, in base.py) without depending on how bare-name
+        # call resolution happens to handle imports.
+        (tmp_path / "base.py").write_text(
+            "class BaseWidget:\n"
+            "    def base_method(self):\n"
+            "        return 0\n"
+        )
+        (tmp_path / "mod.py").write_text(
+            "from base import BaseWidget\n"
+            "\n"
+            "class Widget(BaseWidget):\n"
+            "    def build(self):\n"
+            "        return 1\n"
+        )
+        parser = RepoASTParser(max_workers=1)
+        kg = parser.parse_repo("test/repo", tmp_path)
+
+        engine = KGQueryEngine(kg)
+        extractor = TestContextExtractor(engine, repo_manager=_LocalFileRepoManager(tmp_path))
+
+        patch = (
+            "--- a/mod.py\n"
+            "+++ b/mod.py\n"
+            "@@ -3,3 +3,3 @@\n"
+            " class Widget(BaseWidget):\n"
+            "     def build(self):\n"
+            "-        return 1\n"
+            "+        return 10\n"
+        )
+        instance = {
+            "repo": "test/repo",
+            "base_commit": "deadbeef",
+            "patch": patch,
+            "code_file": "mod.py",
+            "test_file": "test_mod.py",
+        }
+
+        context = extractor.extract(instance, depth=2)
+
+        context_files = {
+            n.get("metadata", {}).get("filepath") or n.get("metadata", {}).get("path")
+            for n in context.context_nodes
+        }
+        assert "base.py" in context_files
+        assert context.cross_file_node_proportion > 0.0
