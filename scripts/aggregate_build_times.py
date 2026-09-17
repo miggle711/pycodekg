@@ -1,11 +1,13 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 
 """Aggregate per-repository KG build timing (build_time_parsing_s /
-build_time_resolution_s) and real code-size normalization
-(total_lines_of_code, build_time_total_s_per_kloc) out of a kg_output/
-directory of already-built kg_<repo>_<commit>.json files, for RQ4's
-one-time KG construction cost (docs/EXPERIMENT_PLAN.md's RQ4
-instrumentation section).
+build_time_resolution_s), real input-size normalization
+(total_lines_of_code, build_time_total_s_per_kloc), and real
+output-size normalization (node_count/edge_count,
+build_time_total_s_per_1k_nodes/_edges) out of a kg_output/ directory
+of already-built kg_<repo>_<commit>.json files, for RQ4's one-time KG
+construction cost (docs/EXPERIMENT_PLAN.md's RQ4 instrumentation
+section).
 
 RepoASTParser.parse_repo() (kg/builder.py) writes these fields into
 every KG's own metadata as it's built -- nothing is silently discarded
@@ -57,6 +59,8 @@ def main():
             continue
         total_s = parsing_s + resolution_s
         loc = metadata.get("total_lines_of_code")
+        node_count = metadata.get("node_count")
+        edge_count = metadata.get("edge_count")
         rows.append(
             {
                 "file": os.path.basename(path),
@@ -64,6 +68,8 @@ def main():
                 "base_commit": metadata.get("base_commit", ""),
                 "file_count": metadata.get("file_count", ""),
                 "total_lines_of_code": loc if loc is not None else "",
+                "node_count": node_count if node_count is not None else "",
+                "edge_count": edge_count if edge_count is not None else "",
                 "build_time_parsing_s": parsing_s,
                 "build_time_resolution_s": resolution_s,
                 "build_time_total_s": round(total_s, 3),
@@ -74,6 +80,16 @@ def main():
                 # existed, so it isn't silently misread as "0s per kLOC".
                 "build_time_total_s_per_kloc": (
                     round(total_s / (loc / 1000), 4) if loc else ""
+                ),
+                # Output-size normalization: distinguishes "this repo has
+                # a lot of source" from "this repo produces a lot of
+                # graph" -- a repo can be large in one and modest in the
+                # other. Blank, not 0, for the same reason as above.
+                "build_time_total_s_per_1k_nodes": (
+                    round(total_s / (node_count / 1000), 4) if node_count else ""
+                ),
+                "build_time_total_s_per_1k_edges": (
+                    round(total_s / (edge_count / 1000), 4) if edge_count else ""
                 ),
             }
         )
@@ -102,20 +118,30 @@ def main():
         f"  resolution: mean {sum(resolution_vals) / len(resolution_vals):.3f}s  "
         f"min {min(resolution_vals):.3f}s  max {max(resolution_vals):.3f}s"
     )
-    per_kloc_vals = [
-        r["build_time_total_s_per_kloc"] for r in rows if r["build_time_total_s_per_kloc"] != ""
-    ]
-    if per_kloc_vals:
-        print(
-            f"  per kLOC:   mean {sum(per_kloc_vals) / len(per_kloc_vals):.4f}s/kLOC  "
-            f"min {min(per_kloc_vals):.4f}s/kLOC  max {max(per_kloc_vals):.4f}s/kLOC"
-        )
-    no_loc = len(rows) - len(per_kloc_vals)
-    if no_loc:
-        print(
-            f"  {no_loc} KG(s) have timing but no total_lines_of_code "
-            f"(built before that field existed) -- excluded from the per-kLOC stats above."
-        )
+
+    def _print_normalized_summary(field: str, label: str, unit: str, source_field: str, source_label: str):
+        vals = [r[field] for r in rows if r[field] != ""]
+        if vals:
+            print(
+                f"  {label}: mean {sum(vals) / len(vals):.4f}{unit}  "
+                f"min {min(vals):.4f}{unit}  max {max(vals):.4f}{unit}"
+            )
+        missing = len(rows) - len(vals)
+        if missing:
+            print(
+                f"    {missing} KG(s) have timing but no {source_field} "
+                f"(built before that field existed) -- excluded from {source_label} stats above."
+            )
+
+    _print_normalized_summary(
+        "build_time_total_s_per_kloc", "per kLOC   ", "s/kLOC", "total_lines_of_code", "the per-kLOC"
+    )
+    _print_normalized_summary(
+        "build_time_total_s_per_1k_nodes", "per 1k nodes", "s/1k nodes", "node_count", "the per-node"
+    )
+    _print_normalized_summary(
+        "build_time_total_s_per_1k_edges", "per 1k edges", "s/1k edges", "edge_count", "the per-edge"
+    )
     if skipped:
         print(
             f"  {len(skipped)} file(s) skipped (built before this "

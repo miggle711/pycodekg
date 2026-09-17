@@ -20,7 +20,7 @@ Output format:
     {
         "nodes": [{"id": ..., "type": ..., "label": ..., "metadata": {...}}, ...],
         "edges": [{"source": ..., "target": ..., "relation": ..., "metadata": {...}}, ...],
-        "metadata": {"repo": ..., "base_commit": ..., "file_count": ..., "total_lines_of_code": ..., "parse_mode": "source", "schema_version": ...,
+        "metadata": {"repo": ..., "base_commit": ..., "file_count": ..., "total_lines_of_code": ..., "node_count": ..., "edge_count": ..., "parse_mode": "source", "schema_version": ...,
                      "build_time_parsing_s": ..., "build_time_resolution_s": ...}
     }
 
@@ -710,6 +710,11 @@ class RepoASTParser:
         call-context steps). Wall-clock via time.perf_counter(), not CPU
         time, so Pass 1's real parallelism is reflected (multiple worker
         processes overlapping) rather than summed as if sequential.
+        'total_lines_of_code' normalizes against real input size;
+        'node_count'/'edge_count' normalize against real output graph
+        size, distinguishing "this repo has a lot of source" from "this
+        repo produces a lot of graph" -- a repo can be large in one and
+        modest in the other (config/data-heavy code vs. dense OO code).
 
         Args:
             repo: Repository name (e.g. 'psf/requests').
@@ -740,6 +745,8 @@ class RepoASTParser:
                 'repo': repo,
                 'file_count': len(file_args),
                 'total_lines_of_code': total_lines_of_code,
+                'node_count': len(all_nodes),
+                'edge_count': len(all_edges),
                 'parse_mode': 'source',
                 'build_time_parsing_s': round(parsing_time_s, 3),
                 'build_time_resolution_s': round(resolution_time_s, 3),
