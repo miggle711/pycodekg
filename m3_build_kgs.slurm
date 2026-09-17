@@ -64,7 +64,15 @@ if [ ! -d "$CONDA_ENV_DIR" ]; then
   echo "---- Creating pycodekg conda env at $CONDA_ENV_DIR (first run) ----"
   conda create -y --prefix "$CONDA_ENV_DIR" python=3.11
 fi
-source activate "$CONDA_ENV_DIR"
+# source activate (legacy syntax) needs conda's shell hooks already
+# loaded, normally set up by `conda init` writing into ~/.bashrc --
+# confirmed missing on a real account (wlee0060), causing "activate:
+# No such file or directory" and killing the whole job under this
+# file's set -euo pipefail, even though `conda`/`module load
+# miniforge3` itself worked fine. Sourcing conda.sh directly loads the
+# same hooks for just this script run, no ~/.bashrc dependency.
+source "$(conda info --base)/etc/profile.d/conda.sh"
+conda activate "$CONDA_ENV_DIR"
 pip install -e ".[datasets]"
 
 echo "---- Building KGs ----"
