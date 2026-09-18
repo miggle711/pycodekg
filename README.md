@@ -114,6 +114,8 @@ src/kg_construction/
 │   └── patch.py           # Unified diff parsing (changed-function detection)
 ├── llm/
 │   └── llm_serializer.py  # Flat subgraph -> hierarchical JSON for LLM prompts
+├── validation/
+│   └── base.py            # Shared base class for kg/extraction validators
 ├── pipeline.py            # Extract and validate orchestration (extract_and_validate)
 └── cli.py                 # pkg-run: build/query subcommands + interactive fallback
 
@@ -140,12 +142,14 @@ tests/                      # Flat pytest suite (no subdirectories)
 |----------|---------|
 | `contains` | File/class contains a class, function, or method |
 | `imports` | File imports a module or name |
-| `calls` | Function calls another function (confidence: `exact`/`ambiguous`/`qualified`) |
+| `calls` | Function calls another function, constructs a class instance (`SomeClass(...)`), or dispatches an operator to a dunder method (`a \| b` → `__or__`) (confidence: `exact`/`ambiguous`/`qualified`) |
 | `accesses` | Function reads an `@property`-decorated attribute (no call syntax; confidence: `qualified`) |
 | `inherits` | Class inherits from another class |
-| `tests` | Test function targets a specific function |
+| `tests` | Test function targets a specific function, class, or dunder method (also derived automatically from any resolved `calls` edge sourced from a test function) |
 | `uses` | Class instantiates another class (or, with `infer_types=True`, a lowercase factory-function call resolved via pyright — see below) |
 | `overrides` | Method overrides a parent class method |
+| `raises` | Function raises or catches an exception class defined elsewhere in the repo |
+| `decorated_by` | Function is decorated by another function or class defined in the repo (bare, unqualified decorators only) |
 | `depends_on` | Function uses a specific import |
 | `module_depends_on` | File depends on another file via imports |
 
@@ -174,6 +178,7 @@ engine.find_test_functions_for(func_id)     # test functions covering this funct
 # Search
 engine.find_file_by_path('sessions.py')     # substring match on path
 engine.find_function_by_name('send')        # exact label match
+engine.find_class_by_name('Session')        # exact label match, class nodes
 
 # Export
 engine.export_subgraph([node_id, ...])      # nodes + 1-hop edges as dict

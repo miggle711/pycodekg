@@ -9,7 +9,8 @@ Output format:
     {
         "nodes": [{"id": ..., "type": ..., "label": ..., "metadata": {...}}, ...],
         "edges": [{"source": ..., "target": ..., "relation": ..., "metadata": {...}}, ...],
-        "metadata": {"repo": ..., "base_commit": ..., "file_count": ..., "parse_mode": "source", "schema_version": ...}
+        "metadata": {"repo": ..., "base_commit": ..., "file_count": ..., "total_lines_of_code": ..., "node_count": ..., "edge_count": ..., "parse_mode": "source", "schema_version": ...,
+                     "build_time_parsing_s": ..., "build_time_resolution_s": ...}
     }
 
 Usage:
@@ -33,9 +34,10 @@ import ast
 import json
 import re
 import tempfile
+import time
 from pathlib import Path
 from collections import defaultdict
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass, asdict, field
 from typing import List, Dict, Set, Optional, Tuple, Union
 
@@ -49,11 +51,14 @@ from kg_construction.ast.helpers import (
     _extract_callee_name,
     _extract_call_receiver,
     _extract_property_accesses,
+    _extract_operator_dispatches,
     _collect_local_types,
     _get_docstring,
     _get_decorators,
+    _get_bare_decorator_names,
     _get_signature,
     _get_exceptions,
+    _get_exception_class_names,
     _count_branches,
     _get_assert_patterns,
     _get_base_names,
@@ -358,6 +363,48 @@ def _parse_file(args: Tuple[str, str, str]) -> Optional[Dict]:
                 }
             )))
 
+    def _emit_operator_edges(func_id: str, func_node: Union[ast.FunctionDef, ast.AsyncFunctionDef],
+                             local_types: Dict[str, str], class_name: Optional[str] = None):
+        """Emit a 'calls' edge for operator dispatch sites (kg_construction#122).
+
+        `a | b` never appears as an ast.Call, Python's own dispatch
+        routes it to a.__or__(b). Emitted as relation='calls' with the
+        same hint shape _emit_call_edges uses, so it resolves through
+        the existing _resolve_call path unchanged, no new resolution
+        logic needed.
+        """
+        for dunder, receiver in _extract_operator_dispatches(func_node):
+            if (func_id, dunder) in seen_call_targets:
+                continue
+
+            class_hint: Optional[str] = None
+            local_type_hint: Optional[str] = None
+
+            if receiver == 'self' and class_name is not None:
+                class_hint = class_name
+            elif receiver in local_types:
+                local_type_hint = local_types[receiver]
+            else:
+                continue  # receiver's type isn't inferable, drop rather than guess
+
+            # Marked only once resolvable, so an earlier unresolvable
+            # site for the same dunder doesn't consume the dedup slot
+            # a later, genuinely resolvable site needs (kg_construction#137
+            # review).
+            seen_call_targets.add((func_id, dunder))
+
+            edges.append(asdict(KGEdge(
+                source=func_id, target=dunder, relation='calls',
+                metadata={
+                    'unresolved': True,
+                    'receiver': receiver,
+                    'class_hint': class_hint,
+                    'local_type_hint': local_type_hint,
+                    'import_resolved': None,
+                    'is_super_call': False,
+                }
+            )))
+
     def _emit_func_edges(func_id: str, func_node: Union[ast.FunctionDef, ast.AsyncFunctionDef],
                          class_name: Optional[str] = None):
         """Emit semantic edges for a function or method beyond call relationships.
@@ -550,6 +597,22 @@ def _parse_file(args: Tuple[str, str, str]) -> Optional[Dict]:
         _emit_call_edges(func_id, func_node, local_types, class_name=parent_class)
         _emit_access_edges(func_id, func_node, local_types, class_name=parent_class)
         _emit_func_edges(func_id, func_node, class_name=parent_class)
+        _emit_operator_edges(func_id, func_node, local_types, class_name=parent_class)
+
+        # raises/decorated_by: unresolved here, resolved in _resolve_edges
+        # against the repo's own class/function index, same pattern as
+        # inherits/uses/overrides above (kg_construction#112, #113).
+        exc_names = _get_exception_class_names(func_node)
+        for exc_name in exc_names['raises'] + exc_names['catches']:
+            edges.append(asdict(KGEdge(
+                source=func_id, target=exc_name, relation='raises',
+                metadata={'unresolved': True}
+            )))
+        for dec_name in _get_bare_decorator_names(func_node):
+            edges.append(asdict(KGEdge(
+                source=func_id, target=dec_name, relation='decorated_by',
+                metadata={'unresolved': True}
+            )))
 
         _record_factory_sites(func_node, enclosing_class_id=enclosing_class_id)
 
@@ -628,6 +691,20 @@ class RepoASTParser:
             Pass 2 (sequential): Aggregate nodes, build name→id indices,
                 resolve edges, add call context.
 
+        Timing (RQ4 instrumentation, docs/EXPERIMENT_PLAN.md's RQ4
+        instrumentation section): 'build_time_parsing_s' covers file
+        discovery plus Pass 1 (the parallel AST-parse);
+        'build_time_resolution_s' covers everything after (Pass 1.5 if
+        infer_types is on, plus Pass 2's aggregation/edge-resolution/
+        call-context steps). Wall-clock via time.perf_counter(), not CPU
+        time, so Pass 1's real parallelism is reflected (multiple worker
+        processes overlapping) rather than summed as if sequential.
+        'total_lines_of_code' normalizes against real input size;
+        'node_count'/'edge_count' normalize against real output graph
+        size, distinguishing "this repo has a lot of source" from "this
+        repo produces a lot of graph" -- a repo can be large in one and
+        modest in the other (config/data-heavy code vs. dense OO code).
+
         Args:
             repo: Repository name (e.g. 'psf/requests').
             repo_dir: Root of extracted source tree.
@@ -635,15 +712,20 @@ class RepoASTParser:
         Returns:
             KG dict: {'nodes': [...], 'edges': [...], 'metadata': {...}}
         """
+        parse_start = time.perf_counter()
         file_args = self._collect_files(repo, repo_dir)
+        total_lines_of_code = self._count_lines(file_args)
         results = self._run_parallel_parse(file_args)
+        parsing_time_s = time.perf_counter() - parse_start
 
+        resolution_start = time.perf_counter()
         if self.infer_types:
             self._inject_inferred_uses_edges(results, repo_dir)
 
         all_nodes, all_edges, indices = self._aggregate_and_index(results)
         all_edges = self._resolve_edges(all_nodes, all_edges, indices)
         self._add_call_context(all_nodes, all_edges)
+        resolution_time_s = time.perf_counter() - resolution_start
 
         return {
             'nodes': all_nodes,
@@ -651,7 +733,12 @@ class RepoASTParser:
             'metadata': {
                 'repo': repo,
                 'file_count': len(file_args),
+                'total_lines_of_code': total_lines_of_code,
+                'node_count': len(all_nodes),
+                'edge_count': len(all_edges),
                 'parse_mode': 'source',
+                'build_time_parsing_s': round(parsing_time_s, 3),
+                'build_time_resolution_s': round(resolution_time_s, 3),
             }
         }
 
@@ -716,21 +803,50 @@ class RepoASTParser:
             if 'migrations' in rel.parts and _GENERATED_MIGRATION_FILENAME.match(py_file.name):
                 continue
             file_args.append((repo, str(rel), str(py_file)))
+        # rglob's traversal order isn't guaranteed deterministic across
+        # runs/filesystems -- sort so downstream node/edge ordering (and
+        # anything that truncates by list position, e.g.
+        # llm_serializer's MAX_CONTEXT_ITEMS_PER_CATEGORY caps) doesn't
+        # vary between separate builds of the same repo+commit.
+        file_args.sort(key=lambda args: args[1])
         return file_args
+
+    def _count_lines(self, file_args: List[Tuple[str, str, str]]) -> int:
+        """Sum real line counts across every file _collect_files returned.
+
+        RQ4 instrumentation (docs/EXPERIMENT_PLAN.md's RQ4 instrumentation
+        section): build timing is only meaningful normalized against real
+        code size, not file_count alone (a 50-line file and a 5000-line
+        file both count as '1' there). Read synchronously in the main
+        process, not part of _run_parallel_parse's worker pool -- this is
+        a plain line count, no AST work, and keeping it out of the
+        parallel path avoids touching that pool's existing behavior.
+        A file that fails to decode (rare, e.g. real encoding issues)
+        contributes 0 rather than aborting the whole count.
+        """
+        total = 0
+        for _repo, _rel_path, abs_path in file_args:
+            try:
+                with open(abs_path, 'r', encoding='utf-8', errors='ignore') as f:
+                    total += sum(1 for _ in f)
+            except OSError:
+                continue
+        return total
 
     def _run_parallel_parse(self, file_args: List[Tuple[str, str, str]]) -> List[Dict]:
         """Run _parse_file in parallel via ProcessPoolExecutor.
 
-        Returns list of parse results (nodes + unresolved edges from each file).
+        Returns list of parse results (nodes + unresolved edges from each
+        file), in a fixed order matching file_args -- as_completed()
+        previously returned results in whichever order each worker
+        process happened to finish, which varies run-to-run and made
+        all_nodes/all_edges ordering (and anything downstream that
+        truncates by list position) non-deterministic across separate
+        builds of the same repo+commit.
         """
-        results = []
         with ProcessPoolExecutor(max_workers=self.max_workers) as executor:
-            futures = {executor.submit(_parse_file, args): args for args in file_args}
-            for future in as_completed(futures):
-                result = future.result()
-                if result:
-                    results.append(result)
-        return results
+            results = list(executor.map(_parse_file, file_args))
+        return [r for r in results if r]
 
     def _aggregate_and_index(self, results: List[Dict]) -> Tuple[List[Dict], List[Dict], Dict]:
         """Aggregate nodes from parse results and build resolution indices.
@@ -871,7 +987,10 @@ class RepoASTParser:
                     if hits:
                         return hits, 'qualified'
 
-            hits = label_to_ids.get(callee_name, [])
+            # Bare Foo(...) is a constructor call when Foo is a class, so
+            # check class names too, not just functions/methods
+            # (kg_construction#120).
+            hits = label_to_ids.get(callee_name, []) + class_label_to_ids.get(callee_name, [])
 
             # A bare call (no receiver at all, e.g. `request(...)` calling
             # a module-level function, as opposed to `x.request()`) that
@@ -973,6 +1092,55 @@ class RepoASTParser:
                         seen_edges.add(key)
                         resolved_edges.append(asdict(KGEdge(
                             source=edge['source'], target=target_id, relation='inherits',
+                            metadata={'confidence': confidence}
+                        )))
+
+            elif edge['relation'] == 'raises' and meta.get('unresolved'):
+                # Only resolves when the raised/caught name is a real
+                # in-repo class (kg_construction#112) -- builtins and
+                # external exceptions have nothing to match and are
+                # dropped, same "drop rather than guess" rule as calls.
+                exc_name = edge['target']
+                matches = class_label_to_ids.get(exc_name, [])
+                if not matches:
+                    continue
+                confidence = 'exact' if len(matches) == 1 else 'ambiguous'
+                for target_id in matches:
+                    key = (edge['source'], target_id, 'raises')
+                    if key not in seen_edges:
+                        seen_edges.add(key)
+                        resolved_edges.append(asdict(KGEdge(
+                            source=edge['source'], target=target_id, relation='raises',
+                            metadata={'confidence': confidence}
+                        )))
+
+            elif edge['relation'] == 'decorated_by' and meta.get('unresolved'):
+                # Check both indices unconditionally, not short-circuited,
+                # a class and function of the same name can both exist
+                # (kg_construction#135 review).
+                dec_name = edge['target']
+                matches = class_label_to_ids.get(dec_name, []) + label_to_ids.get(dec_name, [])
+                if not matches:
+                    continue
+                # A bare decorator name resolves via the decorated
+                # function's own module scope, same reasoning as bare
+                # calls above. Prefer a single same-file match over
+                # reporting every same-named candidate as ambiguous.
+                if len(matches) > 1:
+                    decorated_filepath = nodes_by_id.get(edge['source'], {}).get('metadata', {}).get('filepath')
+                    same_file_matches = [
+                        mid for mid in matches
+                        if nodes_by_id.get(mid, {}).get('metadata', {}).get('filepath') == decorated_filepath
+                    ]
+                    if len(same_file_matches) == 1:
+                        matches = same_file_matches
+                confidence = 'exact' if len(matches) == 1 else 'ambiguous'
+                for target_id in matches:
+                    key = (edge['source'], target_id, 'decorated_by')
+                    if key not in seen_edges:
+                        seen_edges.add(key)
+                        resolved_edges.append(asdict(KGEdge(
+                            source=edge['source'], target=target_id, relation='decorated_by',
                             metadata={'confidence': confidence}
                         )))
 

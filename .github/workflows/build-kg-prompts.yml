@@ -1,0 +1,79 @@
+name: Build KGs and kg_only prompts for TestGenEval instances
+
+on:
+  workflow_dispatch:
+    inputs:
+      instances:
+        description: "Comma-separated instance ids to build for (empty = every row in the dataset). For the full dataset, split into several batches to stay under the runner's time limit, same as the KG-only build workflow."
+        default: ""
+      dataset:
+        description: "HuggingFace dataset to load instances from"
+        type: choice
+        options:
+          - kjain14/testgenevallite
+          - kjain14/testgeneval
+        default: kjain14/testgenevallite
+      depth:
+        description: "BFS traversal depth for kg_only context retrieval"
+        default: "2"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[datasets]"
+
+      - name: Build KGs
+        run: |
+          PYTHONPATH=src python scripts/build_kgs_for_instances.py \
+            --instances "${{ github.event.inputs.instances }}" \
+            --dataset "${{ github.event.inputs.dataset }}"
+
+      - name: Save dataset to disk
+        # build_kg_prompts.py's --dataset-path needs a local
+        # load_from_disk path, not a HF dataset name.
+        run: |
+          python -c "
+          from datasets import load_dataset
+          ds = load_dataset('${{ github.event.inputs.dataset }}')
+          ds.save_to_disk('dataset_on_disk')
+          "
+
+      - name: Build kg_only prompts
+        run: |
+          PYTHONPATH=src python scripts/build_kg_prompts.py \
+            --kg-dir kg_output \
+            --dataset-path dataset_on_disk \
+            --output kg_prompts.json \
+            --depth "${{ github.event.inputs.depth }}"
+
+      - name: Upload KG outputs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kg-outputs
+          path: kg_output/
+          retention-days: 30
+
+      - name: Upload kg_prompts.json
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kg-prompts
+          path: kg_prompts.json
+          retention-days: 30

@@ -8,9 +8,9 @@ test file from scratch, no existing test content shown to either arm).
 For each instance, surfaces what pycodekg's TestContextExtractor +
 LLMSerializer retrieve for every seed function/class the instance's patch
 touches (a patch can change more than one -- 6/66 real django instances
-do): each seed's own source, structural metadata (module, class),
-callers/callees/siblings, and any existing tests already linked to it in
-the KG.
+do): each seed's own source, docstring, structural metadata (module,
+class), callers/callees/siblings, and related classes it inherits from
+or instantiates.
 
 Also writes each seed's function name (and enclosing class, if any) as a
 separate field per instance, meant to be merged into the `instruct` arm's
@@ -54,6 +54,7 @@ SYSTEM_MESSAGE = (
 SEED_BLOCK_TEMPLATE = """Function under test: {function_name}
 Module: {module}
 Class: {class_name}
+Docstring: {docstring}
 
 Source:
 ```python
@@ -90,11 +91,33 @@ def _snippet_section(title: str, items: list) -> str:
     return "\n".join(parts) + "\n"
 
 
+def _related_section(items: list) -> str:
+    # related has two entry shapes (parent_class has source_code,
+    # instantiation doesn't), so it needs its own renderer instead of
+    # _snippet_section's single generic shape.
+    if not items:
+        return ""
+    parts = ["Related classes:"]
+    for item in items:
+        name = item.get("name", "?")
+        module = item.get("module", "")
+        via = "the seed" if item.get("source") == "seed" else "the seed's class"
+        if item.get("type") == "parent_class":
+            parts.append(
+                f"- {name} ({module}), parent class of {via}:\n"
+                f"```python\n{item.get('source_code', '')}\n```"
+            )
+        else:
+            parts.append(f"- {name} ({module}), instantiated by {via}")
+    return "\n".join(parts) + "\n"
+
+
 def _build_seed_block(seed: dict) -> str:
     return SEED_BLOCK_TEMPLATE.format(
         function_name=seed.get("function_name", ""),
         module=seed.get("module", ""),
         class_name=seed.get("class_name", "") or "(none -- top-level function)",
+        docstring=seed.get("docstring") or "(none)",
         source_code=seed.get("source_code", ""),
         exceptions=", ".join(seed.get("exceptions", [])) or "(none declared)",
     )
@@ -113,6 +136,7 @@ def _build_prompt(serialized: dict) -> str:
         _snippet_section("Callers", context.get("callers", [])),
         _snippet_section("Callees", context.get("callees", [])),
         _snippet_section("Sibling methods", context.get("sibling_methods", [])),
+        _related_section(context.get("related", [])),
     ]))
 
     return PROMPT_TEMPLATE.format(
@@ -120,6 +144,17 @@ def _build_prompt(serialized: dict) -> str:
         sections=sections,
         function_or_functions="this function" if len(seeds) == 1 else "these functions",
     )
+
+
+def _repo_slug(repo: str) -> str:
+    """Sanitize a repo name for use in a kg_<slug>_<commit>.json filename.
+
+    Must match RepoKGBuilder._cache_path's sanitization exactly
+    (kg/builder.py), which also replaces "-" and "." -- a repo like
+    scikit-learn/scikit-learn produced kg files this script could never
+    find when only "/" was being replaced here (kg_construction#141).
+    """
+    return repo.replace("/", "_").replace("-", "_").replace(".", "_")
 
 
 def main():
@@ -142,13 +177,26 @@ def main():
     failures = []
     stale_seed_instances = []
     multi_seed_instances = []
+    # RQ4 instrumentation (docs/EXPERIMENT_PLAN.md's RQ4 instrumentation
+    # section, per-instance retrieval overhead): TestContext.retrieval_time_s
+    # is computed by extractor.extract() below regardless of what happens
+    # afterward, so it's recorded for any instance where extract() itself
+    # completed, even if serialization later fails that instance out of
+    # `prompts` -- retrieval work still genuinely happened and took real
+    # time. Written to a sidecar file, not merged into `prompts` itself, so
+    # nothing downstream that reads the main kg_prompts_depthN.json schema
+    # needs to change.
+    retrieval_times = {}
+    # RQ2 instrumentation (docs/EXPERIMENT_PLAN.md, miggle711/pycodekg#147):
+    # localization_outcome/node_count/edge_count/cross_file_node_proportion/
+    # relationship_type_counts are all computed by extractor.extract() below,
+    # same reasoning as retrieval_times above -- recorded for any instance
+    # where extract() itself completed, even if serialization later fails
+    # that instance out of `prompts`.
+    localization_stats = {}
 
     for row in rows:
-        # Must match RepoKGBuilder._cache_path's sanitization exactly
-        # (kg/builder.py), which also replaces "-" and "." -- a repo
-        # like scikit-learn/scikit-learn produced kg files this script
-        # could never find, since only "/" was being replaced here.
-        repo_slug = row["repo"].replace("/", "_").replace("-", "_").replace(".", "_")
+        repo_slug = _repo_slug(row["repo"])
         commit = row["base_commit"]
         kg_path = kg_dir / f"kg_{repo_slug}_{commit[:8]}.json"
         if not kg_path.exists():
@@ -168,6 +216,14 @@ def main():
                 "test_file": row["test_file"],
             }
             context = extractor.extract(instance, depth=args.depth)
+            retrieval_times[row["id"]] = context.retrieval_time_s
+            localization_stats[row["id"]] = {
+                "localization_outcome": context.localization_outcome,
+                "node_count": context.node_count,
+                "edge_count": context.edge_count,
+                "cross_file_node_proportion": context.cross_file_node_proportion,
+                "relationship_type_counts": context.relationship_type_counts,
+            }
             if context.stale_seed_labels:
                 stale_seed_instances.append((row["id"], context.stale_seed_labels))
             context_dict = {
@@ -199,7 +255,54 @@ def main():
     with open(args.output, "w") as f:
         json.dump(prompts, f, indent=2)
 
+    retrieval_times_path = Path(args.output).with_name(
+        Path(args.output).stem + "_retrieval_times.json"
+    )
+    with open(retrieval_times_path, "w") as f:
+        json.dump(retrieval_times, f, indent=2)
+
+    localization_stats_path = Path(args.output).with_name(
+        Path(args.output).stem + "_localization_stats.json"
+    )
+    with open(localization_stats_path, "w") as f:
+        json.dump(localization_stats, f, indent=2)
+
     print(f"\n{len(prompts)}/{len(rows)} prompts built -> {args.output}")
+    if retrieval_times:
+        values = list(retrieval_times.values())
+        print(
+            f"{len(retrieval_times)} retrieval times -> {retrieval_times_path} "
+            f"(mean {sum(values) / len(values):.4f}s, "
+            f"min {min(values):.4f}s, max {max(values):.4f}s)"
+        )
+    if localization_stats:
+        outcome_counts = {}
+        node_counts = []
+        edge_counts = []
+        cross_file_props = []
+        for stats in localization_stats.values():
+            outcome = stats["localization_outcome"]
+            outcome_counts[outcome] = outcome_counts.get(outcome, 0) + 1
+            node_counts.append(stats["node_count"])
+            edge_counts.append(stats["edge_count"])
+            cross_file_props.append(stats["cross_file_node_proportion"])
+        print(
+            f"{len(localization_stats)} localization/retrieval stats -> "
+            f"{localization_stats_path}"
+        )
+        print(f"  localization_outcome: {outcome_counts}")
+        print(
+            f"  node_count: mean {sum(node_counts) / len(node_counts):.1f}  "
+            f"min {min(node_counts)}  max {max(node_counts)}"
+        )
+        print(
+            f"  edge_count: mean {sum(edge_counts) / len(edge_counts):.1f}  "
+            f"min {min(edge_counts)}  max {max(edge_counts)}"
+        )
+        print(
+            f"  cross_file_node_proportion: mean "
+            f"{sum(cross_file_props) / len(cross_file_props):.3f}"
+        )
     if failures:
         print(f"{len(failures)} failures:")
         for instance_id, err in failures:

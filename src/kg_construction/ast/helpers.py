@@ -190,6 +190,70 @@ def _extract_property_accesses(
     return accesses
 
 
+# Common overloadable binary operators -> the dunder method Python
+# dispatches to. Right-operand fallback (__ror__ etc, when the left
+# side returns NotImplemented) and in-place variants (__iadd__ etc)
+# are out of scope for a first cut (kg_construction#122).
+_BINOP_DUNDER_METHODS = {
+    ast.Add: '__add__', ast.Sub: '__sub__', ast.Mult: '__mul__',
+    ast.Div: '__truediv__', ast.FloorDiv: '__floordiv__', ast.Mod: '__mod__',
+    ast.Pow: '__pow__', ast.LShift: '__lshift__', ast.RShift: '__rshift__',
+    ast.BitOr: '__or__', ast.BitXor: '__xor__', ast.BitAnd: '__and__',
+    ast.MatMult: '__matmul__',
+}
+
+_COMPARE_DUNDER_METHODS = {
+    ast.Eq: '__eq__', ast.NotEq: '__ne__', ast.Lt: '__lt__',
+    ast.LtE: '__le__', ast.Gt: '__gt__', ast.GtE: '__ge__',
+}
+
+
+def _extract_operator_dispatches(
+    func_node: Union[ast.FunctionDef, ast.AsyncFunctionDef],
+) -> List[Tuple[str, str]]:
+    """Find operator sites whose left operand is a bare name (kg_construction#122).
+
+    `a | b` never appears as an ast.Call, so _emit_call_edges has no
+    signal for it at all -- Python's own dispatch routes it to
+    `a.__or__(b)`. Only the left operand is handled (no __ror__
+    fallback), and only when it's a bare Name -- the same shape
+    _extract_call_receiver already resolves for `x.method()`, so the
+    existing local_types/class_hint machinery can resolve it without
+    any new type inference. Chained comparisons (`a < b < c`) are
+    skipped, only the simple a OP b shape is handled.
+
+    Returns a deduplicated list of (dunder_method, receiver) pairs,
+    e.g. `self | x` -> ('__or__', 'self').
+    """
+    dispatches: List[Tuple[str, str]] = []
+    seen: Set[Tuple[str, str]] = set()
+
+    def _walk_no_nested(n: ast.AST):
+        for child in ast.iter_child_nodes(n):
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue  # nested fn -- its operator sites belong to that scope
+
+            dunder = None
+            left = None
+            if isinstance(child, ast.BinOp):
+                dunder = _BINOP_DUNDER_METHODS.get(type(child.op))
+                left = child.left
+            elif isinstance(child, ast.Compare) and len(child.ops) == 1:
+                dunder = _COMPARE_DUNDER_METHODS.get(type(child.ops[0]))
+                left = child.left
+
+            if dunder and isinstance(left, ast.Name):
+                key = (dunder, left.id)
+                if key not in seen:
+                    seen.add(key)
+                    dispatches.append(key)
+
+            _walk_no_nested(child)
+
+    _walk_no_nested(func_node)
+    return dispatches
+
+
 def _collect_local_types(
     func_node: Union[ast.FunctionDef, ast.AsyncFunctionDef],
     before_line: Optional[int] = None,
@@ -274,6 +338,26 @@ def _get_decorators(node: ast.AST) -> List[str]:
         for d in getattr(node, 'decorator_list', [])
         if _safe_unparse(d)
     ]
+
+
+def _get_bare_decorator_names(node: ast.AST) -> List[str]:
+    """Bare names of unqualified decorators only (kg_construction#113).
+
+    A dotted/attribute decorator (@pytest.mark.skip, @app.route) isn't a
+    plain function/class defined in this repo the same way @my_decorator
+    is -- only bare Name and bare Call(func=Name(...)) forms are
+    resolvable against the repo's own function/class index. Whether the
+    resolved name turns out to be stdlib (@staticmethod) or a real
+    in-repo decorator is left to the index lookup itself: a stdlib name
+    simply won't match anything and the edge gets dropped, same as any
+    other unresolved edge in this codebase.
+    """
+    names = []
+    for dec in getattr(node, 'decorator_list', []):
+        target = dec.func if isinstance(dec, ast.Call) else dec
+        if isinstance(target, ast.Name):
+            names.append(target.id)
+    return names
 
 
 def _get_signature(node: Union[ast.FunctionDef, ast.AsyncFunctionDef]) -> Dict:
@@ -390,7 +474,51 @@ def _get_exceptions(node: Union[ast.FunctionDef, ast.AsyncFunctionDef]) -> Dict:
             unparsed = _safe_unparse(child.type)
             if unparsed:
                 catches.append(unparsed)
-    return {'raises': list(set(raises)), 'catches': list(set(catches))}
+    # sorted(), not list(set(...)): Python randomizes set iteration
+    # order for strings per-process by default (PYTHONHASHSEED unset),
+    # so two separate builds of the same function could otherwise
+    # report 'raises'/'catches' in a different order. This feeds
+    # exceptions in the rendered prompt directly (SEED_BLOCK_TEMPLATE's
+    # "Declared exceptions" field), the same class of bug as #145's
+    # BFS visited-node-order fix, just a different call site.
+    return {'raises': sorted(set(raises)), 'catches': sorted(set(catches))}
+
+
+def _extract_exception_class_name(expr: ast.AST) -> Optional[str]:
+    """Bare class name from a single raise/except expression, if resolvable.
+
+    Handles `raise Foo`, `raise Foo(...)`, `except Foo`. Attribute-based
+    forms (`raise mod.Foo(...)`, `raise self.exc(...)`) are left
+    unresolved here -- module.Class needs import resolution, and
+    self.attr is an instance attribute, not a class name at all.
+    """
+    target = expr.func if isinstance(expr, ast.Call) else expr
+    if isinstance(target, ast.Name):
+        return target.id
+    return None
+
+
+def _get_exception_class_names(node: Union[ast.FunctionDef, ast.AsyncFunctionDef]) -> Dict:
+    """Bare, resolvable class names raised/caught in a function body.
+
+    Companion to _get_exceptions: that returns full unparsed expressions
+    for display; this returns just the class names usable to resolve a
+    real edge to the exception class's own node (kg_construction#112).
+    A tuple except handler (`except (A, B):`) contributes every element.
+    """
+    raises, catches = set(), set()
+    for child in ast.walk(node):
+        if isinstance(child, ast.Raise) and child.exc is not None:
+            name = _extract_exception_class_name(child.exc)
+            if name:
+                raises.add(name)
+        elif isinstance(child, ast.ExceptHandler) and child.type is not None:
+            exc_types = child.type.elts if isinstance(child.type, ast.Tuple) else [child.type]
+            for exc_type in exc_types:
+                name = _extract_exception_class_name(exc_type)
+                if name:
+                    catches.add(name)
+    return {'raises': sorted(raises), 'catches': sorted(catches)}
 
 
 def _extract_conditions(node: Union[ast.FunctionDef, ast.AsyncFunctionDef]) -> List[Dict]:
@@ -555,10 +683,13 @@ def _extract_data_flows(node: Union[ast.FunctionDef, ast.AsyncFunctionDef]) -> D
     for param in flows['parameter_usage']:
         flows['parameter_usage'][param] = sorted(list(set(flows['parameter_usage'][param])))
 
-    # Deduplicate return values and mutations
-    flows['returns'] = list(set(flows['returns']))
+    # Deduplicate return values and mutations. sorted(), not
+    # list(set(...)), for the same reason as parameter_usage above and
+    # _extract_exceptions' raises/catches: Python randomizes set
+    # iteration order for strings per-process by default.
+    flows['returns'] = sorted(set(flows['returns']))
     for attr in flows['mutates_attributes']:
-        flows['mutates_attributes'][attr] = list(set(flows['mutates_attributes'][attr]))
+        flows['mutates_attributes'][attr] = sorted(set(flows['mutates_attributes'][attr]))
 
     return flows
 
