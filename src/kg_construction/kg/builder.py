@@ -1,16 +1,5 @@
 """
-repo_kg_builder.py
-
-Builds structural Knowledge Graphs (KGs) from Python repository source code.
-
-Given a GitHub repo and a commit SHA, this module:
-  1. Clones the repo as a bare git mirror (cached locally)
-  2. Extracts the source tree at that commit via git archive
-  3. Parses every .py file with Python's ast module in parallel
-  4. Emits nodes (file, class, function, method, test_function, import) and
-     edges (contains, imports, calls, accesses, inherits, tests, uses,
-     overrides, depends_on, module_depends_on) into a JSON KG
-
+repo_kg_buildeq
 Node metadata includes: signatures, type annotations, default values,
 decorators, docstrings, raised/caught exceptions, branch counts,
 assert patterns (for test functions), class attributes, module constants,
@@ -1716,7 +1705,7 @@ class RepoKGBuilder:
 
         A cached file is only returned if it exists AND its stamped
         metadata.base_commit and metadata.schema_version both match what's
-        requested/current -- guards against a pre-#45 cache file (no
+        requested/current, guards against a pre-#45 cache file (no
         schema_version, or a filename collision) being served as if valid.
 
         Args:

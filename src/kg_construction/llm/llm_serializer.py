@@ -240,7 +240,16 @@ class LLMSerializer:
             # PreparedRequest, not just __init__. `source` records which of
             # the two applies so the model can tell "the seed does this
             # directly" from "the seed's class does this elsewhere."
-            elif relation == "inherits" and (src_id in seed_ids or src_id in seed_class_ids):
+            # Ambiguous-confidence inherits edges are excluded: with N
+            # same-named-class candidates, at most 1 can be the real parent
+            # (measured 98.58% of real inherits edges are ambiguous; one
+            # seed pulled in 929 unrelated "parent_class" entries before
+            # this filter).
+            elif (
+                relation == "inherits"
+                and (src_id in seed_ids or src_id in seed_class_ids)
+                and edge.get("metadata", {}).get("confidence") == "exact"
+            ):
                 related.append(
                     {
                         "type": "parent_class",
@@ -250,7 +259,16 @@ class LLMSerializer:
                         "source": "seed" if src_id in seed_ids else "seed_class",
                     }
                 )
-            elif relation == "uses" and (src_id in seed_ids or src_id in seed_class_ids):
+            # Ambiguous-confidence uses edges are excluded, same reasoning
+            # as inherits above: the instantiated-class heuristic downgrades
+            # to 'ambiguous' when the candidate name collides with another
+            # real class or function elsewhere in the repo, so an ambiguous
+            # edge isn't a confirmed instantiation.
+            elif (
+                relation == "uses"
+                and (src_id in seed_ids or src_id in seed_class_ids)
+                and edge.get("metadata", {}).get("confidence") == "exact"
+            ):
                 related.append(
                     {
                         "type": "instantiation",

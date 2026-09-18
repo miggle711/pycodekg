@@ -1,0 +1,38 @@
+digraph Methodology {
+    rankdir=LR;
+    bgcolor=white;
+    node [shape=box, style=filled, fontname="Helvetica", fontsize=9, width=1.2, height=0.6];
+    edge [fontname="Helvetica", fontsize=8, arrowsize=0.8];
+    size="8,3";
+    margin=0.15;
+    nodesep=0.2;
+    ranksep=0.5;
+
+    label="Repository-based Knowledge Graph Construction for LLM-Guided Test Generation";
+    labelloc=top;
+    labeljust=center;
+
+    // Inputs
+    repo [label="Repository", fillcolor=lightblue, shape=cylinder];
+    patch [label="Patch", fillcolor=lightblue];
+
+    // Phase 1-3: Knowledge Graph Construction and Extraction
+    kg_phase [label="1. Build KG\n2. Find Seeds\n3. Extract Subgraph", fillcolor=lightyellow, shape=box];
+    kg [label="Subgraph", fillcolor=gold];
+
+    // Phase 4-5: Validation and Generation
+    gen_phase [label="4. Validate\n5. LLM Test Gen", fillcolor=lightyellow];
+    tests [label="Test Code", fillcolor=gold];
+
+    // Phase 6-7: Execution and Evaluation
+    eval_phase [label="6. Execute\n7. Evaluate", fillcolor=lightyellow];
+
+
+    repo -> kg_phase;
+    patch -> kg_phase;
+    kg_phase -> kg;
+    kg -> gen_phase;
+    gen_phase -> tests;
+    tests -> eval_phase;
+
+}

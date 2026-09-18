@@ -1,0 +1,222 @@
+digraph Session_send_Example_Trace {
+    rankdir=TB;
+    bgcolor=white;
+    node [shape=box, style=filled, fontname="Helvetica", fontsize=9];
+    edge [fontname="Helvetica", fontsize=8];
+
+    // ============================================================================
+    // PHASE 1: KNOWLEDGE GRAPH CONSTRUCTION
+    // ============================================================================
+
+    subgraph cluster_phase1 {
+        style=filled;
+        fillcolor="#E8F4F8";
+        label="Phase 1: Knowledge Graph Construction";
+        color=black;
+        fontsize=11;
+        fontname="Helvetica";
+
+        // Input
+        source_code [label="Source Code\nSession.send()", fillcolor=lightblue, shape=box];
+
+        // 1a: AST Parsing
+        ast_node [label="AST Node\nFunctionDef", fillcolor=lightyellow];
+
+        // 1b: Metadata Extraction
+        metadata_box [label="Metadata Extracted:\n• params: [self, request, kwargs]\n• returns: null\n• branches: 4\n• raises: [ValueError]\n• side_effects: [cookies]\n• data_flows: {returns, mutations, param_usage}", fillcolor=lightyellow, shape=box];
+
+        // 1c: Edge Resolution
+        edges_resolved [label="Edges Resolved:\n• send → get_adapter (exact)\n• send → dispatch_hook (qualified)\n• send → extract_cookies_to_jar (qualified)\n• send → resolve_redirects (exact)", fillcolor=lightyellow, shape=box];
+
+        // 1d: KG Node
+        kg_node [label="KG Node Created\nID: a7f3b284\ntype: method\nlabel: send", fillcolor=gold, style="filled,bold"];
+
+        source_code -> ast_node;
+        ast_node -> metadata_box;
+        metadata_box -> edges_resolved;
+        edges_resolved -> kg_node;
+    }
+
+    // ============================================================================
+    // PHASE 2: PATCH PARSING & SEED IDENTIFICATION
+    // ============================================================================
+
+    subgraph cluster_phase2 {
+        style=filled;
+        fillcolor="#F0E8F8";
+        label="Phase 2: Patch Parsing & Seed Identification";
+        color=black;
+        fontsize=11;
+        fontname="Helvetica";
+
+        patch [label="GitHub PR Patch\n(unified diff)", fillcolor=lightblue, shape=box];
+        parse_patch [label="Parse Patch\nIdentify changed function:\nSession.send() @ line 445", fillcolor=lightyellow];
+        query_kg [label="Query KG:\nFind seed nodes\nfor Session.send()", fillcolor=lightyellow];
+        find_tests [label="Find test functions\nthat test send()", fillcolor=lightyellow];
+        seeds [label="Seeds Identified:\n• Primary: a7f3b284 (send)\n• Tests: [c4e9d156, f7a2c890]", fillcolor=gold, style="filled,bold"];
+
+        patch -> parse_patch;
+        parse_patch -> query_kg;
+        kg_node -> query_kg;
+        query_kg -> find_tests;
+        find_tests -> seeds;
+    }
+
+    // ============================================================================
+    // PHASE 3: SUBGRAPH EXTRACTION
+    // ============================================================================
+
+    subgraph cluster_phase3 {
+        style=filled;
+        fillcolor="#F8F4E8";
+        label="Phase 3: Subgraph Extraction (BFS)";
+        color=black;
+        fontsize=11;
+        fontname="Helvetica";
+
+        bfs_config [label="BFS Configuration:\n• Start: a7f3b284 (send)\n• Depth: 2\n• Edges: {calls, inherits}\n• Directions: outgoing+incoming", fillcolor=lightyellow, shape=box];
+
+        depth0 [label="Depth 0:\nSeed node\na7f3b284 (send)", fillcolor=lightcyan];
+
+        depth1 [label="Depth 1:\nCallees/Callers\n• get_adapter\n• dispatch_hook\n• extract_cookies_to_jar\n• resolve_redirects\n• test_send", fillcolor=lightcyan];
+
+        depth2 [label="Depth 2:\nTransitive calls\n• HTTPAdapter.send\n• PreparedRequest methods\n...", fillcolor=lightcyan];
+
+        compression [label="Size Compression:\nFull KG: 5MB (960 nodes, 3603 edges)\nSubgraph: 45KB (18 nodes, 24 edges)\nReduction: 99.1%", fillcolor=lightyellow, shape=box];
+
+        subgraph_result [label="Extracted Subgraph\n18 nodes, 24 edges\nReady for validation", fillcolor=gold, style="filled,bold"];
+
+        seeds -> bfs_config;
+        bfs_config -> depth0;
+        depth0 -> depth1;
+        depth1 -> depth2;
+        depth2 -> compression;
+        compression -> subgraph_result;
+    }
+
+    // ============================================================================
+    // PHASE 4: SUBGRAPH VALIDATION
+    // ============================================================================
+
+    subgraph cluster_phase4 {
+        style=filled;
+        fillcolor="#F8E8E8";
+        label="Phase 4: Subgraph Validation";
+        color=black;
+        fontsize=11;
+        fontname="Helvetica";
+
+        must_haves [label="Must-Haves:\n✓ All seeds present\n✓ No orphan nodes\n✓ All edges valid\nResult: PASS", fillcolor=lightgreen];
+
+        should_haves [label="Should-Haves:\n✓ Has test coverage (2 tests)\n✓ External deps resolved\n⚠ 1 ambiguous edge\nResult: PASS_WITH_WARNINGS", fillcolor=lightyellow];
+
+        validated [label="Validated Subgraph\nReady for LLM", fillcolor=gold, style="filled,bold"];
+
+        subgraph_result -> must_haves;
+        must_haves -> should_haves;
+        should_haves -> validated;
+    }
+
+    // ============================================================================
+    // PHASE 5: LLM-BASED TEST GENERATION
+    // ============================================================================
+
+    subgraph cluster_phase5 {
+        style=filled;
+        fillcolor="#E8F8E8";
+        label="Phase 5: LLM-Based Test Generation";
+        color=black;
+        fontsize=11;
+        fontname="Helvetica";
+
+        hierarchy [label="Hierarchical JSON Input:\nSeed:\n  - function_name: Session.send\n  - docstring, params, returns\n  - data_flows, side_effects\n\nContext:\n  - class_definition\n  - callers, dependencies\n  - similar_functions\n\nInstructions:\n  - task description\n  - test_categories\n  - constraints", fillcolor=lightyellow, shape=box];
+
+        llm_call [label="LLM API Call\n(Groq/Anthropic)\nwith subgraph context", fillcolor=lightyellow];
+
+        test_code [label="Generated Tests:\n• test_send_validates_prepared_request\n• test_send_updates_cookies\n• test_send_resolves_redirects\n\n3 tests generated", fillcolor=gold, style="filled,bold"];
+
+        validated -> hierarchy;
+        hierarchy -> llm_call;
+        llm_call -> test_code;
+    }
+
+    // ============================================================================
+    // PHASE 6: TEST EXECUTION & VALIDATION
+    // ============================================================================
+
+    subgraph cluster_phase6 {
+        style=filled;
+        fillcolor="#F8E8F8";
+        label="Phase 6: Test Execution & Validation";
+        color=black;
+        fontsize=11;
+        fontname="Helvetica";
+
+        execute [label="Execute Tests\nAgainst mocked code", fillcolor=lightyellow];
+
+        verify [label="Verify:\n✓ Syntax valid\n✓ All assertions work\n✓ Tests isolated\n✓ No external calls", fillcolor=lightyellow];
+
+        exec_results [label="Test Results:\n3/3 PASS ✓\nExecution time: 0.287s", fillcolor=gold, style="filled,bold"];
+
+        test_code -> execute;
+        execute -> verify;
+        verify -> exec_results;
+    }
+
+    // ============================================================================
+    // PHASE 7: EVALUATION METRICS
+    // ============================================================================
+
+    subgraph cluster_phase7 {
+        style=filled;
+        fillcolor="#F8F4E8";
+        label="Phase 7: Evaluation Metrics";
+        color=black;
+        fontsize=11;
+        fontname="Helvetica";
+
+        coverage_metric [label="Coverage Metrics:\n• Line coverage: 36\n• Branch coverage: 5/6\n• Exception coverage: 1\n• Assertions: 8", fillcolor=lightyellow];
+
+        quality_metric [label="Quality Metrics:\n• Tests: 3\n• Docstring coverage: 100%\n• Assertion diversity: 4 types\n• Mock usage: high", fillcolor=lightyellow];
+
+        efficiency_metric [label="Efficiency Metrics:\n• KG build: 45s\n• Subgraph extraction: 2s\n• LLM generation: 8.3s\n• Test execution: 0.287s\n• Total: 55.6s", fillcolor=lightyellow];
+
+        final_report [label="Final Report:\nFunctionality: ✓ PASS\nQuality: ✓ HIGH\nEfficiency: ✓ 55.6s\n\nConclusion: High-quality\ntest suite generated", fillcolor=gold, style="filled,bold"];
+
+        exec_results -> coverage_metric;
+        exec_results -> quality_metric;
+        exec_results -> efficiency_metric;
+        coverage_metric -> final_report;
+        quality_metric -> final_report;
+        efficiency_metric -> final_report;
+    }
+
+    // ============================================================================
+    // DATA FLOW BOX (side reference)
+    // ============================================================================
+
+    subgraph cluster_dataflow {
+        style=filled;
+        fillcolor="#FFF8DC";
+        label="Key Data Flows in Session.send()";
+        color=gray;
+        fontsize=10;
+        fontname="Helvetica";
+
+        df_returns [label="Returns: r\n(Response object)", fillcolor=white, shape=box];
+        df_mutations [label="Mutations: self.cookies\n(via extract_cookies_to_jar)", fillcolor=white, shape=box];
+        df_params [label="Parameters Used:\n• request: 6 uses\n• kwargs: 8 uses", fillcolor=white, shape=box];
+        df_conditions [label="Branches: 4\n1. isinstance(request, Request)\n2. 'proxies' not in kwargs\n3. r.history\n4. allow_redirects", fillcolor=white, shape=box];
+
+        df_returns -> df_mutations [style=invis];
+        df_mutations -> df_params [style=invis];
+        df_params -> df_conditions [style=invis];
+    }
+
+    // ============================================================================
+    // LEGEND
+    // ============================================================================
+
+    legend [label="Legend:\nBlue boxes = Input data\nYellow boxes = Processing steps\nGold boxes = Output/results\nCyan boxes = Intermediate results",
+            shape=box, fillcolor=white, style=filled, fontsize=8];
+}

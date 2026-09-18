@@ -234,7 +234,10 @@ class TestSerializeContextSection:
         instance = {
             "seeds": [seed_node],
             "context_nodes": [parent_node],
-            "edges": [{"source": seed_node["id"], "target": parent_node["id"], "relation": "inherits"}],
+            "edges": [{
+                "source": seed_node["id"], "target": parent_node["id"], "relation": "inherits",
+                "metadata": {"confidence": "exact"},
+            }],
             "test_nodes": [],
         }
         result = LLMSerializer().serialize(instance)
@@ -244,6 +247,33 @@ class TestSerializeContextSection:
         assert related[0]["type"] == "parent_class"
         assert related[0]["module"] == "requests.sessions"
         assert related[0]["source"] == "seed"
+
+    def test_ambiguous_inherits_edge_is_excluded(self):
+        # A base class name that isn't unique repo-wide (e.g. "Meta") gets
+        # one inherits edge per same-named candidate, confidence='ambiguous'
+        # -- at most one candidate can be the real parent, so these edges
+        # are excluded rather than surfaced as unreliable "parent_class"
+        # context.
+        seed_node = {
+            "id": "seed", "label": "Session", "type": "class",
+            "metadata": {"filepath": "requests/sessions.py"},
+        }
+        parent_node = {
+            "id": "parent", "label": "Meta", "type": "class",
+            "metadata": {"filepath": "unrelated/models.py", "source_code": "class Meta: ..."},
+        }
+        instance = {
+            "seeds": [seed_node],
+            "context_nodes": [parent_node],
+            "edges": [{
+                "source": seed_node["id"], "target": parent_node["id"], "relation": "inherits",
+                "metadata": {"confidence": "ambiguous"},
+            }],
+            "test_nodes": [],
+        }
+        result = LLMSerializer().serialize(instance)
+
+        assert result["context"]["related"] == []
 
     def test_instantiation_includes_module(self):
         seed_node = {
@@ -257,7 +287,10 @@ class TestSerializeContextSection:
         instance = {
             "seeds": [seed_node],
             "context_nodes": [used_node],
-            "edges": [{"source": seed_node["id"], "target": used_node["id"], "relation": "uses"}],
+            "edges": [{
+                "source": seed_node["id"], "target": used_node["id"], "relation": "uses",
+                "metadata": {"confidence": "exact"},
+            }],
             "test_nodes": [],
         }
         result = LLMSerializer().serialize(instance)
@@ -267,6 +300,32 @@ class TestSerializeContextSection:
         assert related[0]["type"] == "instantiation"
         assert related[0]["module"] == "requests.adapters"
         assert related[0]["source"] == "seed"
+
+    def test_ambiguous_uses_edge_is_excluded(self):
+        # An instantiated-class candidate name that collides with another
+        # real class or function elsewhere in the repo gets confidence
+        # downgraded to 'ambiguous' (see test_uses_edge_confidence.py) --
+        # not a confirmed instantiation, so excluded from related.
+        seed_node = {
+            "id": "seed", "label": "send", "type": "method",
+            "metadata": {"filepath": "requests/sessions.py"},
+        }
+        used_node = {
+            "id": "used", "label": "Config", "type": "class",
+            "metadata": {"filepath": "unrelated/models.py"},
+        }
+        instance = {
+            "seeds": [seed_node],
+            "context_nodes": [used_node],
+            "edges": [{
+                "source": seed_node["id"], "target": used_node["id"], "relation": "uses",
+                "metadata": {"confidence": "ambiguous"},
+            }],
+            "test_nodes": [],
+        }
+        result = LLMSerializer().serialize(instance)
+
+        assert result["context"]["related"] == []
 
 
 class TestRelatedScopedToSeedOrSeedClass:
@@ -305,7 +364,10 @@ class TestRelatedScopedToSeedOrSeedClass:
             "metadata": {"filepath": "requests/structures.py"},
         }
         instance = self._method_seed_instance(
-            extra_edges=[{"source": "class_preparedrequest", "target": "used", "relation": "uses"}],
+            extra_edges=[{
+                "source": "class_preparedrequest", "target": "used", "relation": "uses",
+                "metadata": {"confidence": "exact"},
+            }],
             extra_nodes=[used_node],
         )
         result = LLMSerializer().serialize(instance)
@@ -321,7 +383,10 @@ class TestRelatedScopedToSeedOrSeedClass:
             "metadata": {"filepath": "requests/models.py"},
         }
         instance = self._method_seed_instance(
-            extra_edges=[{"source": "class_preparedrequest", "target": "parent", "relation": "inherits"}],
+            extra_edges=[{
+                "source": "class_preparedrequest", "target": "parent", "relation": "inherits",
+                "metadata": {"confidence": "exact"},
+            }],
             extra_nodes=[parent_node],
         )
         result = LLMSerializer().serialize(instance)
