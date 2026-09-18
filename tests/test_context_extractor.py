@@ -488,3 +488,214 @@ class TestClassLevelSeedLookup:
         # The old fallback behavior (file-as-seed) must not happen now that
         # the class itself resolves correctly.
         assert "mod.py" not in {s["label"] for s in context.seeds}
+
+
+class TestSeedSourceIsPostPatch:
+    """kg_construction#124: the KG is built once from base_commit, with no
+    patch applied, so every stored node's source_code -- including a
+    seed's -- is PRE-patch content. Generated tests are evaluated against
+    the real, current (POST-patch) repository state either way, so a
+    seed's source_code must reflect the patch's fix, not the KG's stored
+    (stale) value. Context nodes are unaffected since the patch never
+    touches them.
+    """
+
+    def _write_pre_patch_repo(self, tmp_path: Path) -> Path:
+        (tmp_path / "mod.py").write_text(
+            "class Widget:\n"
+            "    def build(self):\n"
+            "        return self.helper() + OLD_VALUE\n"
+            "\n"
+            "    def helper(self):\n"
+            "        return 42\n"
+        )
+        return tmp_path
+
+    def test_seed_source_reflects_the_patch_not_the_kg(self, tmp_path):
+        # KG is built from the PRE-patch file -- same as a real KG built
+        # once from base_commit, before the patch is ever applied.
+        repo_dir = self._write_pre_patch_repo(tmp_path)
+        parser = RepoASTParser(max_workers=1)
+        kg = parser.parse_repo("test/repo", repo_dir)
+
+        engine = KGQueryEngine(kg)
+        # _LocalFileRepoManager also reads the same pre-patch file, same
+        # as RepoManager.read_file_at_commit would for a real base_commit.
+        extractor = TestContextExtractor(engine, repo_manager=_LocalFileRepoManager(repo_dir))
+
+        patch = (
+            "--- a/mod.py\n"
+            "+++ b/mod.py\n"
+            "@@ -1,3 +1,3 @@\n"
+            " class Widget:\n"
+            "     def build(self):\n"
+            "-        return self.helper() + OLD_VALUE\n"
+            "+        return self.helper() + NEW_VALUE\n"
+        )
+        instance = {
+            "repo": "test/repo",
+            "base_commit": "deadbeef",
+            "patch": patch,
+            "code_file": "mod.py",
+            "test_file": "test_mod.py",
+        }
+
+        context = extractor.extract(instance, depth=2)
+
+        seed = next(s for s in context.seeds if s["label"] == "build")
+        assert "NEW_VALUE" in seed["metadata"]["source_code"]
+        assert "OLD_VALUE" not in seed["metadata"]["source_code"]
+
+        # helper is a context node (a callee), never touched by the
+        # patch -- its source must stay exactly what the KG has, since
+        # pre-patch and post-patch content are identical for it.
+        helper = next(n for n in context.context_nodes if n["label"] == "helper")
+        assert "return 42" in helper["metadata"]["source_code"]
+
+    def test_kg_own_cached_node_is_not_mutated(self, tmp_path):
+        # The fix must return a COPY of the seed node, never mutate the
+        # KG's own cached node in place -- that node object is shared
+        # across every extract() call that happens to touch it.
+        repo_dir = self._write_pre_patch_repo(tmp_path)
+        parser = RepoASTParser(max_workers=1)
+        kg = parser.parse_repo("test/repo", repo_dir)
+
+        engine = KGQueryEngine(kg)
+        extractor = TestContextExtractor(engine, repo_manager=_LocalFileRepoManager(repo_dir))
+
+        patch = (
+            "--- a/mod.py\n"
+            "+++ b/mod.py\n"
+            "@@ -1,3 +1,3 @@\n"
+            " class Widget:\n"
+            "     def build(self):\n"
+            "-        return self.helper() + OLD_VALUE\n"
+            "+        return self.helper() + NEW_VALUE\n"
+        )
+        instance = {
+            "repo": "test/repo",
+            "base_commit": "deadbeef",
+            "patch": patch,
+            "code_file": "mod.py",
+            "test_file": "test_mod.py",
+        }
+
+        extractor.extract(instance, depth=2)
+
+        raw_build_node = next(
+            n for n in kg["nodes"] if n["label"] == "build" and n["type"] == "method"
+        )
+        assert "OLD_VALUE" in raw_build_node["metadata"]["source_code"]
+        assert "NEW_VALUE" not in raw_build_node["metadata"]["source_code"]
+
+    def test_stale_seed_labels_is_empty_on_a_successful_refresh(self, tmp_path):
+        repo_dir = self._write_pre_patch_repo(tmp_path)
+        parser = RepoASTParser(max_workers=1)
+        kg = parser.parse_repo("test/repo", repo_dir)
+
+        engine = KGQueryEngine(kg)
+        extractor = TestContextExtractor(engine, repo_manager=_LocalFileRepoManager(repo_dir))
+
+        patch = (
+            "--- a/mod.py\n"
+            "+++ b/mod.py\n"
+            "@@ -1,3 +1,3 @@\n"
+            " class Widget:\n"
+            "     def build(self):\n"
+            "-        return self.helper() + OLD_VALUE\n"
+            "+        return self.helper() + NEW_VALUE\n"
+        )
+        instance = {
+            "repo": "test/repo",
+            "base_commit": "deadbeef",
+            "patch": patch,
+            "code_file": "mod.py",
+            "test_file": "test_mod.py",
+        }
+
+        context = extractor.extract(instance, depth=2)
+        assert context.stale_seed_labels == []
+
+    def test_stale_seed_labels_reports_a_seed_that_could_not_be_refreshed(self, tmp_path):
+        # A patch string with hunks for a DIFFERENT file than code_file --
+        # reconstruct_post_patch_source has nothing to apply, so the seed
+        # can't be found in a post-patch AST and must fall back to stale
+        # (pre-patch) source. This should be visible on the TestContext,
+        # not just silent.
+        repo_dir = self._write_pre_patch_repo(tmp_path)
+        parser = RepoASTParser(max_workers=1)
+        kg = parser.parse_repo("test/repo", repo_dir)
+
+        engine = KGQueryEngine(kg)
+        extractor = TestContextExtractor(engine, repo_manager=_LocalFileRepoManager(repo_dir))
+
+        patch = (
+            "--- a/other.py\n"
+            "+++ b/other.py\n"
+            "@@ -1,1 +1,1 @@\n"
+            "-old\n"
+            "+new\n"
+        )
+        instance = {
+            "repo": "test/repo",
+            "base_commit": "deadbeef",
+            "patch": patch,
+            "code_file": "mod.py",
+            "test_file": "test_mod.py",
+        }
+
+        context = extractor.extract(instance, depth=2)
+        # No changed functions found for mod.py in this patch, so extract()
+        # falls back to the file itself as the seed (see "If no changed
+        # functions found, use the code_file itself as seed" in extract()).
+        # A file-type seed has no matching (label, class) key in
+        # post_patch_ranges, so it must be reported as stale.
+        assert context.stale_seed_labels == ["mod.py"]
+
+
+class TestNestedSeedSourceIsPostPatch:
+    """A closure or a class defined inside a function body is a real,
+    resolvable seed too (builder.py's _emit_function recurses the same
+    way for kg_construction#74's nested-scope case). _PostPatchVisitor
+    must recurse into function bodies too, or a patch changing such a
+    seed silently keeps stale pre-patch source -- caught in review on
+    kg_construction#124's PR (#127).
+    """
+
+    def test_nested_closure_seed_reflects_the_patch(self, tmp_path):
+        (tmp_path / "mod.py").write_text(
+            "def outer():\n"
+            "    def inner():\n"
+            "        return OLD_VALUE\n"
+            "    return inner\n"
+        )
+        parser = RepoASTParser(max_workers=1)
+        kg = parser.parse_repo("test/repo", tmp_path)
+
+        engine = KGQueryEngine(kg)
+        extractor = TestContextExtractor(engine, repo_manager=_LocalFileRepoManager(tmp_path))
+
+        patch = (
+            "--- a/mod.py\n"
+            "+++ b/mod.py\n"
+            "@@ -1,4 +1,4 @@\n"
+            " def outer():\n"
+            "     def inner():\n"
+            "-        return OLD_VALUE\n"
+            "+        return NEW_VALUE\n"
+            "     return inner\n"
+        )
+        instance = {
+            "repo": "test/repo",
+            "base_commit": "deadbeef",
+            "patch": patch,
+            "code_file": "mod.py",
+            "test_file": "test_mod.py",
+        }
+
+        context = extractor.extract(instance, depth=2)
+
+        seed = next(s for s in context.seeds if s["label"] == "inner")
+        assert "NEW_VALUE" in seed["metadata"]["source_code"]
+        assert "OLD_VALUE" not in seed["metadata"]["source_code"]
+        assert context.stale_seed_labels == []

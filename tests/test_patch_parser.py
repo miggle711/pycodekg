@@ -495,6 +495,75 @@ class TestReconstructPostPatchSource:
 """
         assert reconstruct_post_patch_source(pre, patch, 'mod.py') is None
 
+    def test_trailing_newline_artifact_is_not_treated_as_a_context_line(self):
+        # str.split('\n') on a real, newline-terminated patch always adds
+        # a trailing '' element. Without stripping it, that artifact gets
+        # checked as a genuine blank context line against pre_lines and
+        # (correctly, but wrongly here) fails validation, since it has no
+        # real counterpart in the source (kg_construction#128).
+        pre = "def a():\n    return 1\n"
+        patch = (
+            "--- a/mod.py\n"
+            "+++ b/mod.py\n"
+            "@@ -1,2 +1,2 @@\n"
+            " def a():\n"
+            "-    return 1\n"
+            "+    return 2\n"
+        )
+        assert patch.endswith("\n")
+        post = reconstruct_post_patch_source(pre, patch, 'mod.py')
+        assert post == "def a():\n    return 2\n"
+
+    def test_context_line_mismatch_returns_none(self):
+        # pre_patch_source doesn't actually match what this patch assumes
+        # (a context line the diff claims is 'y = 2' isn't really there) --
+        # must be detected and rejected, not silently reconstructed wrong
+        # (kg_construction#128).
+        pre = "def a():\n    x = 1\n    z = 3\n    return x\n"
+        patch = (
+            "--- a/mod.py\n"
+            "+++ b/mod.py\n"
+            "@@ -1,4 +1,4 @@\n"
+            " def a():\n"
+            "     x = 1\n"
+            "     y = 2\n"
+            "-    return x\n"
+            "+    return x + 1\n"
+        )
+        assert reconstruct_post_patch_source(pre, patch, 'mod.py') is None
+
+    def test_removed_line_mismatch_returns_none(self):
+        pre = "def a():\n    return 1\n"
+        patch = (
+            "--- a/mod.py\n"
+            "+++ b/mod.py\n"
+            "@@ -1,2 +1,2 @@\n"
+            " def a():\n"
+            "-    return 999\n"
+            "+    return 2\n"
+        )
+        assert reconstruct_post_patch_source(pre, patch, 'mod.py') is None
+
+    def test_out_of_order_hunk_returns_none(self):
+        # A well-formed diff's hunks are always ascending and
+        # non-overlapping. A second hunk starting behind where the first
+        # hunk already advanced pre_idx means pre_patch_source doesn't
+        # correspond to what this patch was generated against -- the same
+        # mismatch as a forward overshoot past pre_lines' length, just in
+        # the other direction (kg_construction#128).
+        pre = "a\nb\nc\nd\ne\n"
+        patch = (
+            "--- a/mod.py\n"
+            "+++ b/mod.py\n"
+            "@@ -4,1 +4,1 @@\n"
+            "-d\n"
+            "+D\n"
+            "@@ -1,1 +1,1 @@\n"
+            "-a\n"
+            "+A\n"
+        )
+        assert reconstruct_post_patch_source(pre, patch, 'mod.py') is None
+
 
 class TestWhollyNewFunctionsAndClasses:
     """kg_construction#84: a wholly new top-level function/class doesn't
@@ -594,8 +663,7 @@ class TestWhollyNewFunctionsAndClasses:
         )
         patch = """--- a/mod.py
 +++ b/mod.py
-@@ -1,6 +1,10 @@
- class Alpha:
+@@ -2,5 +2,10 @@ class Alpha:
      pass
 
 
@@ -603,7 +671,7 @@ class TestWhollyNewFunctionsAndClasses:
 +    def method(self):
 +        return 1
 +
-
++
  class Beta:
      pass
 """

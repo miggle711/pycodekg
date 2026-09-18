@@ -113,9 +113,6 @@ def _build_prompt(serialized: dict) -> str:
         _snippet_section("Callers", context.get("callers", [])),
         _snippet_section("Callees", context.get("callees", [])),
         _snippet_section("Sibling methods", context.get("sibling_methods", [])),
-        _snippet_section(
-            "Existing tests already covering related code", context.get("existing_tests", [])
-        ),
     ]))
 
     return PROMPT_TEMPLATE.format(
@@ -147,7 +144,11 @@ def main():
     multi_seed_instances = []
 
     for row in rows:
-        repo_slug = row["repo"].replace("/", "_")
+        # Must match RepoKGBuilder._cache_path's sanitization exactly
+        # (kg/builder.py), which also replaces "-" and "." -- a repo
+        # like scikit-learn/scikit-learn produced kg files this script
+        # could never find, since only "/" was being replaced here.
+        repo_slug = row["repo"].replace("/", "_").replace("-", "_").replace(".", "_")
         commit = row["base_commit"]
         kg_path = kg_dir / f"kg_{repo_slug}_{commit[:8]}.json"
         if not kg_path.exists():

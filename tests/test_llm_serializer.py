@@ -56,6 +56,25 @@ class TestSerializeSeedSection:
         assert result["seed"][0]["module"] == ""
         assert result["seed"][0]["filepath"] == ""
 
+    def test_seed_does_not_include_decorators(self):
+        """decorators is redundant with source_code (it's the line directly
+        above the 'def', already included verbatim there) and isn't read by
+        kg-test-generation's prompt builder -- dropped from the seed
+        section entirely rather than serialized and ignored
+        (kg_construction#108).
+        """
+        seed_node = {
+            "id": "n1",
+            "label": "send",
+            "type": "method",
+            "metadata": {"decorators": ["staticmethod"], "source_code": "def send(self): ..."},
+        }
+        result = LLMSerializer().serialize(
+            {"seeds": [seed_node], "context_nodes": [], "edges": [], "test_nodes": []}
+        )
+
+        assert "decorators" not in result["seed"][0]
+
     def test_seed_exceptions_reads_from_raises_metadata_key(self):
         """_build_func_metadata (ast/helpers.py) stores raised exceptions
         under the 'raises' key (never 'exceptions') -- the seed section's
@@ -215,7 +234,10 @@ class TestSerializeContextSection:
         instance = {
             "seeds": [seed_node],
             "context_nodes": [parent_node],
-            "edges": [{"source": seed_node["id"], "target": parent_node["id"], "relation": "inherits"}],
+            "edges": [{
+                "source": seed_node["id"], "target": parent_node["id"], "relation": "inherits",
+                "metadata": {"confidence": "exact"},
+            }],
             "test_nodes": [],
         }
         result = LLMSerializer().serialize(instance)
@@ -225,6 +247,33 @@ class TestSerializeContextSection:
         assert related[0]["type"] == "parent_class"
         assert related[0]["module"] == "requests.sessions"
         assert related[0]["source"] == "seed"
+
+    def test_ambiguous_inherits_edge_is_excluded(self):
+        # A base class name that isn't unique repo-wide (e.g. "Meta") gets
+        # one inherits edge per same-named candidate, confidence='ambiguous'
+        # -- at most one candidate can be the real parent, so these edges
+        # are excluded rather than surfaced as unreliable "parent_class"
+        # context.
+        seed_node = {
+            "id": "seed", "label": "Session", "type": "class",
+            "metadata": {"filepath": "requests/sessions.py"},
+        }
+        parent_node = {
+            "id": "parent", "label": "Meta", "type": "class",
+            "metadata": {"filepath": "unrelated/models.py", "source_code": "class Meta: ..."},
+        }
+        instance = {
+            "seeds": [seed_node],
+            "context_nodes": [parent_node],
+            "edges": [{
+                "source": seed_node["id"], "target": parent_node["id"], "relation": "inherits",
+                "metadata": {"confidence": "ambiguous"},
+            }],
+            "test_nodes": [],
+        }
+        result = LLMSerializer().serialize(instance)
+
+        assert result["context"]["related"] == []
 
     def test_instantiation_includes_module(self):
         seed_node = {
@@ -238,7 +287,10 @@ class TestSerializeContextSection:
         instance = {
             "seeds": [seed_node],
             "context_nodes": [used_node],
-            "edges": [{"source": seed_node["id"], "target": used_node["id"], "relation": "uses"}],
+            "edges": [{
+                "source": seed_node["id"], "target": used_node["id"], "relation": "uses",
+                "metadata": {"confidence": "exact"},
+            }],
             "test_nodes": [],
         }
         result = LLMSerializer().serialize(instance)
@@ -248,6 +300,32 @@ class TestSerializeContextSection:
         assert related[0]["type"] == "instantiation"
         assert related[0]["module"] == "requests.adapters"
         assert related[0]["source"] == "seed"
+
+    def test_ambiguous_uses_edge_is_excluded(self):
+        # An instantiated-class candidate name that collides with another
+        # real class or function elsewhere in the repo gets confidence
+        # downgraded to 'ambiguous' (see test_uses_edge_confidence.py) --
+        # not a confirmed instantiation, so excluded from related.
+        seed_node = {
+            "id": "seed", "label": "send", "type": "method",
+            "metadata": {"filepath": "requests/sessions.py"},
+        }
+        used_node = {
+            "id": "used", "label": "Config", "type": "class",
+            "metadata": {"filepath": "unrelated/models.py"},
+        }
+        instance = {
+            "seeds": [seed_node],
+            "context_nodes": [used_node],
+            "edges": [{
+                "source": seed_node["id"], "target": used_node["id"], "relation": "uses",
+                "metadata": {"confidence": "ambiguous"},
+            }],
+            "test_nodes": [],
+        }
+        result = LLMSerializer().serialize(instance)
+
+        assert result["context"]["related"] == []
 
 
 class TestRelatedScopedToSeedOrSeedClass:
@@ -286,7 +364,10 @@ class TestRelatedScopedToSeedOrSeedClass:
             "metadata": {"filepath": "requests/structures.py"},
         }
         instance = self._method_seed_instance(
-            extra_edges=[{"source": "class_preparedrequest", "target": "used", "relation": "uses"}],
+            extra_edges=[{
+                "source": "class_preparedrequest", "target": "used", "relation": "uses",
+                "metadata": {"confidence": "exact"},
+            }],
             extra_nodes=[used_node],
         )
         result = LLMSerializer().serialize(instance)
@@ -302,7 +383,10 @@ class TestRelatedScopedToSeedOrSeedClass:
             "metadata": {"filepath": "requests/models.py"},
         }
         instance = self._method_seed_instance(
-            extra_edges=[{"source": "class_preparedrequest", "target": "parent", "relation": "inherits"}],
+            extra_edges=[{
+                "source": "class_preparedrequest", "target": "parent", "relation": "inherits",
+                "metadata": {"confidence": "exact"},
+            }],
             extra_nodes=[parent_node],
         )
         result = LLMSerializer().serialize(instance)
@@ -437,3 +521,107 @@ class TestSiblingMethods:
         )
 
         assert result["context"]["sibling_methods"] == []
+
+    def test_existing_tests_are_not_included_even_when_test_nodes_are_present(self):
+        # kg_only must not get existing-test content instruct's full-setting
+        # prompt has no equivalent of (pycodekg#130).
+        seed_node = {"id": "seed", "label": "f", "type": "function", "metadata": {}}
+        test_node = {
+            "id": "t1", "label": "test_f", "type": "function",
+            "metadata": {"source_code": "def test_f(): assert f() == 1"},
+        }
+        result = LLMSerializer().serialize(
+            {
+                "seeds": [seed_node],
+                "context_nodes": [],
+                "edges": [{"source": test_node["id"], "target": seed_node["id"], "relation": "tests"}],
+                "test_nodes": [test_node],
+            }
+        )
+
+        assert "existing_tests" not in result["context"]
+
+
+class TestContextItemsAreCapped:
+    """A high fan-in/fan-out seed (e.g. sklearn's check_array, called from
+    hundreds of sites) produced uncapped callers/callees/sibling_methods
+    lists under an unbounded depth-2 BFS, real prompts up to 2.7MB for a
+    single instance (kg_construction#141). Each category is capped so one
+    densely-connected seed can't blow out the prompt size.
+    """
+
+    def test_callers_are_capped(self):
+        seed_node = {"id": "seed", "label": "check_array", "type": "function", "metadata": {}}
+        caller_nodes = [
+            {"id": f"caller{i}", "label": f"fn{i}", "type": "function", "metadata": {}}
+            for i in range(15)
+        ]
+        edges = [
+            {"source": n["id"], "target": seed_node["id"], "relation": "calls"}
+            for n in caller_nodes
+        ]
+        result = LLMSerializer().serialize(
+            {"seeds": [seed_node], "context_nodes": caller_nodes, "edges": edges, "test_nodes": []}
+        )
+
+        assert len(result["context"]["callers"]) == 10
+
+    def test_callees_are_capped(self):
+        seed_node = {"id": "seed", "label": "f", "type": "function", "metadata": {}}
+        callee_nodes = [
+            {"id": f"callee{i}", "label": f"fn{i}", "type": "function", "metadata": {}}
+            for i in range(15)
+        ]
+        edges = [
+            {"source": seed_node["id"], "target": n["id"], "relation": "calls"}
+            for n in callee_nodes
+        ]
+        result = LLMSerializer().serialize(
+            {"seeds": [seed_node], "context_nodes": callee_nodes, "edges": edges, "test_nodes": []}
+        )
+
+        assert len(result["context"]["callees"]) == 10
+
+    def test_sibling_methods_are_capped(self):
+        seed_node = {"id": "seed", "label": "send", "type": "method", "metadata": {}}
+        seed_class_node = {"id": "cls", "label": "Session", "type": "class", "metadata": {}}
+        sibling_nodes = [
+            {"id": f"sib{i}", "label": f"method{i}", "type": "method", "metadata": {}}
+            for i in range(15)
+        ]
+        edges = [
+            {"source": seed_class_node["id"], "target": seed_node["id"], "relation": "contains"},
+        ] + [
+            {"source": seed_class_node["id"], "target": n["id"], "relation": "contains"}
+            for n in sibling_nodes
+        ]
+        result = LLMSerializer().serialize(
+            {
+                "seeds": [seed_node],
+                "context_nodes": [seed_class_node] + sibling_nodes,
+                "edges": edges,
+                "test_nodes": [],
+            }
+        )
+
+        assert len(result["context"]["sibling_methods"]) == 10
+
+    def test_cap_keeps_first_encountered_order_not_arbitrary(self):
+        # Determinism matters here: a rebuild of kg_prompts.json must
+        # keep selecting the same 10 callers, not some other subset,
+        # since edges are stored in a fixed order in the KG, not a set.
+        seed_node = {"id": "seed", "label": "f", "type": "function", "metadata": {}}
+        caller_nodes = [
+            {"id": f"caller{i}", "label": f"fn{i}", "type": "function", "metadata": {}}
+            for i in range(15)
+        ]
+        edges = [
+            {"source": n["id"], "target": seed_node["id"], "relation": "calls"}
+            for n in caller_nodes
+        ]
+        result = LLMSerializer().serialize(
+            {"seeds": [seed_node], "context_nodes": caller_nodes, "edges": edges, "test_nodes": []}
+        )
+
+        kept_names = [c["name"] for c in result["context"]["callers"]]
+        assert kept_names == [f"fn{i}" for i in range(10)]

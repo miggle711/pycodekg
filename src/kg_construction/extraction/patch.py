@@ -181,7 +181,12 @@ def reconstruct_post_patch_source(pre_patch_source: str, patch: str, code_file: 
     current_file = None
     saw_any_hunk = False
 
+    # A trailing '' is a real artifact of splitting a newline-terminated
+    # patch string, not a genuine blank context line. Left in, it looks
+    # exactly like one and fails validation (kg_construction#128).
     lines = patch.split('\n')
+    if patch.endswith('\n'):
+        lines = lines[:-1]
     i = 0
     while i < len(lines):
         line = lines[i]
@@ -203,6 +208,12 @@ def reconstruct_post_patch_source(pre_patch_source: str, patch: str, code_file: 
                 continue
             saw_any_hunk = True
             hunk_start = int(match.group(1)) - 1  # 0-indexed
+            # -1 is the real "new file" convention (@@ -0,0 @@), not a
+            # mismatch. Anything beyond pre_lines' real length, or behind
+            # pre_idx (an out-of-order hunk), means pre_patch_source
+            # doesn't match what this patch assumes (kg_construction#128).
+            if hunk_start > len(pre_lines) or (hunk_start != -1 and hunk_start < pre_idx):
+                return None
             # Copy everything between the end of the last hunk (or file
             # start) and the start of this one, unchanged.
             out_lines.extend(pre_lines[pre_idx:hunk_start])
@@ -215,16 +226,23 @@ def reconstruct_post_patch_source(pre_patch_source: str, patch: str, code_file: 
             continue
 
         if line.startswith('-') and not line.startswith('---'):
+            # Must match pre_patch_source at this position (kg_construction#128).
+            if pre_idx >= len(pre_lines) or pre_lines[pre_idx] != line[1:]:
+                return None
             pre_idx += 1  # removed: present in pre, absent from post
         elif line.startswith('+') and not line.startswith('+++'):
             out_lines.append(line[1:])  # added: present in post only
         elif line.startswith(' '):
+            if pre_idx >= len(pre_lines) or pre_lines[pre_idx] != line[1:]:
+                return None
             out_lines.append(pre_lines[pre_idx])
             pre_idx += 1
         # A blank line with no marker at all (some diffs omit the leading
         # space on a genuinely empty context line) behaves like context.
         elif line == '':
-            out_lines.append(pre_lines[pre_idx] if pre_idx < len(pre_lines) else '')
+            if pre_idx >= len(pre_lines) or pre_lines[pre_idx] != '':
+                return None
+            out_lines.append(pre_lines[pre_idx])
             pre_idx += 1
 
         i += 1

@@ -47,6 +47,16 @@ class LLMInput:
     instructions: Dict
 
 
+# Per-seed cap on callers/callees/sibling_methods. A high fan-in/fan-out
+# function (e.g. sklearn's check_array, sympy's sympify) has a real
+# caller/callee list in the hundreds under an uncapped depth-2 BFS,
+# producing prompts up to 2.7MB for a single instance -- both a context-
+# window overflow risk and noise that likely hurts generation quality
+# even when it fits (kg_construction#141). 10 real examples of usage is
+# enough signal; #11 onward adds no new information.
+MAX_CONTEXT_ITEMS_PER_CATEGORY = 10
+
+
 class LLMSerializer:
     """Converts TestContext (flat subgraph) to LLM-friendly hierarchical JSON."""
 
@@ -76,9 +86,9 @@ class LLMSerializer:
         # Build Seed section from seed nodes
         seed_section = self._build_seed_section(seeds, node_by_id)
 
-        # Build Context section from context_nodes, edges, and test_nodes
+        # Build Context section from context_nodes and edges
         context_section = self._build_context_section(
-            seeds, context_nodes, test_nodes, edges, node_by_id
+            seeds, context_nodes, edges, node_by_id
         )
 
         # Build Instructions section with coverage targets and conventions
@@ -132,7 +142,6 @@ class LLMSerializer:
             "docstring": metadata.get("docstring", ""),
             "exceptions": metadata.get("raises", []),
             "source_code": metadata.get("source_code", ""),
-            "decorators": metadata.get("decorators", []),
             "type_hints": metadata.get("type_hints", {}),
         }
 
@@ -140,7 +149,6 @@ class LLMSerializer:
         self,
         seeds: List[Dict],
         context_nodes: List[Dict],
-        test_nodes: List[Dict],
         edges: List[Dict],
         node_by_id: Dict,
     ) -> Dict:
@@ -163,8 +171,11 @@ class LLMSerializer:
               flat single-function extraction (the baseline arm) can
               never provide, since it has no notion of "what else does
               this class define" (see issue #50 in kg-test-generation).
-            - existing_tests: Test functions that reference the seed
             - patterns: Control flow, type hints, error handling patterns
+
+        existing_tests is deliberately not included: instruct's full-setting
+        prompt shows no existing test content, and full-only generation is
+        meant to be a from-scratch task for both arms (miggle711/pycodekg#130).
         """
         seed_ids = {s["id"] for s in seeds}
 
@@ -186,7 +197,6 @@ class LLMSerializer:
         callees = []
         related = []
         sibling_methods = []
-        existing_tests = []
 
         # Extract relationships from edges
         for edge in edges:
@@ -201,11 +211,13 @@ class LLMSerializer:
 
             # Edges pointing to seed = callers
             if tgt_id in seed_ids and relation == "calls":
-                callers.append(self._node_to_snippet(src_node))
+                if len(callers) < MAX_CONTEXT_ITEMS_PER_CATEGORY:
+                    callers.append(self._node_to_snippet(src_node))
 
             # Edges from seed = callees
             elif src_id in seed_ids and relation == "calls":
-                callees.append(self._node_to_snippet(tgt_node))
+                if len(callees) < MAX_CONTEXT_ITEMS_PER_CATEGORY:
+                    callees.append(self._node_to_snippet(tgt_node))
 
             # Inheritance and composition -- restricted to edges sourced from
             # the seed itself OR the seed's own class (src_id in seed_ids or
@@ -228,7 +240,16 @@ class LLMSerializer:
             # PreparedRequest, not just __init__. `source` records which of
             # the two applies so the model can tell "the seed does this
             # directly" from "the seed's class does this elsewhere."
-            elif relation == "inherits" and (src_id in seed_ids or src_id in seed_class_ids):
+            # Ambiguous-confidence inherits edges are excluded: with N
+            # same-named-class candidates, at most 1 can be the real parent
+            # (measured 98.58% of real inherits edges are ambiguous; one
+            # seed pulled in 929 unrelated "parent_class" entries before
+            # this filter).
+            elif (
+                relation == "inherits"
+                and (src_id in seed_ids or src_id in seed_class_ids)
+                and edge.get("metadata", {}).get("confidence") == "exact"
+            ):
                 related.append(
                     {
                         "type": "parent_class",
@@ -238,7 +259,16 @@ class LLMSerializer:
                         "source": "seed" if src_id in seed_ids else "seed_class",
                     }
                 )
-            elif relation == "uses" and (src_id in seed_ids or src_id in seed_class_ids):
+            # Ambiguous-confidence uses edges are excluded, same reasoning
+            # as inherits above: the instantiated-class heuristic downgrades
+            # to 'ambiguous' when the candidate name collides with another
+            # real class or function elsewhere in the repo, so an ambiguous
+            # edge isn't a confirmed instantiation.
+            elif (
+                relation == "uses"
+                and (src_id in seed_ids or src_id in seed_class_ids)
+                and edge.get("metadata", {}).get("confidence") == "exact"
+            ):
                 related.append(
                     {
                         "type": "instantiation",
@@ -259,16 +289,8 @@ class LLMSerializer:
                 and tgt_id not in seed_ids
                 and tgt_node.get("type") in ("method", "function")
             ):
-                sibling_methods.append(self._node_to_snippet(tgt_node))
-
-        # Extract test functions
-        for test_node in test_nodes:
-            existing_tests.append(
-                {
-                    "name": test_node.get("label", ""),
-                    "source_code": test_node.get("metadata", {}).get("source_code", ""),
-                }
-            )
+                if len(sibling_methods) < MAX_CONTEXT_ITEMS_PER_CATEGORY:
+                    sibling_methods.append(self._node_to_snippet(tgt_node))
 
         # Extract patterns from seed nodes
         patterns = self._extract_patterns(seeds, context_nodes)
@@ -278,7 +300,6 @@ class LLMSerializer:
             "callees": callees,
             "related": related,
             "sibling_methods": sibling_methods,
-            "existing_tests": existing_tests,
             "patterns": patterns,
         }
 

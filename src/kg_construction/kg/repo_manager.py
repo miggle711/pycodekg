@@ -104,8 +104,15 @@ class RepoManager:
                     f"origin. Verify the commit SHA is correct and reachable."
                 ) from e
         with tarfile.open(archive_path) as tar:
-            # filter='data' prevents path traversal attacks from malicious tarballs
-            tar.extractall(dest, filter='data')
+            # filter='data' rejects some real, non-malicious symlinks
+            # (e.g. django's docs tree), aborting the whole extraction.
+            # Extract member by member so one bad symlink is skipped
+            # instead of failing the entire build.
+            for member in tar.getmembers():
+                try:
+                    tar.extract(member, dest, filter='data')
+                except tarfile.FilterError:
+                    continue
         archive_path.unlink()
 
     def read_file_at_commit(self, repo: str, commit: str, path: str) -> str:

@@ -128,6 +128,42 @@ class TestReadFileAtCommit:
             manager.read_file_at_commit("test/repo", first_commit, "nonexistent.py")
 
 
+@pytest.fixture
+def remote_repo_with_escaping_symlink(tmp_path):
+    """A repo containing a real file plus a symlink that resolves
+    outside the extraction destination, the shape that trips
+    tarfile's filter='data' check (kg_construction#94 -- django's
+    docs tree has real, non-malicious symlinks like this).
+    """
+    remote = tmp_path / "remote"
+    remote.mkdir()
+    _run(["git", "init", "-q"], cwd=remote)
+    _run(["git", "config", "user.email", "test@test.com"], cwd=remote)
+    _run(["git", "config", "user.name", "test"], cwd=remote)
+    (remote / "real_file.py").write_text("x = 1")
+    (remote / "escapes_outside.py").symlink_to("/etc/passwd")
+    _run(["git", "add", "-A"], cwd=remote)
+    _run(["git", "commit", "-q", "-m", "initial commit"], cwd=remote)
+    return remote
+
+
+class TestRepoManagerEscapingSymlink:
+    def test_escaping_symlink_is_skipped_not_fatal(
+        self, tmp_path, remote_repo_with_escaping_symlink
+    ):
+        commit = _head_commit(remote_repo_with_escaping_symlink)
+        manager = LocalRepoManager(
+            cache_dir=tmp_path / "cache",
+            remote_path=remote_repo_with_escaping_symlink,
+        )
+
+        dest = tmp_path / "dest"
+        manager.extract_at_commit("test/repo", commit, dest)
+
+        assert (dest / "real_file.py").read_text() == "x = 1"
+        assert not (dest / "escapes_outside.py").exists()
+
+
 class TestRepoManagerCloneFailureCleanup:
     """A failed clone must not leave a partial directory behind -- kg_construction#72:
     path.exists() is the only cache check, so a half-written clone left on disk
