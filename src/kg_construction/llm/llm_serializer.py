@@ -18,6 +18,19 @@ import json
 from typing import Dict, List, Optional, Set
 from dataclasses import dataclass
 
+from kg_construction.ast.helpers import _is_test_file
+
+
+def _is_test_caller(node: Dict) -> bool:
+    """True if a caller node is test code, which must not reach the prompt.
+
+    Full-setting generation is a from-scratch task for both arms, so existing
+    tests (and helpers defined in test files) are never shown to the model.
+    """
+    if node.get("type") == "test_function":
+        return True
+    return _is_test_file(node.get("metadata", {}).get("filepath", ""))
+
 
 def _filepath_to_module(filepath: str) -> str:
     """Convert a repo-relative filepath (e.g. "requests/sessions.py") to a
@@ -209,8 +222,12 @@ class LLMSerializer:
             if not src_node or not tgt_node:
                 continue
 
-            # Edges pointing to seed = callers
+            # Edges pointing to seed = callers. Test code is skipped: it would
+            # show the model existing tests, some from the very file it is
+            # asked to write (testgeneval#87).
             if tgt_id in seed_ids and relation == "calls":
+                if _is_test_caller(src_node):
+                    continue
                 if len(callers) < MAX_CONTEXT_ITEMS_PER_CATEGORY:
                     callers.append(self._node_to_snippet(src_node))
 
