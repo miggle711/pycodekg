@@ -542,6 +542,64 @@ class TestSiblingMethods:
         assert "existing_tests" not in result["context"]
 
 
+class TestTestCallersAreExcluded:
+    """Existing tests also reach a seed through 'calls' edges (a test calls
+    the function it tests), not only through 'tests' edges. Rendering them
+    as callers showed kg_only real tests, some from the very file it is asked
+    to write (testgeneval#87), so callers that are test code are skipped.
+    """
+
+    def _serialize(self, caller_nodes):
+        seed_node = {
+            "id": "seed", "label": "send", "type": "method",
+            "metadata": {"filepath": "requests/sessions.py"},
+        }
+        edges = [
+            {"source": n["id"], "target": seed_node["id"], "relation": "calls"}
+            for n in caller_nodes
+        ]
+        return LLMSerializer().serialize(
+            {"seeds": [seed_node], "context_nodes": caller_nodes, "edges": edges, "test_nodes": []}
+        )
+
+    def test_test_function_caller_is_excluded(self):
+        test_caller = {
+            "id": "t", "label": "test_send", "type": "test_function",
+            "metadata": {"filepath": "tests/test_sessions.py"},
+        }
+        result = self._serialize([test_caller])
+
+        assert result["context"]["callers"] == []
+
+    def test_non_test_named_caller_in_a_test_file_is_excluded(self):
+        # e.g. setUp or a helper in a test class: not named test_*, but still test code.
+        helper = {
+            "id": "h", "label": "setUp", "type": "method",
+            "metadata": {"filepath": "tests/test_sessions.py"},
+        }
+        real_caller = {
+            "id": "r", "label": "request", "type": "method",
+            "metadata": {"filepath": "requests/sessions.py"},
+        }
+        result = self._serialize([helper, real_caller])
+
+        assert [c["name"] for c in result["context"]["callers"]] == ["request"]
+
+    def test_test_callers_do_not_use_up_the_cap(self):
+        test_callers = [
+            {"id": f"t{i}", "label": f"test_{i}", "type": "test_function",
+             "metadata": {"filepath": "tests/test_sessions.py"}}
+            for i in range(10)
+        ]
+        real_caller = {
+            "id": "r", "label": "request", "type": "method",
+            "metadata": {"filepath": "requests/sessions.py"},
+        }
+        result = self._serialize(test_callers + [real_caller])
+
+        assert [c["name"] for c in result["context"]["callers"]] == ["request"]
+
+
 class TestContextItemsAreCapped:
     """A high fan-in/fan-out seed (e.g. sklearn's check_array, called from
     hundreds of sites) produced uncapped callers/callees/sibling_methods
