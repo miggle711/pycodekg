@@ -70,6 +70,8 @@ from kg_construction.ast.helpers import (
     _get_factory_call_sites,
     _build_func_metadata,
     _collect_file_level_info,
+    assign_qualnames,
+    iter_scope_defs,
 )
 from kg_construction.kg.repo_manager import RepoManager
 from kg_construction.kg import type_inference
@@ -104,7 +106,14 @@ MAX_FILE_LINES = 20000
 #    body, e.g. Django's real `class __proxy__` inside `lazy()`) are now
 #    emitted as real class/method nodes (kg_construction#102) -- an old
 #    cached KG is silently missing these nodes entirely.
-SCHEMA_VERSION = 3
+# 4: definitions nested under compound statements (`if`/`try`/`with`/`for`/
+#    `while`/`match`) are now emitted, and a second or later definition with
+#    the same qualified name in a file (property getter + setter, `if/else`
+#    alternatives) gets its own node with a unique qualname ('C.x#2') instead
+#    of silently collapsing into the first. Function/class nodes carry
+#    metadata['qualname']. An old cached KG is missing the former and has
+#    collapsed the latter.
+SCHEMA_VERSION = 4
 
 
 @dataclass
@@ -214,6 +223,10 @@ def _parse_file(args: Tuple[str, str, str]) -> Optional[Dict]:
     file_id = _make_id(f"file_{repo}_{rel_path}")
     file_type = 'test_file' if _is_test_file(rel_path) else 'file'
     import_map, exports, constants = _collect_file_level_info(tree)
+    # Unique qualname per def in this file (see assign_qualnames); node IDs
+    # and metadata['qualname'] are derived from it rather than rebuilt from
+    # nesting so two same-named defs can't share an ID.
+    qualnames: Dict[int, str] = {id(d): q for d, q in assign_qualnames(tree)}
 
     nodes.append(asdict(KGNode(
         id=file_id, type=file_type, label=Path(rel_path).name,
@@ -509,6 +522,7 @@ def _parse_file(args: Tuple[str, str, str]) -> Optional[Dict]:
             id=class_id, type='class', label=class_node.name,
             metadata={
                 'filepath': rel_path, 'repo': repo, 'lineno': class_node.lineno,
+                'qualname': qualname,
                 'bases': bases,
                 'decorators': _get_decorators(class_node),
                 'docstring': _get_docstring(class_node),
@@ -530,15 +544,15 @@ def _parse_file(args: Tuple[str, str, str]) -> Optional[Dict]:
             edges.append(asdict(KGEdge(source=class_id, target=inst_cls, relation='uses',
                                        metadata={'unresolved': True})))
 
-        for child in ast.iter_child_nodes(class_node):
+        for child in iter_scope_defs(class_node):
             if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 _emit_function(
-                    child, container_id=class_id, qualname=f"{qualname}.{child.name}",
+                    child, container_id=class_id, qualname=qualnames[id(child)],
                     parent_class=class_node.name, enclosing_class_id=class_id,
                     bases=bases,
                 )
-            elif isinstance(child, ast.ClassDef):
-                _emit_class(child, container_id=class_id, qualname=f"{qualname}.{child.name}")
+            else:
+                _emit_class(child, container_id=class_id, qualname=qualnames[id(child)])
 
     def _emit_function(
         func_node: Union[ast.FunctionDef, ast.AsyncFunctionDef],
@@ -576,13 +590,15 @@ def _parse_file(args: Tuple[str, str, str]) -> Optional[Dict]:
             'method' if parent_class is not None else 'function'
         )
         func_id = _make_id(f"func_{repo}_{rel_path}_{qualname}")
+        func_metadata = _build_func_metadata(func_node, rel_path, repo,
+                                             parent_class=parent_class,
+                                             parent_function=parent_function,
+                                             import_map=import_map,
+                                             source_lines=source_lines)
+        func_metadata['qualname'] = qualname
         nodes.append(asdict(KGNode(
             id=func_id, type=func_type, label=func_node.name,
-            metadata=_build_func_metadata(func_node, rel_path, repo,
-                                          parent_class=parent_class,
-                                          parent_function=parent_function,
-                                          import_map=import_map,
-                                          source_lines=source_lines)
+            metadata=func_metadata
         )))
         edges.append(asdict(KGEdge(source=container_id, target=func_id, relation='contains')))
 
@@ -616,21 +632,22 @@ def _parse_file(args: Tuple[str, str, str]) -> Optional[Dict]:
 
         _record_factory_sites(func_node, enclosing_class_id=enclosing_class_id)
 
-        for child in ast.iter_child_nodes(func_node):
+        for child in iter_scope_defs(func_node):
             if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 _emit_function(
-                    child, container_id=func_id, qualname=f"{qualname}.{child.name}",
+                    child, container_id=func_id, qualname=qualnames[id(child)],
                     parent_function=func_node.name, enclosing_class_id=enclosing_class_id,
                 )
-            elif isinstance(child, ast.ClassDef):
-                _emit_class(child, container_id=func_id, qualname=f"{qualname}.{child.name}")
+            else:
+                _emit_class(child, container_id=func_id, qualname=qualnames[id(child)])
 
-    # Emit class, method, and top-level function nodes
-    for node in ast.iter_child_nodes(tree):
+    # Emit class, method, and top-level function nodes (including ones
+    # nested under module-level if/try/with blocks)
+    for node in iter_scope_defs(tree):
         if isinstance(node, ast.ClassDef):
-            _emit_class(node, container_id=file_id, qualname=node.name)
-        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            _emit_function(node, container_id=file_id, qualname=node.name)
+            _emit_class(node, container_id=file_id, qualname=qualnames[id(node)])
+        else:
+            _emit_function(node, container_id=file_id, qualname=qualnames[id(node)])
 
     factory_sites_out = [
         (rel_path, source_class_id, source_name, line, col)

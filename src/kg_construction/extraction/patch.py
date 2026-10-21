@@ -20,7 +20,7 @@ see kg_construction#75 for the investigation and rationale.
 
 import ast
 import re
-from typing import List, NamedTuple, Optional, Set, Tuple
+from typing import Dict, List, NamedTuple, Optional, Set, Tuple
 
 
 class _FunctionRange(NamedTuple):
@@ -36,6 +36,11 @@ class _FunctionRange(NamedTuple):
     enclosing_function: Optional[str]
     start_line: int
     end_line: int
+    # The `def`/`class` line itself (what a KG node's metadata['lineno']
+    # holds), as opposed to start_line which may be a decorator line above
+    # it. Lets a caller tell same-named definitions in one file apart
+    # (a property getter and its @x.setter).
+    def_line: int
 
 
 def _function_ranges(source: str) -> List[_FunctionRange]:
@@ -62,6 +67,7 @@ def _function_ranges(source: str) -> List[_FunctionRange]:
                     name=child.name, is_class=False,
                     enclosing_class=enclosing_class, enclosing_function=enclosing_function,
                     start_line=start_line, end_line=child.end_lineno,
+                    def_line=child.lineno,
                 ))
                 visit(child, enclosing_class=None, enclosing_function=child.name)
             elif isinstance(child, ast.ClassDef):
@@ -72,6 +78,7 @@ def _function_ranges(source: str) -> List[_FunctionRange]:
                     name=child.name, is_class=True,
                     enclosing_class=enclosing_class, enclosing_function=enclosing_function,
                     start_line=start_line, end_line=child.end_lineno,
+                    def_line=child.lineno,
                 ))
                 visit(child, enclosing_class=child.name, enclosing_function=None)
             else:
@@ -409,10 +416,33 @@ class PatchParser:
             same-class-method-name ambiguity needs the class hint, and a
             nested function can't collide with a class method that way.
         """
+        return set(PatchParser.extract_changed_defs(patch, code_file, pre_patch_source))
+
+    @staticmethod
+    def extract_changed_defs(
+        patch: str, code_file: str, pre_patch_source: str
+    ) -> Dict[Tuple[str, Optional[str]], Set[int]]:
+        """Same as extract_changed_functions_with_scope, but also reports
+        WHICH same-named definition changed.
+
+        Two definitions can share (name, enclosing_class) in one file -- a
+        property getter and its `@x.setter`, `if/else` alternative defs.
+        The (name, class) pair alone can't say which one the patch touched.
+
+        Returns:
+            {(name, enclosing_class_or_None): {pre-patch `def`/`class`
+            line numbers}}. The line numbers are the same value a KG node
+            stores as metadata['lineno'], so a caller can narrow several
+            same-named nodes to the ones the patch actually changed. The
+            set is empty for an entity found ONLY by the post-patch pass
+            (a wholly new definition): it has no pre-patch line, so there is
+            nothing to narrow by.
+        """
         pre_ranges = _function_ranges(pre_patch_source)
         removed_lines, insertion_anchor_lines = _changed_pre_patch_lines(patch, code_file)
 
         changed: Set[Tuple[str, Optional[str]]] = set()
+        def_lines: Dict[Tuple[str, Optional[str]], Set[int]] = {}
         # Class-level matches found ONLY via the insertion-anchor pass are
         # provisional: an anchor landing on a blank line right after some
         # method's closing line has no smaller range to match (the method's
@@ -432,6 +462,7 @@ class PatchParser:
             if match is None:
                 continue  # module-level change
             changed.add((match.name, match.enclosing_class))
+            def_lines.setdefault((match.name, match.enclosing_class), set()).add(match.def_line)
 
         for line in insertion_anchor_lines:
             match = _innermost_range(pre_ranges, line)
@@ -446,6 +477,7 @@ class PatchParser:
             if match.is_class and pair not in changed:
                 anchor_only_class_matches.add(pair)
             changed.add(pair)
+            def_lines.setdefault(pair, set()).add(match.def_line)
 
         post_patch_source = reconstruct_post_patch_source(pre_patch_source, patch, code_file)
         if post_patch_source is not None:
@@ -470,4 +502,4 @@ class PatchParser:
             if pair[0] in class_names_with_method_match
         }
 
-        return changed
+        return {pair: def_lines.get(pair, set()) for pair in changed}

@@ -22,6 +22,8 @@ from pathlib import Path
 from typing import List, Dict, Optional, Set, Tuple
 
 from kg_construction.ast.helpers import (
+    assign_qualnames,
+    iter_scope_defs,
     _make_id,
     _build_func_metadata,
     _collect_file_level_info,
@@ -287,7 +289,10 @@ class TestContextExtractor:
         pre_patch_source = self.repo_manager.read_file_at_commit(
             instance['repo'], instance['base_commit'], instance['code_file']
         )
-        changed = self.patch_parser.extract_changed_functions_with_scope(
+        # {(name, enclosing_class): {pre-patch def lines}} -- the lines say
+        # WHICH same-named definition changed (a property getter vs its
+        # @x.setter), since (name, class) alone can't.
+        changed = self.patch_parser.extract_changed_defs(
             instance['patch'],
             instance['code_file'],
             pre_patch_source,
@@ -300,6 +305,11 @@ class TestContextExtractor:
         post_patch_source = reconstruct_post_patch_source(
             pre_patch_source, instance['patch'], instance['code_file']
         )
+        # Post-patch def nodes, looked up by the same unique qualname the KG
+        # node carries in metadata['qualname'] (ast.helpers.assign_qualnames),
+        # with the older (label, enclosing class) key as a fallback for KG
+        # nodes that have no qualname (hand-built, or from a pre-v4 KG file).
+        post_patch_by_qualname: Dict[str, ast.AST] = {}
         post_patch_ranges: Dict[Tuple[str, Optional[str]], ast.AST] = {}
         post_patch_lines: List[str] = []
         if post_patch_source is not None:
@@ -309,24 +319,7 @@ class TestContextExtractor:
                 post_tree = None
             if post_tree is not None:
                 post_patch_lines = post_patch_source.splitlines(keepends=True)
-                class_stack: List[str] = []
-
-                class _PostPatchVisitor(ast.NodeVisitor):
-                    def visit_ClassDef(self, node):
-                        post_patch_ranges[(node.name, class_stack[-1] if class_stack else None)] = node
-                        class_stack.append(node.name)
-                        self.generic_visit(node)
-                        class_stack.pop()
-
-                    def visit_FunctionDef(self, node):
-                        # Recurse so nested functions/classes are found
-                        # too (matches builder.py's _emit_function).
-                        post_patch_ranges[(node.name, class_stack[-1] if class_stack else None)] = node
-                        self.generic_visit(node)
-
-                    visit_AsyncFunctionDef = visit_FunctionDef
-
-                _PostPatchVisitor().visit(post_tree)
+                post_patch_by_qualname, post_patch_ranges = self._index_post_patch_defs(post_tree)
 
         # Find the code file node
         code_file_results = self.engine.find_file_by_path(instance['code_file'])
@@ -345,7 +338,8 @@ class TestContextExtractor:
         # None to str, so sort on a key that substitutes "" for None.
         seed_ids: List[str] = []
         resolved_entity_count = 0
-        for name, enclosing_class in sorted(changed, key=lambda pair: (pair[0], pair[1] or "")):
+        for (name, enclosing_class), def_lines in sorted(
+                changed.items(), key=lambda item: (item[0][0], item[0][1] or "")):
             funcs = self.engine.find_function_by_name(name)
             # Filter to only those in the code_file
             matches = [
@@ -370,6 +364,18 @@ class TestContextExtractor:
                 ]
                 if len(narrowed) == 1:
                     matches = narrowed
+            # Still several same-named, same-class definitions (a property
+            # getter and its @x.setter, if/else alternatives): narrow to the
+            # ones the patch's changed lines actually fall inside, via each
+            # node's own `def` line. An entity found only by the post-patch
+            # pass has no pre-patch lines, so it isn't narrowed here.
+            if len(matches) > 1 and def_lines:
+                by_line = [
+                    func for func in matches
+                    if func['metadata'].get('lineno') in def_lines
+                ]
+                if by_line:
+                    matches = by_line
 
             # A changed entity can be a CLASS itself (e.g. a class-body
             # attribute assignment outside any method) -- find_function_by_name
@@ -460,7 +466,7 @@ class TestContextExtractor:
             if n['id'] not in seed_node_ids:
                 continue
             refreshed, was_refreshed = self._refresh_seed_source(
-                n, post_patch_ranges, post_patch_lines
+                n, post_patch_ranges, post_patch_lines, post_patch_by_qualname
             )
             seed_nodes.append(refreshed)
             if not was_refreshed:
@@ -501,11 +507,45 @@ class TestContextExtractor:
             relationship_type_counts=relationship_type_counts,
         )
 
+    @staticmethod
+    def _index_post_patch_defs(
+        tree: ast.AST,
+    ) -> Tuple[Dict[str, ast.AST], Dict[Tuple[str, Optional[str]], ast.AST]]:
+        """Index a post-patch tree's defs two ways, for _refresh_seed_source.
+
+        Returns (by_qualname, by_label_class):
+            by_qualname: unique qualname (ast.helpers.assign_qualnames) ->
+                def node. Matches a KG node's metadata['qualname'] exactly.
+            by_label_class: (name, enclosing class name) -> def node, the
+                older fallback for KG nodes without a qualname. The class
+                part follows how the KG records `class`: set only for a
+                function/method that is a DIRECT member of a class (None
+                for closures and for classes, even nested ones). Where
+                several defs share a key, the last wins.
+        """
+        pairs = assign_qualnames(tree)
+        direct_class: Dict[int, str] = {}
+        for def_node, _qualname in pairs:
+            if isinstance(def_node, ast.ClassDef):
+                for member in iter_scope_defs(def_node):
+                    direct_class[id(member)] = def_node.name
+
+        by_qualname: Dict[str, ast.AST] = {}
+        by_label_class: Dict[Tuple[str, Optional[str]], ast.AST] = {}
+        for def_node, qualname in pairs:
+            by_qualname[qualname] = def_node
+            enclosing = (
+                None if isinstance(def_node, ast.ClassDef) else direct_class.get(id(def_node))
+            )
+            by_label_class[(def_node.name, enclosing)] = def_node
+        return by_qualname, by_label_class
+
     def _refresh_seed_source(
         self,
         node: Dict,
         post_patch_ranges: Dict[Tuple[str, Optional[str]], ast.AST],
         post_patch_lines: List[str],
+        post_patch_by_qualname: Optional[Dict[str, ast.AST]] = None,
     ) -> Tuple[Dict, bool]:
         """Return (node, was_refreshed) -- a copy of a seed node with
         source_code/signature replaced by the post-patch version, leaving
@@ -525,8 +565,15 @@ class TestContextExtractor:
         non-empty TestContext.stale_seed_labels as worth investigating,
         not routine.
         """
-        key = (node['label'], node.get('metadata', {}).get('class'))
-        ast_node = post_patch_ranges.get(key)
+        # Exact match by unique qualname first -- the only lookup that can
+        # tell a property getter from its same-named setter.
+        ast_node = None
+        qualname = node.get('metadata', {}).get('qualname')
+        if qualname and post_patch_by_qualname:
+            ast_node = post_patch_by_qualname.get(qualname)
+        if ast_node is None:
+            key = (node['label'], node.get('metadata', {}).get('class'))
+            ast_node = post_patch_ranges.get(key)
         if ast_node is None:
             return node, False
 

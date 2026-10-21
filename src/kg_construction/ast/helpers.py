@@ -54,6 +54,69 @@ def _is_test_file(filepath: str) -> bool:
     )
 
 
+_DEF_TYPES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+
+# Nodes a def can be nested under without changing scope: statements
+# (if/try/with/for/while/match...) plus the two non-stmt containers that
+# hold statement bodies. Expressions are skipped on purpose, they can't
+# contain a def, and descending into them would risk RecursionError on
+# very deep expressions (e.g. a long chain of `a + b + c + ...`).
+_SCOPE_TRANSPARENT = (ast.stmt, ast.ExceptHandler) + (
+    (ast.match_case,) if hasattr(ast, 'match_case') else ()
+)
+
+
+def iter_scope_defs(node: ast.AST):
+    """Yield the function/class defs that belong directly to `node`'s scope,
+    in source order.
+
+    Looks through compound statements (`if`/`try`/`with`/`for`/`while`/
+    `match`), which don't introduce a scope, so a def under
+    `if sys.version_info[0] == 2:` still belongs to the enclosing module/
+    class/function. Stops at each def it finds and does not look inside it:
+    a def's own body is a new scope, handled by calling this again on that
+    def (see assign_qualnames).
+    """
+    for child in ast.iter_child_nodes(node):
+        if isinstance(child, _DEF_TYPES):
+            yield child
+        elif isinstance(child, _SCOPE_TRANSPARENT):
+            yield from iter_scope_defs(child)
+
+
+def assign_qualnames(tree: ast.AST) -> List[Tuple[ast.AST, str]]:
+    """Give every function/class def in `tree` a qualified name that is
+    unique within the file, as (def_node, qualname) pairs.
+
+    A qualname is the dotted path to the def (`Klass.method`,
+    `outer.inner`). The first def with a given path keeps it as is; each
+    later one with the same path (a property getter and its `@x.setter`, the
+    two branches of an `if/else`, `@overload` stubs) gets an ordinal suffix
+    in source order: `Klass.x`, `Klass.x#2`, `Klass.x#3`. `#` can't occur in
+    a Python identifier, so a suffix never collides with a real name.
+    Children are prefixed with their parent's *unique* qualname
+    (`Klass#2.method`), so the members of a redefined class can't collide
+    with the original's.
+
+    The result is deterministic (source order) and is shared by the KG
+    builder (node IDs) and the seed-refresh step in extraction/context.py,
+    so both sides name the same definition identically.
+    """
+    seen: Dict[str, int] = {}
+    out: List[Tuple[ast.AST, str]] = []
+
+    def visit(scope: ast.AST, prefix: str) -> None:
+        for d in iter_scope_defs(scope):
+            path = f"{prefix}{d.name}"
+            seen[path] = seen.get(path, 0) + 1
+            qualname = path if seen[path] == 1 else f"{path}#{seen[path]}"
+            out.append((d, qualname))
+            visit(d, f"{qualname}.")
+
+    visit(tree, "")
+    return out
+
+
 # ---------------------------------------------------------------------------
 # AST unparsing
 # ---------------------------------------------------------------------------
