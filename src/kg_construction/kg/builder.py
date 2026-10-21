@@ -113,7 +113,20 @@ MAX_FILE_LINES = 20000
 #    of silently collapsing into the first. Function/class nodes carry
 #    metadata['qualname']. An old cached KG is missing the former and has
 #    collapsed the latter.
-SCHEMA_VERSION = 4
+# 5: inherits edges now resolve generic bases (`Base[int]`) and no longer
+#    match a class to itself (`class Foo(a.Foo)`); self.method() calls
+#    resolve by class ID and follow the parent chain; calls through an
+#    import whose top level name is not in the repo are dropped; a unique
+#    name match on an untyped receiver is labelled 'name_only' instead of
+#    'exact'.
+SCHEMA_VERSION = 5
+
+
+def _base_name(base: str) -> str:
+    """Simple class name from a base class expression: 'pkg.Base[int]'
+    becomes 'Base'. The generic subscript is dropped first because it may
+    itself contain dots (`Base[pkg.Other]`)."""
+    return base.split('[', 1)[0].split('.')[-1]
 
 
 @dataclass
@@ -252,7 +265,8 @@ def _parse_file(args: Tuple[str, str, str]) -> Optional[Dict]:
                 edges.append(asdict(KGEdge(source=file_id, target=imp_id, relation='imports')))
 
     def _emit_call_edges(func_id: str, func_node: Union[ast.FunctionDef, ast.AsyncFunctionDef],
-                         local_types: Dict[str, str], class_name: Optional[str] = None):
+                         local_types: Dict[str, str], class_name: Optional[str] = None,
+                         class_id: Optional[str] = None):
         """Emit one 'calls' edge per unique (caller, callee_name) pair.
 
         Edges are marked unresolved=True because callee_name is just a string
@@ -299,6 +313,7 @@ def _parse_file(args: Tuple[str, str, str]) -> Optional[Dict]:
 
             receiver = _extract_call_receiver(call)
             class_hint: Optional[str] = None
+            class_hint_id: Optional[str] = None
             local_type_hint: Optional[str] = None
             import_resolved: Optional[str] = None
             is_super_call = receiver == 'super()'
@@ -307,6 +322,9 @@ def _parse_file(args: Tuple[str, str, str]) -> Optional[Dict]:
                 pass  # resolved in pass 2 via the caller's own inherits chain
             elif receiver == 'self' and class_name is not None:
                 class_hint = class_name
+                # The exact class node, so pass 2 does not have to guess
+                # between same named classes in different files.
+                class_hint_id = class_id
             elif receiver and receiver in local_types:
                 local_type_hint = local_types[receiver]
             elif receiver and receiver in import_map:
@@ -322,6 +340,7 @@ def _parse_file(args: Tuple[str, str, str]) -> Optional[Dict]:
                     'unresolved': True,
                     'receiver': receiver,
                     'class_hint': class_hint,
+                    'class_hint_id': class_hint_id,
                     'local_type_hint': local_type_hint,
                     'import_resolved': import_resolved,
                     'is_super_call': is_super_call,
@@ -605,12 +624,13 @@ def _parse_file(args: Tuple[str, str, str]) -> Optional[Dict]:
         if parent_class is not None and func_node.name != '__init__':
             for base in (bases or []):
                 edges.append(asdict(KGEdge(
-                    source=func_id, target=f"{base}.{func_node.name}", relation='overrides',
+                    source=func_id, target=f"{_base_name(base)}.{func_node.name}", relation='overrides',
                     metadata={'unresolved': True}
                 )))
 
         local_types = _collect_local_types(func_node)
-        _emit_call_edges(func_id, func_node, local_types, class_name=parent_class)
+        _emit_call_edges(func_id, func_node, local_types, class_name=parent_class,
+                         class_id=enclosing_class_id if parent_class is not None else None)
         _emit_access_edges(func_id, func_node, local_types, class_name=parent_class)
         _emit_func_edges(func_id, func_node, class_name=parent_class)
         _emit_operator_edges(func_id, func_node, local_types, class_name=parent_class)
@@ -670,7 +690,11 @@ class RepoASTParser:
 
     Call resolution is best-effort:
         - 'qualified': resolved via class_hint, local_type_hint, or import_resolved
-        - 'exact': only one function with that name exists in the repo
+        - 'exact': only one function with that name exists in the repo, and
+          the call is a bare call or goes through a repo import
+        - 'name_only': only one function with that name exists in the repo,
+          but the call is on a receiver whose type is unknown (`d.loads()`),
+          so the match is a guess that the name is unique
         - 'ambiguous': multiple functions share the name (e.g. common names
           like 'get' or '__init__'); all candidates are linked
         - Calls to external libraries (no match in repo) are dropped
@@ -905,6 +929,31 @@ class RepoASTParser:
         nodes_by_id: Dict[str, Dict] = {n['id']: n for n in all_nodes}
         all_edges: List[Dict] = [edge for result in results for edge in result['edges']]
 
+        # (class node ID, method name) -> method node IDs, from the class to
+        # method 'contains' edges. Unlike class_method_to_ids this is keyed
+        # by the class node itself, so same named classes in different
+        # files stay separate.
+        function_types = ('function', 'method', 'test_function')
+        class_methods_by_id: Dict[Tuple[str, str], List[str]] = defaultdict(list)
+        for edge in all_edges:
+            if edge['relation'] != 'contains':
+                continue
+            container = nodes_by_id.get(edge['source'])
+            member = nodes_by_id.get(edge['target'])
+            if (container and member and container['type'] == 'class'
+                    and member['type'] in function_types):
+                class_methods_by_id[(edge['source'], member['label'])].append(edge['target'])
+
+        # Every directory and module name that appears in a repo file path.
+        # A call through an import whose top level name is not in this set
+        # (json, requests, numpy) cannot be a call into this repo.
+        repo_module_names: Set[str] = set()
+        for node in all_nodes:
+            if node['type'] in ('file', 'test_file'):
+                parts = node['metadata'].get('path', '').split('/')
+                repo_module_names.update(parts[:-1])
+                repo_module_names.add(parts[-1].removesuffix('.py'))
+
         # Derived from class_method_to_ids (no extra AST walk needed): the
         # same index, filtered to @property/@cached_property-decorated
         # methods only, so 'accesses' edge resolution can't accidentally
@@ -927,6 +976,8 @@ class RepoASTParser:
             'label_to_ids': label_to_ids,
             'class_label_to_ids': class_label_to_ids,
             'class_method_to_ids': class_method_to_ids,
+            'class_methods_by_id': class_methods_by_id,
+            'repo_module_names': repo_module_names,
             'property_method_to_ids': property_method_to_ids,
             'qualified_to_ids': qualified_to_ids,
             'nodes_by_id': nodes_by_id,
@@ -945,9 +996,31 @@ class RepoASTParser:
         label_to_ids = indices['label_to_ids']
         class_label_to_ids = indices['class_label_to_ids']
         class_method_to_ids = indices['class_method_to_ids']
+        class_methods_by_id = indices['class_methods_by_id']
+        repo_module_names = indices['repo_module_names']
         property_method_to_ids = indices['property_method_to_ids']
         qualified_to_ids = indices['qualified_to_ids']
         nodes_by_id = indices['nodes_by_id']
+
+        def _base_matches(class_id: str, base: str) -> List[str]:
+            """Class nodes a base class expression can refer to. The class
+            itself is excluded: `class Foo(a.Foo)` names the OTHER Foo, and
+            matching by simple name alone would link Foo to itself."""
+            return [
+                cid for cid in class_label_to_ids.get(_base_name(base), [])
+                if cid != class_id
+            ]
+
+        # class ID -> parent class IDs, built from the raw inherits edges up
+        # front so self.method() calls can follow the parent chain while
+        # they are being resolved (the main loop below resolves edges in
+        # one pass, in file order).
+        base_ids_by_class: Dict[str, List[str]] = defaultdict(list)
+        for raw in all_edges:
+            if raw['relation'] == 'inherits' and raw.get('metadata', {}).get('unresolved'):
+                for parent_id in _base_matches(raw['source'], raw['target']):
+                    if parent_id not in base_ids_by_class[raw['source']]:
+                        base_ids_by_class[raw['source']].append(parent_id)
 
         def _resolve_access(meta: Dict, attr_name: str) -> Tuple[List[str], str]:
             """Resolve an accesses-edge target against known @property methods.
@@ -981,8 +1054,22 @@ class RepoASTParser:
 
         def _resolve_call(meta: Dict, callee_name: str, caller_filepath: Optional[str] = None) -> Tuple[List[str], str]:
             """Resolve a call-edge target using the metadata hints."""
+            class_hint_id = meta.get('class_hint_id')
             class_hint = meta.get('class_hint')
-            if class_hint:
+            if class_hint_id:
+                # self.method(): the caller's own class, then its parents.
+                own = class_methods_by_id.get((class_hint_id, callee_name), [])
+                if own:
+                    return own, 'qualified'
+                for parent_id in base_ids_by_class.get(class_hint_id, []):
+                    inherited = self._find_nearest_ancestor_method(
+                        parent_id, callee_name, base_ids_by_class, class_methods_by_id
+                    )
+                    if inherited is not None:
+                        return [inherited], 'qualified'
+            elif class_hint:
+                # Edge without a class ID (e.g. an operator dispatch edge):
+                # the older lookup by class name.
                 hits = class_method_to_ids.get((class_hint, callee_name), [])
                 if hits:
                     return hits, 'qualified'
@@ -1003,6 +1090,15 @@ class RepoASTParser:
                     hits = class_method_to_ids.get((parts[1], parts[2]), [])
                     if hits:
                         return hits, 'qualified'
+                # The precise lookups missed. That is not proof the target is
+                # outside the repo (relative imports lose their package,
+                # src/ layouts and __init__ re-exports do not match path
+                # derived names), but an import whose top level name is not
+                # any directory or module in this repo cannot be a call into
+                # it. Drop it rather than let the bare name fallback below
+                # link `json.loads` to an unrelated repo method named loads.
+                if qualified.split('.', 1)[0] not in repo_module_names:
+                    return [], 'unresolved'
 
             # Bare Foo(...) is a constructor call when Foo is a class, so
             # check class names too, not just functions/methods
@@ -1044,7 +1140,15 @@ class RepoASTParser:
                 # of calls edges in both real repos hit this fallback).
                 # Drop rather than fan out to every candidate.
                 return [], 'unresolved'
-            return hits, 'exact'
+            # A bare call resolves through the caller's module scope, and a
+            # call through a repo import is anchored by that import, so a
+            # unique name match is trustworthy for both. A unique match on a
+            # receiver whose type is unknown (`d.loads()`, `self.session.get()`)
+            # is only a guess that the name is unique, so it gets its own
+            # lower tier.
+            if meta.get('receiver') is None or meta.get('import_resolved'):
+                return hits, 'exact'
+            return hits, 'name_only'
 
         resolved_edges: List[Dict] = []
         seen_edges: Set[Tuple] = set()
@@ -1098,8 +1202,7 @@ class RepoASTParser:
                         )))
 
             elif edge['relation'] == 'inherits' and meta.get('unresolved'):
-                base_name = edge['target'].split('.')[-1]
-                matches = class_label_to_ids.get(base_name, [])
+                matches = _base_matches(edge['source'], edge['target'])
                 if not matches:
                     continue
                 confidence = 'exact' if len(matches) == 1 else 'ambiguous'
@@ -1371,17 +1474,21 @@ class RepoASTParser:
         if not pending_overrides:
             return
 
-        class_label_to_ids = indices['class_label_to_ids']
-        class_method_to_ids = indices['class_method_to_ids']
+        class_methods_by_id = indices['class_methods_by_id']
         nodes_by_id = indices['nodes_by_id']
 
         # Build class_id -> [base_class_id, ...] from the resolved inherits
         # edges so the chain can be walked by ID (unambiguous), rather than
         # re-deriving base names from strings for every ancestor level.
         base_class_ids: Dict[str, List[str]] = defaultdict(list)
+        # method_id -> the class node that directly contains it
+        owner_class_id: Dict[str, str] = {}
         for edge in resolved_edges:
             if edge['relation'] == 'inherits':
                 base_class_ids[edge['source']].append(edge['target'])
+            elif edge['relation'] == 'contains':
+                if nodes_by_id.get(edge['source'], {}).get('type') == 'class':
+                    owner_class_id[edge['target']] = edge['source']
 
         for edge in pending_overrides:
             parts = edge['target'].rsplit('.', 1)
@@ -1390,9 +1497,18 @@ class RepoASTParser:
             base_name, method_name = parts
             base_simple = base_name.split('.')[-1]
 
-            for base_class_id in class_label_to_ids.get(base_simple, []):
+            # Start only from the overriding method's own resolved parents
+            # whose name matches this base. Searching every class with that
+            # name would also match the method's own class when it shares a
+            # name with its parent (`class Foo(a.Foo)`).
+            owner = owner_class_id.get(edge['source'])
+            candidate_bases = [
+                parent_id for parent_id in base_class_ids.get(owner, [])
+                if nodes_by_id.get(parent_id, {}).get('label') == base_simple
+            ]
+            for base_class_id in candidate_bases:
                 target_id = self._find_nearest_ancestor_method(
-                    base_class_id, method_name, base_class_ids, class_method_to_ids, nodes_by_id
+                    base_class_id, method_name, base_class_ids, class_methods_by_id
                 )
                 if target_id is None:
                     continue
@@ -1409,8 +1525,7 @@ class RepoASTParser:
         base_class_id: str,
         method_name: str,
         base_class_ids: Dict[str, List[str]],
-        class_method_to_ids: Dict[Tuple[str, str], List[str]],
-        nodes_by_id: Dict[str, Dict],
+        class_methods_by_id: Dict[Tuple[str, str], List[str]],
     ) -> Optional[str]:
         """BFS up an inheritance chain for the nearest ancestor defining
         method_name, starting from base_class_id. Returns its node ID, or
@@ -1429,11 +1544,11 @@ class RepoASTParser:
                     continue
                 visited.add(class_id)
 
-                class_node = nodes_by_id.get(class_id)
-                if class_node:
-                    hits = class_method_to_ids.get((class_node['label'], method_name), [])
-                    if hits:
-                        return hits[0]
+                # Keyed by the class node, not its name, so a same named
+                # class in another file cannot supply the method.
+                hits = class_methods_by_id.get((class_id, method_name), [])
+                if hits:
+                    return hits[0]
 
                 next_frontier.extend(base_class_ids.get(class_id, []))
             frontier = next_frontier
@@ -1462,7 +1577,7 @@ class RepoASTParser:
             return
 
         class_label_to_ids = indices['class_label_to_ids']
-        class_method_to_ids = indices['class_method_to_ids']
+        class_methods_by_id = indices['class_methods_by_id']
         nodes_by_id = indices['nodes_by_id']
 
         base_class_ids: Dict[str, List[str]] = defaultdict(list)
@@ -1493,7 +1608,7 @@ class RepoASTParser:
             for caller_class_id in caller_class_ids:
                 for base_class_id in base_class_ids.get(caller_class_id, []):
                     target_id = self._find_nearest_ancestor_method(
-                        base_class_id, method_name, base_class_ids, class_method_to_ids, nodes_by_id
+                        base_class_id, method_name, base_class_ids, class_methods_by_id
                     )
                     if target_id is None:
                         continue

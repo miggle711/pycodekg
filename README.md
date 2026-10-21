@@ -142,7 +142,7 @@ tests/                      # Flat pytest suite (no subdirectories)
 |----------|---------|
 | `contains` | File/class contains a class, function, or method |
 | `imports` | File imports a module or name |
-| `calls` | Function calls another function, constructs a class instance (`SomeClass(...)`), or dispatches an operator to a dunder method (`a \| b` → `__or__`) (confidence: `exact`/`ambiguous`/`qualified`) |
+| `calls` | Function calls another function, constructs a class instance (`SomeClass(...)`), or dispatches an operator to a dunder method (`a \| b` → `__or__`) (confidence: `qualified`/`exact`/`name_only`/`ambiguous`; `name_only` is a unique name match on a receiver of unknown type) |
 | `accesses` | Function reads an `@property`-decorated attribute (no call syntax; confidence: `qualified`) |
 | `inherits` | Class inherits from another class |
 | `tests` | Test function targets a specific function, class, or dunder method (also derived automatically from any resolved `calls` edge sourced from a test function) |
