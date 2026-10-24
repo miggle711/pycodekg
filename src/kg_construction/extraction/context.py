@@ -86,6 +86,8 @@ class TestContext:
             data for the paper's callers/callees/siblings/class-related
             breakdown.
     """
+
+    __test__ = False  # not a pytest test class, despite the name
     seeds: List[Dict]
     context_nodes: List[Dict]
     edges: List[Dict]
@@ -110,6 +112,7 @@ class TestContext:
             'repo': self.repo,
             'base_commit': self.base_commit,
             'seeds': self.seeds,
+            'stale_seed_labels': self.stale_seed_labels,
             'context_nodes': self.context_nodes,
             'edges': self.edges,
             'test_nodes': self.test_nodes,
@@ -142,6 +145,7 @@ class TestContext:
         data = json.loads(Path(path).read_text())
         return cls(
             seeds=data['seeds'],
+            stale_seed_labels=data.get('stale_seed_labels', []),
             context_nodes=data['context_nodes'],
             edges=data['edges'],
             test_nodes=data['test_nodes'],
@@ -191,6 +195,8 @@ class TestContext:
 
 class TestContextExtractor:
     """Extract KG subgraphs from dataset instances for test generation."""
+
+    __test__ = False  # not a pytest test class, despite the name
 
     def __init__(self, engine: KGQueryEngine, repo_manager: Optional[RepoManager] = None):
         """
@@ -629,7 +635,7 @@ class TestContextExtractor:
                 })
                 for child in ast.iter_child_nodes(node):
                     if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                        func_id = _make_id(f"func_{repo}_{rel_path}_{node.name}_{child.name}")
+                        func_id = _make_id(f"func_{repo}_{rel_path}_{node.name}.{child.name}")
                         func_metadata = _build_func_metadata(
                             child, rel_path, repo, parent_class=node.name,
                             import_map=import_map, source_lines=source_lines,
