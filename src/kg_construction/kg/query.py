@@ -210,6 +210,17 @@ class KGQueryEngine:
                 results.append(node)
         return results
 
+    def find_file(self, path: str) -> List[Dict]:
+        """Find file nodes for a path a caller already believes is complete.
+
+        Returns the exact matches if there are any, and only falls back to
+        the substring match of find_file_by_path when there are none. A
+        plain substring match returns a vendored or build copy
+        (build/lib/pkg/mod.py) ahead of the real file (pkg/mod.py), and
+        callers that take the first result would pick the wrong one.
+        """
+        return self.find_file_by_path(path, exact=True) or self.find_file_by_path(path)
+
     def find_function_by_name(self, name: str) -> List[Dict]:
         """Find all function, method, and test_function nodes with a given name.
 

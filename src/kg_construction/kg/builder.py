@@ -122,6 +122,16 @@ MAX_FILE_LINES = 20000
 SCHEMA_VERSION = 5
 
 
+def _same_commit(a: Optional[str], b: Optional[str]) -> bool:
+    """True if two commit SHAs name the same commit, where either may be
+    abbreviated. The shorter one must be at least 7 characters and a prefix
+    of the longer, so 'a' does not match every commit."""
+    if not a or not b:
+        return False
+    shorter, longer = sorted((a, b), key=len)
+    return len(shorter) >= 7 and longer.startswith(shorter)
+
+
 def _base_name(base: str) -> str:
     """Simple class name from a base class expression: 'pkg.Base[int]'
     becomes 'Base'. The generic subscript is dropped first because it may
@@ -134,7 +144,7 @@ class KGNode:
     """A node in the knowledge graph representing a code entity.
 
     Attributes:
-        id: Deterministic 8-char MD5 hash of the entity's qualified name.
+        id: Deterministic 16-char MD5 hash of the entity's qualified name.
             Identical entities across issues/commits map to the same ID.
         type: One of 'file', 'test_file', 'class', 'function', 'method',
               'test_function', 'import'.
@@ -1853,7 +1863,7 @@ class RepoKGBuilder:
             return None
         with open(kg_file) as f:
             kg = json.load(f)
-        if kg.get('metadata', {}).get('base_commit') != commit:
+        if not _same_commit(kg.get('metadata', {}).get('base_commit'), commit):
             return None
         if kg.get('metadata', {}).get('schema_version') != SCHEMA_VERSION:
             return None

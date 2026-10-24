@@ -86,6 +86,9 @@ class TestContext:
             data for the paper's callers/callees/siblings/class-related
             breakdown.
     """
+    # Not a test class, despite the name: stops pytest trying to collect it.
+    __test__ = False
+
     seeds: List[Dict]
     context_nodes: List[Dict]
     edges: List[Dict]
@@ -113,6 +116,7 @@ class TestContext:
             'context_nodes': self.context_nodes,
             'edges': self.edges,
             'test_nodes': self.test_nodes,
+            'stale_seed_labels': self.stale_seed_labels,
             'stats': {
                 'num_seeds': len(self.seeds),
                 'num_context_nodes': len(self.context_nodes),
@@ -147,6 +151,7 @@ class TestContext:
             test_nodes=data['test_nodes'],
             repo=data['repo'],
             base_commit=data['base_commit'],
+            stale_seed_labels=data.get('stale_seed_labels', []),
             retrieval_time_s=data.get('retrieval_time_s'),
             localization_outcome=data.get('localization_outcome'),
             node_count=data.get('node_count'),
@@ -191,6 +196,9 @@ class TestContext:
 
 class TestContextExtractor:
     """Extract KG subgraphs from dataset instances for test generation."""
+
+    # Not a test class, despite the name: stops pytest trying to collect it.
+    __test__ = False
 
     def __init__(self, engine: KGQueryEngine, repo_manager: Optional[RepoManager] = None):
         """
@@ -322,7 +330,7 @@ class TestContextExtractor:
                 post_patch_by_qualname, post_patch_ranges = self._index_post_patch_defs(post_tree)
 
         # Find the code file node
-        code_file_results = self.engine.find_file_by_path(instance['code_file'])
+        code_file_results = self.engine.find_file(instance['code_file'])
         if not code_file_results:
             raise ValueError(f"Code file not found: {instance['code_file']}")
         code_file_node = code_file_results[0]
@@ -452,10 +460,14 @@ class TestContextExtractor:
         # handle_401 -- most were tests of other functions/methods nearby.
         seed_id_set = set(seed_ids)
         test_nodes = []
+        seen_test_ids: Set[str] = set()
         for edge in subgraph_edges:
             if edge['relation'] == 'tests' and edge['target'] in seed_id_set:
                 test_node = self.engine.nodes_by_id.get(edge['source'])
-                if test_node:
+                # A test that exercises several seeds has one edge per
+                # seed, but should be listed once.
+                if test_node and test_node['id'] not in seen_test_ids:
+                    seen_test_ids.add(test_node['id'])
                     test_nodes.append(test_node)
 
         # Separate seeds from context
@@ -629,7 +641,7 @@ class TestContextExtractor:
                 })
                 for child in ast.iter_child_nodes(node):
                     if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                        func_id = _make_id(f"func_{repo}_{rel_path}_{node.name}_{child.name}")
+                        func_id = _make_id(f"func_{repo}_{rel_path}_{node.name}.{child.name}")
                         func_metadata = _build_func_metadata(
                             child, rel_path, repo, parent_class=node.name,
                             import_map=import_map, source_lines=source_lines,
