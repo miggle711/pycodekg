@@ -11,11 +11,56 @@ Each test constructs BOTH a patch and its corresponding pre-patch source,
 since the new API requires the latter to resolve real ranges.
 """
 
+import difflib
+
+import pytest
+
 from kg_construction.extraction.patch import (
     PatchParser,
     is_newly_created_file,
     reconstruct_post_patch_source,
 )
+
+
+class TestHeaderLikeHunkContent:
+    """A hunk's line counts distinguish source text from file headers."""
+
+    @staticmethod
+    def patch(pre, post, filename='mod.py', context=3):
+        return ''.join(difflib.unified_diff(
+            pre.splitlines(keepends=True), post.splitlines(keepends=True),
+            fromfile='a/' + filename, tofile='b/' + filename, n=context,
+        ))
+
+    @pytest.mark.parametrize('before,after', [
+        ('--old', 'new'),
+        ('old', '++new'),
+        ('-- a/old.py', '++ b/other.py'),
+        ('---', '+++'),
+    ])
+    def test_reconstructs_header_like_source_lines(self, before, after):
+        pre = 'def first():\n    text = """\n' + before + '\n"""\n    return text\n'
+        post = pre.replace(before, after)
+        patch = self.patch(pre, post)
+        assert reconstruct_post_patch_source(pre, patch, 'mod.py') == post
+
+    def test_removal_only_attributes_header_like_lines(self):
+        pre = 'def first():\n    text = """\n--old\n"""\n    return text\n'
+        post = pre.replace('--old\n', '')
+        assert PatchParser.extract_changed_functions(self.patch(pre, post), 'mod.py', pre) == {'first'}
+
+    @pytest.mark.parametrize('text', ['++new', '++ b/other.py'])
+    def test_addition_only_attributes_header_like_lines(self, text):
+        pre = 'def first():\n    text = """\n"""\n    return text\n'
+        post = pre.replace('text = """\n', 'text = """\n' + text + '\n')
+        assert PatchParser.extract_changed_functions(self.patch(pre, post), 'mod.py', pre) == {'first'}
+
+    def test_new_function_keeps_header_like_lines(self):
+        pre = 'value = 1\n'
+        post = pre + '\ndef added():\n    return """\n++ b/other.py\n-- a/old.py\n"""\n'
+        patch = self.patch(pre, post, context=0)
+        assert reconstruct_post_patch_source(pre, patch, 'mod.py') == post
+        assert PatchParser.extract_changed_functions(patch, 'mod.py', pre) == {'added'}
 
 
 class TestPatchParser:

@@ -20,7 +20,32 @@ see kg_construction#75 for the investigation and rationale.
 
 import ast
 import re
-from typing import Dict, List, NamedTuple, Optional, Set, Tuple
+from typing import Dict, Iterator, List, NamedTuple, Optional, Set, Tuple
+
+
+def _patch_lines(patch: str) -> Iterator[Tuple[bool, str]]:
+    """Mark hunk body lines using both ranges, so +++/--- can be source text."""
+    old_remaining = new_remaining = 0
+    lines = patch.split('\n')
+    if patch.endswith('\n'):
+        lines = lines[:-1]
+    for line in lines:
+        if line.startswith('@@'):
+            match = re.match(r'^@@ -\d+(?:,(\d+))? \+\d+(?:,(\d+))? @@', line)
+            old_remaining = int(match.group(1) or 1) if match else 0
+            new_remaining = int(match.group(2) or 1) if match else 0
+            yield False, line
+            continue
+        in_hunk = old_remaining > 0 or new_remaining > 0
+        yield in_hunk, line
+        if in_hunk:
+            if line.startswith('-'):
+                old_remaining -= 1
+            elif line.startswith('+'):
+                new_remaining -= 1
+            elif line.startswith(' ') or line == '':
+                old_remaining -= 1
+                new_remaining -= 1
 
 
 class _FunctionRange(NamedTuple):
@@ -136,8 +161,8 @@ def _changed_pre_patch_lines(patch: str, code_file: str) -> Tuple[Set[int], Set[
     current_file = None
     old_lineno = None
 
-    for line in patch.split('\n'):
-        if line.startswith('+++'):
+    for in_hunk, line in _patch_lines(patch):
+        if not in_hunk and line.startswith('+++'):
             match = re.match(r'^\+\+\+ b/(.+)$', line)
             current_file = match.group(1) if match else None
             continue
@@ -150,17 +175,17 @@ def _changed_pre_patch_lines(patch: str, code_file: str) -> Tuple[Set[int], Set[
             old_lineno = int(match.group(1)) if match else None
             continue
 
-        if old_lineno is None:
+        if old_lineno is None or not in_hunk:
             continue
 
-        if line.startswith('-') and not line.startswith('---'):
+        if line.startswith('-'):
             removed_lines.add(old_lineno)
             old_lineno += 1
-        elif line.startswith('+') and not line.startswith('+++'):
+        elif line.startswith('+'):
             insertion_anchor_lines.add(old_lineno)
             if old_lineno > 1:
                 insertion_anchor_lines.add(old_lineno - 1)
-        elif line.startswith(' '):
+        elif line.startswith(' ') or line == '':
             old_lineno += 1
 
     return removed_lines, insertion_anchor_lines
@@ -188,56 +213,43 @@ def reconstruct_post_patch_source(pre_patch_source: str, patch: str, code_file: 
     current_file = None
     saw_any_hunk = False
 
-    # A trailing '' is a real artifact of splitting a newline-terminated
-    # patch string, not a genuine blank context line. Left in, it looks
-    # exactly like one and fails validation (kg_construction#128).
-    lines = patch.split('\n')
-    if patch.endswith('\n'):
-        lines = lines[:-1]
-    i = 0
-    while i < len(lines):
-        line = lines[i]
-
-        if line.startswith('+++'):
+    for in_hunk, line in _patch_lines(patch):
+        if not in_hunk and line.startswith('+++'):
             match = re.match(r'^\+\+\+ b/(.+)$', line)
             current_file = match.group(1) if match else None
-            i += 1
             continue
 
         if current_file != code_file:
-            i += 1
             continue
 
         if line.startswith('@@'):
-            match = re.match(r'^@@ -(\d+)', line)
+            match = re.match(r'^@@ -(\d+)(?:,(\d+))?', line)
             if not match:
-                i += 1
                 continue
             saw_any_hunk = True
-            hunk_start = int(match.group(1)) - 1  # 0-indexed
-            # -1 is the real "new file" convention (@@ -0,0 @@), not a
-            # mismatch. Anything beyond pre_lines' real length, or behind
-            # pre_idx (an out-of-order hunk), means pre_patch_source
-            # doesn't match what this patch assumes (kg_construction#128).
-            if hunk_start > len(pre_lines) or (hunk_start != -1 and hunk_start < pre_idx):
+            # An empty old range starts AFTER this line (including line 0
+            # for a new file), rather than replacing the line itself.
+            hunk_start = int(match.group(1)) - (match.group(2) != '0')
+            # Anything beyond pre_lines' real length, or behind pre_idx
+            # (an out-of-order hunk), means pre_patch_source doesn't match
+            # what this patch assumes (kg_construction#128).
+            if hunk_start > len(pre_lines) or hunk_start < pre_idx:
                 return None
             # Copy everything between the end of the last hunk (or file
             # start) and the start of this one, unchanged.
             out_lines.extend(pre_lines[pre_idx:hunk_start])
             pre_idx = hunk_start
-            i += 1
             continue
 
-        if not saw_any_hunk:
-            i += 1
+        if not in_hunk:
             continue
 
-        if line.startswith('-') and not line.startswith('---'):
+        if line.startswith('-'):
             # Must match pre_patch_source at this position (kg_construction#128).
             if pre_idx >= len(pre_lines) or pre_lines[pre_idx] != line[1:]:
                 return None
             pre_idx += 1  # removed: present in pre, absent from post
-        elif line.startswith('+') and not line.startswith('+++'):
+        elif line.startswith('+'):
             out_lines.append(line[1:])  # added: present in post only
         elif line.startswith(' '):
             if pre_idx >= len(pre_lines) or pre_lines[pre_idx] != line[1:]:
@@ -251,8 +263,6 @@ def reconstruct_post_patch_source(pre_patch_source: str, patch: str, code_file: 
                 return None
             out_lines.append(pre_lines[pre_idx])
             pre_idx += 1
-
-        i += 1
 
     if not saw_any_hunk:
         return None
@@ -283,8 +293,8 @@ def _changed_post_patch_lines(patch: str, code_file: str) -> Set[int]:
     current_file = None
     new_lineno = None
 
-    for line in patch.split('\n'):
-        if line.startswith('+++'):
+    for in_hunk, line in _patch_lines(patch):
+        if not in_hunk and line.startswith('+++'):
             match = re.match(r'^\+\+\+ b/(.+)$', line)
             current_file = match.group(1) if match else None
             continue
@@ -297,15 +307,15 @@ def _changed_post_patch_lines(patch: str, code_file: str) -> Set[int]:
             new_lineno = int(match.group(1)) if match else None
             continue
 
-        if new_lineno is None:
+        if new_lineno is None or not in_hunk:
             continue
 
-        if line.startswith('+') and not line.startswith('+++'):
+        if line.startswith('+'):
             changed_lines.add(new_lineno)
             new_lineno += 1
-        elif line.startswith('-') and not line.startswith('---'):
+        elif line.startswith('-'):
             changed_lines.add(new_lineno)
-        elif line.startswith(' '):
+        elif line.startswith(' ') or line == '':
             new_lineno += 1
 
     return changed_lines
