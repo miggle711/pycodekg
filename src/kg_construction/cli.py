@@ -25,6 +25,7 @@ nothing that already depends on that entry point breaks.
 
 import argparse
 import json
+import re
 import sys
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -47,9 +48,25 @@ def _cmd_build(args: argparse.Namespace) -> int:
         kg = builder.build(args.repo, args.commit)
         builder.save(args.repo, kg)
     else:
+        local_path = Path(args.repo)
+        if not local_path.exists():
+            hint = ""
+            if re.fullmatch(r"[\w.-]+/[\w.-]+", args.repo):
+                hint = " To build a GitHub repo, pass a commit with --commit <sha>."
+            print(f"error: '{args.repo}' does not exist.{hint}", file=sys.stderr)
+            return 2
+        if not local_path.is_dir():
+            print(f"error: '{args.repo}' is not a directory.", file=sys.stderr)
+            return 2
+
         name = args.name or args.repo
         print(f"Building local KG for '{name}' from {args.repo}...")
-        kg = builder.build_from_dir(name, Path(args.repo))
+        kg = builder.build_from_dir(name, local_path)
+        # Saving a KG with no files would leave an empty cache entry that
+        # looks like a real build.
+        if kg.get('metadata', {}).get('file_count') == 0:
+            print(f"error: no Python files found under '{args.repo}'.", file=sys.stderr)
+            return 1
         builder.save_local(name, kg)
 
     return 0
@@ -124,7 +141,7 @@ def _cmd_query(args: argparse.Namespace) -> int:
         return 0
 
     if args.file:
-        file_matches = engine.find_file_by_path(args.file)
+        file_matches = engine.find_file(args.file)
         if not file_matches:
             print(f"No file matching '{args.file}' found in this KG.", file=sys.stderr)
             return 1

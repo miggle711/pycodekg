@@ -21,6 +21,9 @@ from kg_construction.validation.base import ValidationBase
 class TestContextValidator(ValidationBase):
     """Validate TestContext subgraphs for LLM test generation."""
 
+    # Not a test class, despite the name: stops pytest trying to collect it.
+    __test__ = False
+
     def __init__(self, context: TestContext):
         """
         Args:
