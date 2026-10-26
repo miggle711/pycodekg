@@ -163,6 +163,35 @@ def _extract_callee_name(call: ast.Call) -> Optional[str]:
     return None
 
 
+def iter_calls_by_scope(
+    func_node: Union[ast.FunctionDef, ast.AsyncFunctionDef],
+) -> Tuple[List[ast.Call], List[ast.Call]]:
+    """Split the calls in a function into (own, in_closure), in source order.
+
+    `own` are calls the function's own body makes. `in_closure` are calls
+    inside a function nested in it: they only run if the closure is called,
+    but they are still a dependency of the outer function. A nested
+    function's decorators and default values are evaluated by the outer
+    function, so they count as the outer function's own calls. Lambdas and
+    comprehensions are part of the enclosing scope.
+    """
+    own: List[ast.Call] = []
+    in_closure: List[ast.Call] = []
+    stack: List[Tuple[ast.AST, bool]] = [(func_node, False)]
+    while stack:
+        node, nested = stack.pop()
+        if isinstance(node, ast.Call):
+            (in_closure if nested else own).append(node)
+        if node is not func_node and isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            defaults = node.args.defaults + [d for d in node.args.kw_defaults if d is not None]
+            kids = [(d, nested) for d in node.decorator_list + defaults]
+            kids += [(stmt, True) for stmt in node.body]
+        else:
+            kids = [(child, nested) for child in ast.iter_child_nodes(node)]
+        stack.extend(reversed(kids))
+    return own, in_closure
+
+
 def _extract_call_receiver(call: ast.Call) -> Optional[str]:
     """Extract the receiver expression of an attribute call as a string.
 
@@ -737,8 +766,10 @@ def _extract_data_flows(node: Union[ast.FunctionDef, ast.AsyncFunctionDef]) -> D
                         flows['parameter_usage'][param] = []
                     flows['parameter_usage'][param].append(child.lineno)
 
-            # Recurse
-            _walk_no_nested(child)
+            # Recurse, keeping the flag: inside a closure, nothing deeper
+            # (an `if` body, a loop) may count as the outer function's own
+            # returns or mutations either.
+            _walk_no_nested(child, allow_param_in_nested)
 
     _walk_no_nested(node)
 
@@ -816,30 +847,73 @@ def _get_base_names(node: ast.ClassDef) -> List[str]:
     return [_safe_unparse(base) for base in node.bases if _safe_unparse(base)]
 
 
+def _walk_own_scope(node: ast.AST):
+    """Yield `node` and its descendants, without entering nested function
+    definitions: a nested function's statements belong to its own scope."""
+    yield node
+    for child in ast.iter_child_nodes(node):
+        if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        yield from _walk_own_scope(child)
+
+
+def _self_attr_names(target: ast.AST, include_subscript: bool) -> List[str]:
+    """Names of `self.<name>` attributes an assignment target writes.
+
+    Handles `self.x`, tuple and list unpacking (including starred
+    elements), and, if include_subscript, `self.x[key]` (a write to the
+    container held in x).
+    """
+    if isinstance(target, ast.Attribute):
+        if isinstance(target.value, ast.Name) and target.value.id == 'self':
+            return [target.attr]
+        return []
+    if isinstance(target, ast.Subscript) and include_subscript:
+        value = target.value
+        if (isinstance(value, ast.Attribute) and isinstance(value.value, ast.Name)
+                and value.value.id == 'self'):
+            return [value.attr]
+        return []
+    if isinstance(target, (ast.Tuple, ast.List)):
+        return [name for elt in target.elts for name in _self_attr_names(elt, include_subscript)]
+    if isinstance(target, ast.Starred):
+        return _self_attr_names(target.value, include_subscript)
+    return []
+
+
+def _written_self_attrs(stmt: ast.AST, include_subscript: bool) -> List[str]:
+    """`self.<name>` attributes written by one statement: plain, annotated
+    and augmented assignment, `for` targets, and `with ... as` targets.
+    Mutating method calls such as `self.items.append(x)` are not writes."""
+    if isinstance(stmt, ast.Assign):
+        targets = stmt.targets
+    elif isinstance(stmt, (ast.AnnAssign, ast.AugAssign)):
+        targets = [stmt.target]
+    elif isinstance(stmt, (ast.For, ast.AsyncFor)):
+        targets = [stmt.target]
+    elif isinstance(stmt, (ast.With, ast.AsyncWith)):
+        targets = [item.optional_vars for item in stmt.items if item.optional_vars is not None]
+    else:
+        return []
+    return [name for t in targets for name in _self_attr_names(t, include_subscript)]
+
+
 def _get_class_attributes(node: ast.ClassDef) -> List[str]:
     """Extract instance variable names assigned in __init__.
 
-    Covers both plain assignment (self.x = ...) and annotated assignment
-    (self.x: int = ...). Returns names in assignment order, deduplicated.
+    Covers plain, annotated and augmented assignment, tuple and list
+    unpacking, and `for`/`with` targets (self.x = ..., self.a, self.b = ...,
+    self.n += 1). Returns names in assignment order, deduplicated.
 
-    Only __init__ is scanned — attributes set in other methods are not
+    Only __init__ is scanned, and only its own scope: attributes set in
+    other methods, or inside a function nested in __init__, are not
     included, as they may not always exist on the instance.
     """
     attrs = []
     for child in ast.iter_child_nodes(node):
         if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)) and child.name == '__init__':
-            for stmt in ast.walk(child):
-                if isinstance(stmt, ast.Assign):
-                    for target in stmt.targets:
-                        if (isinstance(target, ast.Attribute) and
-                                isinstance(target.value, ast.Name) and
-                                target.value.id == 'self'):
-                            attrs.append(target.attr)
-                elif (isinstance(stmt, ast.AnnAssign) and
-                      isinstance(stmt.target, ast.Attribute) and
-                      isinstance(stmt.target.value, ast.Name) and
-                      stmt.target.value.id == 'self'):
-                    attrs.append(stmt.target.attr)
+            for stmt in _walk_own_scope(child):
+                attrs.extend(_written_self_attrs(stmt, include_subscript=False))
     # dict.fromkeys preserves insertion order while deduplicating
     return list(dict.fromkeys(attrs))
 
@@ -878,13 +952,15 @@ def _get_attribute_accesses(
 ) -> Tuple[List[str], List[str]]:
     """Extract self.x reads and self.x writes from a method body.
 
-    Reads are any `self.attr` access not on the left side of an assignment.
-    Writes are `self.attr = ...` assignments (both plain and annotated).
+    Reads are any `self.attr` access that is not a write. Writes are every
+    form that assigns to `self.attr` or `self.attr[key]`: plain, annotated
+    and augmented assignment, tuple and list unpacking, and `for`/`with`
+    targets. Mutating method calls (`self.items.append(x)`) are not writes.
     Excludes nested function scopes to avoid false positives from closures.
 
     Args:
         func_node: The method AST node.
-        class_name: Used only for scoping — not currently used but kept for
+        class_name: Used only for scoping, not currently used but kept for
                     future qualified-attribute support.
 
     Returns:
@@ -894,37 +970,11 @@ def _get_attribute_accesses(
     writes: List[str] = []
     written: Set[str] = set()
 
-    def _walk_no_nested(node: ast.AST):
-        """Walk AST nodes, stopping descent into nested function scopes."""
-        yield node
-        for child in ast.iter_child_nodes(node):
-            if child is not node and isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                continue
-            yield from _walk_no_nested(child)
-
-    for child in _walk_no_nested(func_node):
-        if isinstance(child, ast.Assign):
-            for target in child.targets:
-                if (isinstance(target, ast.Attribute) and
-                        isinstance(target.value, ast.Name) and
-                        target.value.id == 'self'):
-                    writes.append(target.attr)
-                    written.add(target.attr)
-                elif (isinstance(target, ast.Subscript) and
-                      isinstance(target.value, ast.Attribute) and
-                      isinstance(target.value.value, ast.Name) and
-                      target.value.value.id == 'self'):
-                    attr = target.value.attr
-                    writes.append(attr)
-                    written.add(attr)
-
-        elif isinstance(child, ast.AnnAssign):
-            if (isinstance(child.target, ast.Attribute) and
-                    isinstance(child.target.value, ast.Name) and
-                    child.target.value.id == 'self'):
-                writes.append(child.target.attr)
-                written.add(child.target.attr)
-
+    for child in _walk_own_scope(func_node):
+        names = _written_self_attrs(child, include_subscript=True)
+        if names:
+            writes.extend(names)
+            written.update(names)
         elif isinstance(child, ast.Attribute):
             if (isinstance(child.value, ast.Name) and
                     child.value.id == 'self' and
@@ -943,6 +993,8 @@ def _get_used_imports(
     Walks the function body looking for Name nodes whose id appears in the
     file-level import_map. Returns the fully-qualified import paths for
     those names, which tells the test generator exactly what to mock.
+    Nested functions are included on purpose: an import used only inside a
+    closure still has to be mocked to test the outer function.
 
     Args:
         func_node: The function AST node.
@@ -954,8 +1006,6 @@ def _get_used_imports(
     """
     used: List[str] = []
     for child in ast.walk(func_node):
-        if child is not func_node and isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            continue
         if isinstance(child, ast.Name) and child.id in import_map:
             qualified = import_map[child.id]
             if qualified not in used:
@@ -970,15 +1020,15 @@ def _get_instantiated_classes(
 
     Detects patterns like `x = SomeClass(...)` by finding Call nodes where
     the callee is a Name starting with an uppercase letter (PEP 8 convention).
-    Used to build `uses` edges from a class to its dependencies.
+    Used to build `uses` edges from a class to its dependencies. Nested
+    functions are included on purpose: a class instantiated inside a closure
+    is still a dependency of the outer function.
 
     Returns:
         List of class name strings instantiated in this function.
     """
     classes: List[str] = []
     for child in ast.walk(func_node):
-        if child is not func_node and isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            continue
         if isinstance(child, ast.Call):
             if isinstance(child.func, ast.Name) and child.func.id[0].isupper():
                 if child.func.id not in classes:
