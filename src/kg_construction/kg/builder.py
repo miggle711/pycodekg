@@ -71,6 +71,7 @@ from kg_construction.ast.helpers import (
     _build_func_metadata,
     _collect_file_level_info,
     assign_qualnames,
+    iter_calls_by_scope,
     iter_scope_defs,
 )
 from kg_construction.kg.repo_manager import RepoManager
@@ -119,7 +120,14 @@ MAX_FILE_LINES = 20000
 #    import whose top level name is not in the repo are dropped; a unique
 #    name match on an untyped receiver is labelled 'name_only' instead of
 #    'exact'.
-SCHEMA_VERSION = 5
+# 6: a function now also gets the calls made inside closures it defines, tagged
+#    metadata['via_closure'] = True (a direct call of the same name wins and
+#    stays untagged); calls are deduplicated per (callee, receiver) instead
+#    of per callee name, so a resolvable call is no longer hidden behind an
+#    unresolvable one; caller_count / direct_callers count direct callers
+#    only, with the rest in closure_callers; side_effects and class
+#    attributes cover augmented assignment, unpacking and for/with targets.
+SCHEMA_VERSION = 6
 
 
 def _same_commit(a: Optional[str], b: Optional[str]) -> bool:
@@ -228,7 +236,7 @@ def _parse_file(args: Tuple[str, str, str]) -> Optional[Dict]:
     
     # Deduplicate call edges within this file at creation time to avoid
     # accumulating one edge per call-site for frequently called functions
-    seen_call_targets: Set[Tuple[str, str]] = set()
+    seen_call_targets: Set[Tuple[str, str, Optional[str]]] = set()
 
     # Factory-call assignment sites recorded for optional pyright type
     # resolution (see kg/type_inference.py). Each site is
@@ -277,7 +285,16 @@ def _parse_file(args: Tuple[str, str, str]) -> Optional[Dict]:
     def _emit_call_edges(func_id: str, func_node: Union[ast.FunctionDef, ast.AsyncFunctionDef],
                          local_types: Dict[str, str], class_name: Optional[str] = None,
                          class_id: Optional[str] = None):
-        """Emit one 'calls' edge per unique (caller, callee_name) pair.
+        """Emit one 'calls' edge per unique (caller, callee_name, receiver).
+
+        The receiver is part of the key because the resolution hints derive
+        from it: `x.save()` (type unknown) and `m.save()` (m = Model()) are
+        different calls even though the callee name is the same, and a
+        resolvable one must not be hidden behind an unresolvable one.
+
+        Calls made inside a closure defined in this function are included
+        too, tagged via_closure=True, unless the function makes the same
+        call itself (then the direct edge wins and stays untagged).
 
         Edges are marked unresolved=True because callee_name is just a string
         at this point — cross-file resolution happens in RepoASTParser.parse_repo
@@ -304,11 +321,13 @@ def _parse_file(args: Tuple[str, str, str]) -> Optional[Dict]:
                          shared with _emit_access_edges to avoid walking the
                          same function body twice for the same data.
         """
-        for call in ast.walk(func_node):
-            if not isinstance(call, ast.Call):
-                continue
+        own_calls, closure_calls = iter_calls_by_scope(func_node)
+        # Own scope first, so a direct call takes the dedup slot before the
+        # same call found inside a closure.
+        tagged_calls = [(c, False) for c in own_calls] + [(c, True) for c in closure_calls]
+        for call, in_closure in tagged_calls:
             callee = _extract_callee_name(call)
-            if not callee or (func_id, callee) in seen_call_targets:
+            if not callee:
                 continue
 
             # super().method() parses as TWO Call nodes: the outer method
@@ -316,12 +335,14 @@ def _parse_file(args: Tuple[str, str, str]) -> Optional[Dict]:
             # that constructs the super proxy itself (callee='super',
             # receiver=None) -- not a real call, so it must not fall
             # through to bare-name matching (kg_construction#61).
-            if callee == 'super' and _extract_call_receiver(call) is None:
+            receiver = _extract_call_receiver(call)
+            if callee == 'super' and receiver is None:
                 continue
 
-            seen_call_targets.add((func_id, callee))
+            if (func_id, callee, receiver) in seen_call_targets:
+                continue
+            seen_call_targets.add((func_id, callee, receiver))
 
-            receiver = _extract_call_receiver(call)
             class_hint: Optional[str] = None
             class_hint_id: Optional[str] = None
             local_type_hint: Optional[str] = None
@@ -344,17 +365,19 @@ def _parse_file(args: Tuple[str, str, str]) -> Optional[Dict]:
                 # Bare-name call: foo() where foo was imported
                 import_resolved = import_map.get(callee)
 
+            call_meta = {
+                'unresolved': True,
+                'receiver': receiver,
+                'class_hint': class_hint,
+                'class_hint_id': class_hint_id,
+                'local_type_hint': local_type_hint,
+                'import_resolved': import_resolved,
+                'is_super_call': is_super_call,
+            }
+            if in_closure:
+                call_meta['via_closure'] = True
             edges.append(asdict(KGEdge(
-                source=func_id, target=callee, relation='calls',
-                metadata={
-                    'unresolved': True,
-                    'receiver': receiver,
-                    'class_hint': class_hint,
-                    'class_hint_id': class_hint_id,
-                    'local_type_hint': local_type_hint,
-                    'import_resolved': import_resolved,
-                    'is_super_call': is_super_call,
-                }
+                source=func_id, target=callee, relation='calls', metadata=call_meta
             )))
 
     def _emit_access_edges(func_id: str, func_node: Union[ast.FunctionDef, ast.AsyncFunctionDef],
@@ -416,7 +439,7 @@ def _parse_file(args: Tuple[str, str, str]) -> Optional[Dict]:
         logic needed.
         """
         for dunder, receiver in _extract_operator_dispatches(func_node):
-            if (func_id, dunder) in seen_call_targets:
+            if (func_id, dunder, receiver) in seen_call_targets:
                 continue
 
             class_hint: Optional[str] = None
@@ -433,7 +456,7 @@ def _parse_file(args: Tuple[str, str, str]) -> Optional[Dict]:
             # site for the same dunder doesn't consume the dedup slot
             # a later, genuinely resolvable site needs (kg_construction#137
             # review).
-            seen_call_targets.add((func_id, dunder))
+            seen_call_targets.add((func_id, dunder, receiver))
 
             edges.append(asdict(KGEdge(
                 source=func_id, target=dunder, relation='calls',
@@ -1191,10 +1214,13 @@ class RepoASTParser:
                     key = (edge['source'], target_id, 'calls')
                     if key not in seen_edges:
                         seen_edges.add(key)
+                        resolved_meta = {'confidence': confidence,
+                                         'import_resolved': meta.get('import_resolved')}
+                        if meta.get('via_closure'):
+                            resolved_meta['via_closure'] = True
                         resolved_edges.append(asdict(KGEdge(
                             source=edge['source'], target=target_id, relation='calls',
-                            metadata={'confidence': confidence,
-                                      'import_resolved': meta.get('import_resolved')}
+                            metadata=resolved_meta
                         )))
 
             elif edge['relation'] == 'accesses' and meta.get('unresolved'):
@@ -1447,10 +1473,13 @@ class RepoASTParser:
             if key in seen_edges:
                 continue
             seen_edges.add(key)
+            tests_meta = {'confidence': edge.get('metadata', {}).get('confidence', 'unknown'),
+                          'derived_from': 'calls'}
+            if edge.get('metadata', {}).get('via_closure'):
+                tests_meta['via_closure'] = True
             resolved_edges.append(asdict(KGEdge(
                 source=edge['source'], target=edge['target'], relation='tests',
-                metadata={'confidence': edge.get('metadata', {}).get('confidence', 'unknown'),
-                          'derived_from': 'calls'}
+                metadata=tests_meta
             )))
 
     def _resolve_overrides(
@@ -1625,40 +1654,45 @@ class RepoASTParser:
                     key = (edge['source'], target_id, 'calls')
                     if key not in seen_edges:
                         seen_edges.add(key)
+                        super_meta = {'confidence': 'qualified', 'via': 'super'}
+                        if edge.get('metadata', {}).get('via_closure'):
+                            super_meta['via_closure'] = True
                         resolved_edges.append(asdict(KGEdge(
                             source=edge['source'], target=target_id, relation='calls',
-                            metadata={'confidence': 'qualified', 'via': 'super'}
+                            metadata=super_meta
                         )))
 
     def _add_call_context(self, all_nodes: List[Dict], all_edges: List[Dict]) -> None:
-        """Annotate functions with caller_count and direct_callers metadata."""
-        callers: Dict[str, List[str]] = defaultdict(list)
+        """Annotate functions with caller_count, direct_callers and closure_callers.
+
+        caller_count and direct_callers count only functions that call this
+        one from their own body. Functions that reach it only through a
+        closure they define (calls edges tagged via_closure) are listed
+        separately in closure_callers, so one call is not counted twice.
+        """
+        direct: Dict[str, List[str]] = defaultdict(list)
+        via_closure: Dict[str, List[str]] = defaultdict(list)
         for edge in all_edges:
             if edge['relation'] == 'calls':
-                callers[edge['target']].append(edge['source'])
+                bucket = via_closure if edge.get('metadata', {}).get('via_closure') else direct
+                bucket[edge['target']].append(edge['source'])
 
         node_by_id = {node['id']: node for node in all_nodes}
+
+        def describe(caller_ids: List[str]) -> List[Dict]:
+            return [
+                {'id': cid, 'label': node_by_id[cid]['label'], 'type': node_by_id[cid]['type']}
+                for cid in caller_ids if cid in node_by_id
+            ]
 
         for node in all_nodes:
             if node['type'] not in ('function', 'method', 'test_function'):
                 continue
 
             node_id = node['id']
-            caller_ids = callers.get(node_id, [])
-            caller_count = len(caller_ids)
-
-            direct_callers = []
-            for caller_id in caller_ids:
-                caller_node = node_by_id.get(caller_id)
-                if caller_node:
-                    direct_callers.append({
-                        'id': caller_id,
-                        'label': caller_node['label'],
-                        'type': caller_node['type'],
-                    })
-
-            node['metadata']['caller_count'] = caller_count
-            node['metadata']['direct_callers'] = direct_callers
+            node['metadata']['caller_count'] = len(direct.get(node_id, []))
+            node['metadata']['direct_callers'] = describe(direct.get(node_id, []))
+            node['metadata']['closure_callers'] = describe(via_closure.get(node_id, []))
 
 
 # ---------------------------------------------------------------------------

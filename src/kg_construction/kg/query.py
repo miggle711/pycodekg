@@ -134,7 +134,7 @@ class KGQueryEngine:
     # Call graph queries
     # ------------------------------------------------------------------
 
-    def find_callers(self, func_id: str) -> List[Dict]:
+    def find_callers(self, func_id: str, include_closure: bool = True) -> List[Dict]:
         """Return all functions/methods that call a given function.
 
         Only returns nodes that exist in the KG (external callers are excluded).
@@ -143,6 +143,9 @@ class KGQueryEngine:
 
         Args:
             func_id: Node ID of the target function.
+            include_closure: If False, leave out callers that reach this
+                             function only through a closure they define
+                             (edges tagged via_closure).
 
         Returns:
             List of function/method/test_function nodes that call this function.
@@ -151,13 +154,17 @@ class KGQueryEngine:
             self.nodes_by_id[e['source']]
             for e in self.edges_by_target.get(func_id, [])
             if e['relation'] == 'calls' and e['source'] in self.nodes_by_id
+            and (include_closure or not e.get('metadata', {}).get('via_closure'))
         ]
 
-    def find_callees(self, func_id: str) -> List[Dict]:
+    def find_callees(self, func_id: str, include_closure: bool = True) -> List[Dict]:
         """Return all functions/methods called by a given function.
 
         Args:
             func_id: Node ID of the calling function.
+            include_closure: If False, leave out callees this function
+                             reaches only through a closure it defines
+                             (edges tagged via_closure).
 
         Returns:
             List of function/method/test_function nodes called by this function.
@@ -166,6 +173,7 @@ class KGQueryEngine:
             self.nodes_by_id[e['target']]
             for e in self.edges_by_source.get(func_id, [])
             if e['relation'] == 'calls' and e['target'] in self.nodes_by_id
+            and (include_closure or not e.get('metadata', {}).get('via_closure'))
         ]
 
     def find_test_functions_for(self, func_id: str) -> List[Dict]:
