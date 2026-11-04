@@ -132,6 +132,15 @@ class TestModuleDependsOnResolution:
             {"pkg/__init__.py": "", "pkg/x.py": "", "pkg/sub/__init__.py": "",
              "pkg/sub/a.py": "from ..x import y\n"},
             {("pkg/sub/a.py", "pkg/x.py")}, id="relative-two-levels"),
+        pytest.param(
+            {"pkg/__init__.py": "", "pkg/feature.py": "", "pkg/feature/__init__.py": "",
+             "main.py": "import pkg.feature\n"},
+            {("main.py", "pkg/feature/__init__.py")}, id="package-wins-over-module"),
+        pytest.param(
+            {"pkg/__init__.py": "", "pkg/feature.py": "", "pkg/feature/__init__.py": "",
+             "pkg/a.py": "from . import feature\n"},
+            {("pkg/a.py", "pkg/__init__.py"), ("pkg/a.py", "pkg/feature/__init__.py")},
+            id="package-wins-over-module-relative"),
     ])
     def test_import_links_to_the_files_it_depends_on(self, tmp_path, files, expected):
         assert _module_edges(tmp_path, files) == expected

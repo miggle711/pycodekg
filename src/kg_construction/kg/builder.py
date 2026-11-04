@@ -261,7 +261,8 @@ class _ModuleIndex:
     def find(self, module_parts: List[str]) -> Optional[str]:
         """The file for a top level module path, or None if there is none or
         more than one."""
-        candidates = ['/'.join(module_parts) + '.py', '/'.join(module_parts) + '/__init__.py']
+        # A package wins over a same named module, as it does when imported.
+        candidates = ['/'.join(module_parts) + '/__init__.py', '/'.join(module_parts) + '.py']
         for candidate in candidates:
             if candidate in self.paths:
                 return candidate
@@ -276,7 +277,7 @@ class _ModuleIndex:
     def find_relative(self, base_parts: List[str], module_parts: List[str]) -> Optional[str]:
         """The file for a module path relative to a package directory."""
         stem = '/'.join(base_parts + module_parts)
-        for candidate in (stem + '.py', stem + '/__init__.py'):
+        for candidate in (stem + '/__init__.py', stem + '.py'):
             if candidate in self.paths:
                 return candidate
         return None
