@@ -200,10 +200,13 @@ def _parse_file(args: Tuple[str, str, str]) -> Optional[Dict]:
     Returns:
         Dict with 'nodes', 'edges', and 'factory_sites' lists, or None if the
         file should be skipped (unreadable, over line limit, or has a
-        SyntaxError). 'factory_sites' is a list of (rel_path, class_id, line,
-        col) tuples recording lowercase-callee assignment sites invisible to
-        the uppercase-heuristic 'uses' edges — see _get_factory_call_sites
-        and kg/type_inference.py for how these are optionally resolved.
+        SyntaxError). 'factory_sites' is a list of
+        (rel_path, source_class_id, source_name, line, col) tuples recording
+        lowercase-callee assignment sites invisible to the uppercase-heuristic
+        'uses' edges; see _get_factory_call_sites and kg/type_inference.py for
+        how these are optionally resolved. Exactly one of source_class_id (the
+        enclosing class, already resolved) and source_name (the receiver's own
+        class name, still unresolved) is set, and the other is None.
 
     Node types emitted: file/test_file, import, class, function/method/test_function
     Edge types emitted: contains, imports, calls (unresolved — resolved in second pass)
