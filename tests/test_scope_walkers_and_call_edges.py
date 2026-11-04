@@ -92,6 +92,19 @@ class TestClosureCallsAreKeptAndTagged:
         assert meta["via"] == "super"
         assert "via_closure" not in meta
 
+    def test_calls_in_a_nested_defs_annotations_belong_to_the_outer_function(self, tmp_path):
+        kg = _build(tmp_path, {"m.py": """
+            def dep(): ...
+            def ret(): ...
+
+            def make():
+                def handler(db: dep()) -> ret():
+                    ...
+        """})
+        calls = _edges(kg, "calls")
+        assert "via_closure" not in calls[("make", "dep")]
+        assert "via_closure" not in calls[("make", "ret")]
+
     def test_caller_counts_and_queries_separate_direct_from_closure_callers(self, tmp_path):
         kg = _build(tmp_path, {"m.py": CLOSURE_SOURCE})
         normalize = next(n for n in kg["nodes"] if n["label"] == "normalize")

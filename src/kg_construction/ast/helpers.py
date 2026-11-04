@@ -171,9 +171,9 @@ def iter_calls_by_scope(
     `own` are calls the function's own body makes. `in_closure` are calls
     inside a function nested in it: they only run if the closure is called,
     but they are still a dependency of the outer function. A nested
-    function's decorators and default values are evaluated by the outer
-    function, so they count as the outer function's own calls. Lambdas and
-    comprehensions are part of the enclosing scope.
+    function's decorators, default values and annotations are evaluated by
+    the outer function, so they count as the outer function's own calls.
+    Lambdas and comprehensions are part of the enclosing scope.
     """
     own: List[ast.Call] = []
     in_closure: List[ast.Call] = []
@@ -183,8 +183,14 @@ def iter_calls_by_scope(
         if isinstance(node, ast.Call):
             (in_closure if nested else own).append(node)
         if node is not func_node and isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            defaults = node.args.defaults + [d for d in node.args.kw_defaults if d is not None]
-            kids = [(d, nested) for d in node.decorator_list + defaults]
+            args = node.args
+            defaults = args.defaults + [d for d in args.kw_defaults if d is not None]
+            params = args.posonlyargs + args.args + args.kwonlyargs
+            params += [a for a in (args.vararg, args.kwarg) if a is not None]
+            annotations = [a.annotation for a in params if a.annotation is not None]
+            if node.returns is not None:
+                annotations.append(node.returns)
+            kids = [(d, nested) for d in node.decorator_list + defaults + annotations]
             kids += [(stmt, True) for stmt in node.body]
         else:
             kids = [(child, nested) for child in ast.iter_child_nodes(node)]

@@ -129,6 +129,7 @@ MAX_FILE_LINES = 20000
 #    attributes cover augmented assignment, unpacking and for/with targets.
 #    Call sites that resolve to the same (source, target) merge into one edge
 #    with the highest confidence, direct (including super()) over closure.
+#    Calls in a nested def's annotations count as the outer function's.
 SCHEMA_VERSION = 6
 
 
