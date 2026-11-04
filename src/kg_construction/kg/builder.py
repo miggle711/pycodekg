@@ -258,21 +258,22 @@ class _ModuleIndex:
             for i in range(len(parts)):
                 self._by_suffix['/'.join(parts[i:])].append(path)
 
-    def find(self, module_parts: List[str]) -> Optional[str]:
-        """The file for a top level module path, or None if there is none or
-        more than one."""
+    def find(self, module_parts: List[str]) -> Tuple[Optional[str], bool]:
+        """(file, ambiguous): the file for a top level module path, or None
+        if there is none or more than one. `ambiguous` says it was the second
+        reason, so the caller does not guess a file another way."""
         # A package wins over a same named module, as it does when imported.
         candidates = ['/'.join(module_parts) + '/__init__.py', '/'.join(module_parts) + '.py']
         for candidate in candidates:
             if candidate in self.paths:
-                return candidate
+                return candidate, False
         if module_parts[0] in sys.stdlib_module_names:
-            return None
+            return None, False
         hits = [
             path for candidate in candidates for path in self._by_suffix.get(candidate, [])
             if path != candidate and self._is_source_root(path[:-len(candidate) - 1])
         ]
-        return hits[0] if len(hits) == 1 else None
+        return (hits[0], False) if len(hits) == 1 else (None, len(hits) > 1)
 
     def find_relative(self, base_parts: List[str], module_parts: List[str]) -> Optional[str]:
         """The file for a module path relative to a package directory."""
@@ -341,8 +342,9 @@ def _import_target_paths(
             found.append(index.find_relative(base, module_parts + submodule))
     else:
         if module_parts:
-            found.append(index.find(module_parts))
-            if found[0] is None:
+            main, ambiguous = index.find(module_parts)
+            found.append(main)
+            if main is None and not ambiguous:
                 # A repo built from inside the package: `pkg.sub.mod` is sub/mod.py.
                 for i in range(1, len(module_parts)):
                     exact = '/'.join(module_parts[i:]) + '.py'
@@ -350,7 +352,7 @@ def _import_target_paths(
                         found.append(exact)
                         break
         if submodule:
-            found.append(index.find(module_parts + submodule))
+            found.append(index.find(module_parts + submodule)[0])
     return [path for path in found if path]
 
 

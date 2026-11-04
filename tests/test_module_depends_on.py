@@ -155,6 +155,10 @@ class TestModuleDependsOnResolution:
             {"src/pkg/__init__.py": "", "src/pkg/b.py": "", "lib/pkg/__init__.py": "",
              "lib/pkg/b.py": "", "main.py": "from pkg.b import x\n"}, id="two-source-roots"),
         pytest.param(
+            {"src/pkg/__init__.py": "", "src/pkg/b.py": "", "lib/pkg/__init__.py": "",
+             "lib/pkg/b.py": "", "b.py": "", "main.py": "import pkg.b\n"},
+            id="ambiguous-roots-do-not-fall-back-to-a-root-file"),
+        pytest.param(
             {"pkg/__init__.py": "", "pkg/a.py": "from ...x import y\n"}, id="relative-beyond-the-repo"),
         pytest.param(
             {"src/pkg/__init__.py": "", "src/outside.py": "", "src/pkg/a.py": "from ..outside import x\n"},
