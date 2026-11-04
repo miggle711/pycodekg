@@ -1286,6 +1286,51 @@ def _scope_import_map(node: ast.AST) -> Dict[str, str]:
     return {**type_only, **runtime}
 
 
+def scope_import_bindings(node: ast.AST) -> Dict[str, List[Tuple[Tuple[int, int], str]]]:
+    """{local name: [((line, col), qualified name), ...]} in source order for
+    the runtime imports in `node`'s own scope. Type only imports are left out:
+    they never run, so a call can not be going through them."""
+    bindings: Dict[str, List[Tuple[Tuple[int, int], str]]] = {}
+    for stmt, is_type_only in _iter_scope_imports_flagged(node):
+        if is_type_only:
+            continue
+        position = (stmt.lineno, stmt.col_offset)
+        for local, qualified in _import_bindings(stmt):
+            bindings.setdefault(local, []).append((position, qualified))
+    for hits in bindings.values():
+        hits.sort(key=lambda hit: hit[0])
+    return bindings
+
+
+class ImportScopes:
+    """What a name means at a point in a function: the module it was imported
+    from, given the imports that have run by then.
+
+    A function's own imports apply from the line they are on, so a call before
+    `import b as client` still goes through the earlier `import a as client`.
+    `enclosing` is what the function sees from outside itself (the module's
+    imports, and those of the functions around it), where the last binding
+    wins because that code has run by the time the function is called.
+    """
+
+    def __init__(self, enclosing: Dict[str, str]):
+        self.enclosing = enclosing
+        self._bindings: Dict[int, Dict[str, List[Tuple[Tuple[int, int], str]]]] = {}
+
+    def lookup(self, name: str, node: ast.AST, scope: ast.AST) -> Optional[str]:
+        """The qualified name `name` refers to at `node`, a point inside the
+        function `scope`, or None if it is not an imported name."""
+        if id(scope) not in self._bindings:
+            self._bindings[id(scope)] = scope_import_bindings(scope)
+        hits = self._bindings[id(scope)].get(name)
+        if hits:
+            position = (node.lineno, node.col_offset)
+            earlier = [qualified for hit_position, qualified in hits if hit_position < position]
+            if earlier:
+                return earlier[-1]
+        return self.enclosing.get(name)
+
+
 def _collect_file_level_info(tree: ast.Module) -> Tuple[Dict[str, str], List[str], Dict[str, str]]:
     """Collect imports, __all__ exports, and module-level constants in one pass.
 

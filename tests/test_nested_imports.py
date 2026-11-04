@@ -95,3 +95,20 @@ class TestImportsOutsideTheModuleBody:
         # The call is to a.run, and b is still recorded as a dependency.
         assert _run_targets(kg) == [("f", "a.py")]
         assert ("m.py", "b") in _labels(kg, "imports")
+
+    @pytest.mark.parametrize("body, expected", [
+        pytest.param(
+            "import a as client\n    first = client.run()\n    import b as client\n    return first\n",
+            [("f", "a.py")], id="call-before-the-rebinding"),
+        pytest.param(
+            "import a as client\n    first = client.run()\n    import b as client\n"
+            "    second = client.run()\n    return first, second\n",
+            [("f", "a.py"), ("f", "b.py")], id="calls-on-both-sides"),
+    ])
+    def test_a_call_goes_through_the_import_that_has_run_by_then(self, tmp_path, body, expected):
+        kg = _build(tmp_path, {
+            "a.py": "def run(): ...\n",
+            "b.py": "def run(): ...\n",
+            "m.py": "def f():\n    " + body,
+        })
+        assert _run_targets(kg) == expected

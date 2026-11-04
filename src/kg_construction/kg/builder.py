@@ -71,6 +71,7 @@ from kg_construction.ast.helpers import (
     _get_factory_call_sites,
     _build_func_metadata,
     _collect_file_level_info,
+    ImportScopes,
     _scope_import_map,
     assign_qualnames,
     iter_calls_by_scope,
@@ -423,6 +424,9 @@ def _parse_file(args: Tuple[str, str, str]) -> Optional[Dict]:
     # Deduplicate call edges within this file at creation time to avoid
     # accumulating one edge per call-site for frequently called functions
     seen_call_targets: Set[Tuple[str, str, Optional[str]]] = set()
+    # The same call can go through a different import before and after a
+    # name is re-imported, so the import is part of what makes a call unique.
+    seen_call_hints: Set[Tuple[str, str, Optional[str], Optional[str]]] = set()
 
     # Factory-call assignment sites recorded for optional pyright type
     # resolution (see kg/type_inference.py). Each site is
@@ -440,6 +444,10 @@ def _parse_file(args: Tuple[str, str, str]) -> Optional[Dict]:
     file_id = _make_id(f"file_{repo}_{rel_path}")
     file_type = 'test_file' if _is_test_file(rel_path) else 'file'
     import_map, exports, constants = _collect_file_level_info(tree)
+    # What the function being emitted sees from outside itself: the module's
+    # imports, plus those of the functions around it. Its own imports apply
+    # from the line they are on (see ImportScopes).
+    enclosing_imports = import_map
     # Unique qualname per def in this file (see assign_qualnames); node IDs
     # and metadata['qualname'] are derived from it rather than rebuilt from
     # nesting so two same-named defs can't share an ID.
@@ -533,6 +541,7 @@ def _parse_file(args: Tuple[str, str, str]) -> Optional[Dict]:
                          same function body twice for the same data.
         """
         own_calls, closure_calls = iter_calls_by_scope(func_node)
+        scopes = ImportScopes(enclosing_imports)
         # Own scope first, so a direct call takes the dedup slot before the
         # same call found inside a closure.
         tagged_calls = [(c, False) for c in own_calls] + [(c, True) for c in closure_calls]
@@ -550,10 +559,6 @@ def _parse_file(args: Tuple[str, str, str]) -> Optional[Dict]:
             if callee == 'super' and receiver is None:
                 continue
 
-            if (func_id, callee, receiver) in seen_call_targets:
-                continue
-            seen_call_targets.add((func_id, callee, receiver))
-
             class_hint: Optional[str] = None
             class_hint_id: Optional[str] = None
             local_type_hint: Optional[str] = None
@@ -569,12 +574,19 @@ def _parse_file(args: Tuple[str, str, str]) -> Optional[Dict]:
                 class_hint_id = class_id
             elif receiver and receiver in local_types:
                 local_type_hint = local_types[receiver]
-            elif receiver and receiver in import_map:
-                # e.g. json.loads where 'json' was imported
-                import_resolved = f"{import_map[receiver]}.{callee}"
             else:
-                # Bare-name call: foo() where foo was imported
-                import_resolved = import_map.get(callee)
+                bound = scopes.lookup(receiver, call, func_node) if receiver else None
+                if bound is not None:
+                    # e.g. json.loads where 'json' was imported
+                    import_resolved = f"{bound}.{callee}"
+                else:
+                    # Bare-name call: foo() where foo was imported
+                    import_resolved = scopes.lookup(callee, call, func_node)
+
+            if (func_id, callee, receiver, import_resolved) in seen_call_hints:
+                continue
+            seen_call_hints.add((func_id, callee, receiver, import_resolved))
+            seen_call_targets.add((func_id, callee, receiver))
 
             call_meta = {
                 'unresolved': True,
@@ -913,13 +925,14 @@ def _parse_file(args: Tuple[str, str, str]) -> Optional[Dict]:
         and classes nested in it, so import_map is swapped for the duration
         and restored after. Everything nested inside reads the swapped map,
         which is how a closure sees its enclosing function's imports."""
-        nonlocal import_map
-        outer_imports = import_map
+        nonlocal import_map, enclosing_imports
+        outer_imports, outer_enclosing = import_map, enclosing_imports
+        enclosing_imports = outer_imports
         import_map = {**outer_imports, **_scope_import_map(func_node)}
         try:
             _emit_function_body(func_node, *args, **kwargs)
         finally:
-            import_map = outer_imports
+            import_map, enclosing_imports = outer_imports, outer_enclosing
 
     # Emit class, method, and top-level function nodes (including ones
     # nested under module-level if/try/with blocks)
