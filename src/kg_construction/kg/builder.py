@@ -1504,6 +1504,12 @@ class RepoASTParser:
         re-tag test_function-sourced calls edges as also being 'tests'
         edges, not build any new resolution machinery.
 
+        A call made only inside a closure the test defines gives a 'tests'
+        edge tagged via_closure, like the calls edge it comes from. If a
+        naming-convention edge for the same pair already exists, it stays as
+        it is and untagged: the test's name links it to the target on its
+        own, so the link does not depend on the closure.
+
         Mutates resolved_edges/seen_edges in place (same pattern as the
         rest of this pass) rather than returning a new list.
         """
@@ -1516,7 +1522,7 @@ class RepoASTParser:
 
             key = (edge['source'], edge['target'], 'tests')
             if key in seen_edges:
-                continue
+                continue  # the naming convention got there first; keep it untagged
             seen_edges.add(key)
             tests_meta = {'confidence': edge.get('metadata', {}).get('confidence', 'unknown'),
                           'derived_from': 'calls'}

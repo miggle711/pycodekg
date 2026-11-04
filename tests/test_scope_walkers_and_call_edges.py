@@ -117,19 +117,24 @@ class TestClosureCallsAreKeptAndTagged:
         assert {n["label"] for n in engine.find_callers(normalize["id"])} == {"keyfunc", "create_index"}
         assert {n["label"] for n in engine.find_callers(normalize["id"], include_closure=False)} == {"keyfunc"}
 
-    def test_test_whose_only_call_is_in_a_local_callback_is_still_linked(self, tmp_path):
+    @pytest.mark.parametrize("test_name, tagged", [
+        ("test_callback", True),   # linked only through the closure's call
+        ("test_target", False),    # the name also links it, so the link is not via the closure
+    ])
+    def test_test_whose_only_call_is_in_a_local_callback_is_still_linked(
+            self, tmp_path, test_name, tagged):
         kg = _build(tmp_path, {
             "m.py": "def target():\n    return 1\n",
             "tests/test_m.py": (
                 "from m import target\n"
-                "def test_callback():\n"
+                f"def {test_name}():\n"
                 "    def callback():\n"
                 "        return target()\n"
                 "    callback()\n"
             ),
         })
-        tests = _edges(kg, "tests")
-        assert tests[("test_callback", "target")]["via_closure"] is True
+        assert _edges(kg, "calls")[(test_name, "target")]["via_closure"] is True
+        assert _edges(kg, "tests")[(test_name, "target")].get("via_closure", False) is tagged
 
 
 class TestCallsOnDifferentReceiversAreNotCollapsed:
