@@ -9,6 +9,8 @@ no `import_resolved` hint for the calls that use it.
 import textwrap
 from pathlib import Path
 
+import pytest
+
 from kg_construction.kg.builder import RepoASTParser
 
 
@@ -23,6 +25,16 @@ def _labels(kg, relation):
     return sorted(
         (nodes[e["source"]]["label"], nodes[e["target"]]["label"])
         for e in kg["edges"] if e["relation"] == relation
+    )
+
+
+def _run_targets(kg):
+    """(caller label, defining file) for each calls edge to a function named run."""
+    nodes = {n["id"]: n for n in kg["nodes"]}
+    return sorted(
+        (nodes[e["source"]]["label"], nodes[e["target"]]["metadata"]["filepath"])
+        for e in kg["edges"]
+        if e["relation"] == "calls" and nodes[e["target"]]["label"] == "run"
     )
 
 
@@ -69,3 +81,17 @@ class TestImportsOutsideTheModuleBody:
         assert confidence["f"] == "qualified"
         assert confidence["inner"] == "qualified"
         assert confidence["g"] != "qualified"
+
+    @pytest.mark.parametrize("header", [
+        "import a as client\nif TYPE_CHECKING:\n    import b as client\n",
+        "if TYPE_CHECKING:\n    import b as client\nimport a as client\n",
+    ], ids=["runtime-first", "type-checking-first"])
+    def test_type_checking_import_does_not_replace_a_runtime_binding(self, tmp_path, header):
+        kg = _build(tmp_path, {
+            "a.py": "def run(): ...\n",
+            "b.py": "def run(): ...\n",
+            "m.py": "from typing import TYPE_CHECKING\n" + header + "\ndef f():\n    return client.run()\n",
+        })
+        # The call is to a.run, and b is still recorded as a dependency.
+        assert _run_targets(kg) == [("f", "a.py")]
+        assert ("m.py", "b") in _labels(kg, "imports")
