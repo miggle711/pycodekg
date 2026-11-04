@@ -4,9 +4,15 @@ Covers the bug where file_label_to_id was keyed by bare filename, causing
 identically-named files in different packages (pkg_a/utils.py vs
 pkg_b/utils.py) to collide and misattribute module_depends_on edges to
 whichever file happened to be indexed last.
+
+TestModuleDependsOnResolution covers the other half: an import has to find its
+file under a src/ layout, as a package or submodule, and through relative
+imports, without linking a stdlib name to an unrelated deep file.
 """
 
 from pathlib import Path
+
+import pytest
 
 from kg_construction.kg.builder import RepoASTParser
 
@@ -88,3 +94,59 @@ class TestModuleDependsOnPathCollision:
             e["source"] == main_b_id and e["target"] == utils_a_id
             for e in module_depends_on
         ), "pkg_b/main.py must not depend on pkg_a/utils.py"
+
+
+def _module_edges(tmp_path: Path, files: dict) -> set:
+    """{(importing path, imported path)} of the module_depends_on edges."""
+    for rel, source in files.items():
+        path = tmp_path / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(source)
+    kg = RepoASTParser(max_workers=1).parse_repo("test/repo", tmp_path)
+    paths = {n["id"]: n["metadata"]["path"] for n in kg["nodes"] if n["type"] in ("file", "test_file")}
+    return {(paths[e["source"]], paths[e["target"]])
+            for e in kg["edges"] if e["relation"] == "module_depends_on"}
+
+
+class TestModuleDependsOnResolution:
+    """Imports resolve to files under src/ layouts, as packages and submodules,
+    and through relative imports."""
+
+    @pytest.mark.parametrize("files, expected", [
+        pytest.param(
+            {"src/pkg/__init__.py": "", "src/pkg/b.py": "", "src/pkg/a.py": "from pkg.b import f\n"},
+            {("src/pkg/a.py", "src/pkg/b.py")}, id="src-layout"),
+        pytest.param(
+            {"pkg/__init__.py": "", "pkg/b.py": "", "pkg/a.py": "from pkg import b\n"},
+            {("pkg/a.py", "pkg/__init__.py"), ("pkg/a.py", "pkg/b.py")}, id="submodule"),
+        pytest.param(
+            {"pkg/__init__.py": "", "main.py": "import pkg\n"},
+            {("main.py", "pkg/__init__.py")}, id="package"),
+        pytest.param(
+            {"pkg/__init__.py": "", "pkg/b.py": "", "pkg/a.py": "from .b import f\n"},
+            {("pkg/a.py", "pkg/b.py")}, id="relative-module"),
+        pytest.param(
+            {"pkg/__init__.py": "", "pkg/b.py": "", "pkg/a.py": "from . import b\n"},
+            {("pkg/a.py", "pkg/__init__.py"), ("pkg/a.py", "pkg/b.py")}, id="relative-submodule"),
+        pytest.param(
+            {"pkg/__init__.py": "", "pkg/x.py": "", "pkg/sub/__init__.py": "",
+             "pkg/sub/a.py": "from ..x import y\n"},
+            {("pkg/sub/a.py", "pkg/x.py")}, id="relative-two-levels"),
+    ])
+    def test_import_links_to_the_files_it_depends_on(self, tmp_path, files, expected):
+        assert _module_edges(tmp_path, files) == expected
+
+    @pytest.mark.parametrize("files", [
+        pytest.param(
+            {"pkg/__init__.py": "", "pkg/utils/__init__.py": "", "pkg/utils/json.py": "",
+             "pkg/a.py": "import json\n"}, id="top-level-name-inside-a-package"),
+        pytest.param(
+            {"tools/json.py": "", "main.py": "import json\n"}, id="stdlib-name-under-a-plain-directory"),
+        pytest.param(
+            {"src/pkg/__init__.py": "", "src/pkg/b.py": "", "lib/pkg/__init__.py": "",
+             "lib/pkg/b.py": "", "main.py": "from pkg.b import x\n"}, id="two-source-roots"),
+        pytest.param(
+            {"pkg/__init__.py": "", "pkg/a.py": "from ...x import y\n"}, id="relative-beyond-the-repo"),
+    ])
+    def test_no_edge_when_the_target_is_not_the_repos_module(self, tmp_path, files):
+        assert _module_edges(tmp_path, files) == set()
