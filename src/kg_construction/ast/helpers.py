@@ -163,6 +163,41 @@ def _extract_callee_name(call: ast.Call) -> Optional[str]:
     return None
 
 
+def _outer_scope_exprs(def_node: Union[ast.FunctionDef, ast.AsyncFunctionDef]) -> List[ast.AST]:
+    """The expressions of a def that run in the scope the def sits in, not in
+    its own: decorators, default values and annotations."""
+    args = def_node.args
+    defaults = args.defaults + [d for d in args.kw_defaults if d is not None]
+    params = args.posonlyargs + args.args + args.kwonlyargs
+    params += [a for a in (args.vararg, args.kwarg) if a is not None]
+    annotations = [a.annotation for a in params if a.annotation is not None]
+    if def_node.returns is not None:
+        annotations.append(def_node.returns)
+    return def_node.decorator_list + defaults + annotations
+
+
+def call_scope_chains(
+    func_node: Union[ast.FunctionDef, ast.AsyncFunctionDef],
+) -> Dict[int, List[ast.AST]]:
+    """For every Call in a function, keyed by id(call): the functions around
+    it, from `func_node` down to the innermost one. A call in `func_node`'s
+    own body maps to [func_node]; one in a closure `inner` defined in it maps
+    to [func_node, inner]. Walks the same way as iter_calls_by_scope."""
+    chains: Dict[int, List[ast.AST]] = {}
+    stack: List[Tuple[ast.AST, Tuple[ast.AST, ...]]] = [(func_node, (func_node,))]
+    while stack:
+        node, chain = stack.pop()
+        if isinstance(node, ast.Call):
+            chains[id(node)] = list(chain)
+        if node is not func_node and isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            kids = [(expr, chain) for expr in _outer_scope_exprs(node)]
+            kids += [(stmt, chain + (node,)) for stmt in node.body]
+        else:
+            kids = [(child, chain) for child in ast.iter_child_nodes(node)]
+        stack.extend(reversed(kids))
+    return chains
+
+
 def iter_calls_by_scope(
     func_node: Union[ast.FunctionDef, ast.AsyncFunctionDef],
 ) -> Tuple[List[ast.Call], List[ast.Call]]:
@@ -183,14 +218,7 @@ def iter_calls_by_scope(
         if isinstance(node, ast.Call):
             (in_closure if nested else own).append(node)
         if node is not func_node and isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            args = node.args
-            defaults = args.defaults + [d for d in args.kw_defaults if d is not None]
-            params = args.posonlyargs + args.args + args.kwonlyargs
-            params += [a for a in (args.vararg, args.kwarg) if a is not None]
-            annotations = [a.annotation for a in params if a.annotation is not None]
-            if node.returns is not None:
-                annotations.append(node.returns)
-            kids = [(d, nested) for d in node.decorator_list + defaults + annotations]
+            kids = [(expr, nested) for expr in _outer_scope_exprs(node)]
             kids += [(stmt, True) for stmt in node.body]
         else:
             kids = [(child, nested) for child in ast.iter_child_nodes(node)]
@@ -1317,17 +1345,25 @@ class ImportScopes:
         self.enclosing = enclosing
         self._bindings: Dict[int, Dict[str, List[Tuple[Tuple[int, int], str]]]] = {}
 
-    def lookup(self, name: str, node: ast.AST, scope: ast.AST) -> Optional[str]:
-        """The qualified name `name` refers to at `node`, a point inside the
-        function `scope`, or None if it is not an imported name."""
-        if id(scope) not in self._bindings:
-            self._bindings[id(scope)] = scope_import_bindings(scope)
-        hits = self._bindings[id(scope)].get(name)
-        if hits:
-            position = (node.lineno, node.col_offset)
-            earlier = [qualified for hit_position, qualified in hits if hit_position < position]
-            if earlier:
-                return earlier[-1]
+    def lookup(self, name: str, node: ast.AST, chain: List[ast.AST]) -> Optional[str]:
+        """The qualified name `name` refers to at `node`, or None if it is not
+        an imported name. `chain` is the functions around `node`, outermost
+        first (see call_scope_chains). The innermost one is searched first and
+        only up to the line of `node`; for each function around it the last
+        import wins, since a closure runs after its enclosing function has."""
+        position = (node.lineno, node.col_offset)
+        for depth, scope in enumerate(reversed(chain)):
+            if id(scope) not in self._bindings:
+                self._bindings[id(scope)] = scope_import_bindings(scope)
+            hits = self._bindings[id(scope)].get(name)
+            if not hits:
+                continue
+            if depth == 0:
+                earlier = [qualified for hit_position, qualified in hits if hit_position < position]
+                if earlier:
+                    return earlier[-1]
+            else:
+                return hits[-1][1]
         return self.enclosing.get(name)
 
 

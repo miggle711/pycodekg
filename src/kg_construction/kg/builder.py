@@ -72,6 +72,7 @@ from kg_construction.ast.helpers import (
     _build_func_metadata,
     _collect_file_level_info,
     ImportScopes,
+    call_scope_chains,
     _scope_import_map,
     assign_qualnames,
     iter_calls_by_scope,
@@ -542,6 +543,7 @@ def _parse_file(args: Tuple[str, str, str]) -> Optional[Dict]:
         """
         own_calls, closure_calls = iter_calls_by_scope(func_node)
         scopes = ImportScopes(enclosing_imports)
+        chains = call_scope_chains(func_node)
         # Own scope first, so a direct call takes the dedup slot before the
         # same call found inside a closure.
         tagged_calls = [(c, False) for c in own_calls] + [(c, True) for c in closure_calls]
@@ -575,13 +577,14 @@ def _parse_file(args: Tuple[str, str, str]) -> Optional[Dict]:
             elif receiver and receiver in local_types:
                 local_type_hint = local_types[receiver]
             else:
-                bound = scopes.lookup(receiver, call, func_node) if receiver else None
+                chain = chains[id(call)]
+                bound = scopes.lookup(receiver, call, chain) if receiver else None
                 if bound is not None:
                     # e.g. json.loads where 'json' was imported
                     import_resolved = f"{bound}.{callee}"
                 else:
                     # Bare-name call: foo() where foo was imported
-                    import_resolved = scopes.lookup(callee, call, func_node)
+                    import_resolved = scopes.lookup(callee, call, chain)
 
             if (func_id, callee, receiver, import_resolved) in seen_call_hints:
                 continue

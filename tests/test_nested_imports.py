@@ -112,3 +112,20 @@ class TestImportsOutsideTheModuleBody:
             "m.py": "def f():\n    " + body,
         })
         assert _run_targets(kg) == expected
+
+    def test_a_closures_call_goes_through_the_closures_own_import(self, tmp_path):
+        kg = _build(tmp_path, {
+            "a.py": "def run(): ...\n",
+            "b.py": "def run(): ...\n",
+            "m.py": """
+                def outer():
+                    import a as client
+                    def inner():
+                        import b as client
+                        return client.run()
+                    return inner
+            """,
+        })
+        # inner imports b itself, so the call is to b.run, and so is outer's
+        # copy of it (made through the closure). Neither is a call to a.run.
+        assert _run_targets(kg) == [("inner", "b.py"), ("outer", "b.py")]
