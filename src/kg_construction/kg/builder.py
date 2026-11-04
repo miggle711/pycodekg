@@ -135,8 +135,9 @@ MAX_FILE_LINES = 20000
 #    write forms as side_effects.
 # 7: module_depends_on edges are resolved per importing file: src/ layouts,
 #    packages (__init__.py), `from pkg import submodule` and relative imports
-#    now produce edges (an old cached KG is missing them), and the imports
-#    edge of a relative import carries metadata['level'].
+#    now produce edges (an old cached KG is missing them), and every imports
+#    edge carries metadata['statements']: the import statements (module, name,
+#    number of leading dots) of that file behind the shared import node.
 SCHEMA_VERSION = 7
 
 
@@ -311,11 +312,11 @@ class _ModuleIndex:
 def _import_target_paths(index: _ModuleIndex, importing_path: str, statement: Dict) -> List[str]:
     """Repo files an import statement depends on.
 
-    `statement` is {'module', 'name', 'level'}: module is None for a plain
-    `import a.b.c`, which depends on a/b/c. `from a.b import c` depends on
-    a/b, and on a/b/c as well when c is a submodule. A relative import is
-    resolved from the importing file's own package, one directory up per
-    extra dot.
+    `statement` is {'module', 'name', 'level'} as recorded on the imports edge:
+    module is None for a plain `import a.b.c`, which depends on a/b/c.
+    `from a.b import c` depends on a/b, and on a/b/c as well when c is a
+    submodule. A relative import is resolved from the importing file's own
+    package, one directory up per extra dot.
     """
     level = statement['level']
     if statement['module'] is None:
@@ -428,14 +429,21 @@ def _parse_file(args: Tuple[str, str, str]) -> Optional[Dict]:
         metadata={'path': rel_path, 'repo': repo, 'constants': constants, 'exports': exports}
     )))
 
-    # Emit import nodes and edges
+    # Emit import nodes and edges. An import node is shared by every file that
+    # imports the same name, so what a file's import statement actually says
+    # (module, name, number of leading dots) goes on that file's own imports
+    # edge, as `statements`. `import dep`, `from . import dep` and
+    # `from .. import dep` are one node but three different statements.
+    import_statements: Dict[str, List[Dict]] = {}
     for node in ast.iter_child_nodes(tree):
         if isinstance(node, ast.Import):
             for alias in node.names:
                 mod_id = _make_id(f"import_{repo}_{alias.name}")
                 nodes.append(asdict(KGNode(id=mod_id, type='import', label=alias.name,
                                            metadata={'repo': repo})))
-                edges.append(asdict(KGEdge(source=file_id, target=mod_id, relation='imports')))
+                statement = {'module': None, 'name': alias.name, 'level': 0}
+                if statement not in import_statements.setdefault(mod_id, []):
+                    import_statements[mod_id].append(statement)
         elif isinstance(node, ast.ImportFrom):
             mod_name = node.module or ''
             for alias in node.names:
@@ -444,12 +452,12 @@ def _parse_file(args: Tuple[str, str, str]) -> Optional[Dict]:
                 nodes.append(asdict(KGNode(id=imp_id, type='import', label=full_name,
                                            metadata={'repo': repo, 'module': mod_name,
                                                      'name': alias.name})))
-                # The import node is shared by every file, so the number of
-                # leading dots of a relative import goes on this file's edge.
-                edges.append(asdict(KGEdge(
-                    source=file_id, target=imp_id, relation='imports',
-                    metadata={'level': node.level} if node.level else {},
-                )))
+                statement = {'module': mod_name, 'name': alias.name, 'level': node.level}
+                if statement not in import_statements.setdefault(imp_id, []):
+                    import_statements[imp_id].append(statement)
+    for imp_id, statements in import_statements.items():
+        edges.append(asdict(KGEdge(source=file_id, target=imp_id, relation='imports',
+                                   metadata={'statements': statements})))
 
     def _emit_call_edges(func_id: str, func_node: Union[ast.FunctionDef, ast.AsyncFunctionDef],
                          local_types: Dict[str, str], class_name: Optional[str] = None,
@@ -1571,7 +1579,6 @@ class RepoASTParser:
             if n['type'] in ('file', 'test_file')
         }
         file_id_to_path = {file_id: path for path, file_id in file_path_to_id.items()}
-        import_nodes = {n['id']: n for n in all_nodes if n['type'] == 'import'}
         module_index = _ModuleIndex(set(file_path_to_id))
         # Absolute imports resolve the same from every file, so cache them.
         absolute_targets: Dict[Tuple, List[str]] = {}
@@ -1579,24 +1586,19 @@ class RepoASTParser:
         for edge in list(resolved_edges):
             if edge['relation'] != 'imports':
                 continue
-            imp_node = import_nodes.get(edge['target'])
             src_path = file_id_to_path.get(edge['source'])
-            if imp_node is None or src_path is None:
+            if src_path is None:
                 continue
-            level = edge.get('metadata', {}).get('level', 0)
-            meta = imp_node['metadata']
-            if 'module' in meta:
-                statement = {'module': meta['module'], 'name': meta['name'], 'level': level}
-            else:
-                statement = {'module': None, 'name': imp_node['label'], 'level': level}
-            if level:
-                target_paths = _import_target_paths(module_index, src_path, statement)
-            else:
+            target_paths: List[str] = []
+            for statement in edge.get('metadata', {}).get('statements', []):
+                if statement['level']:
+                    target_paths += _import_target_paths(module_index, src_path, statement)
+                    continue
                 cache_key = (statement['module'], statement['name'])
                 if cache_key not in absolute_targets:
                     absolute_targets[cache_key] = _import_target_paths(
                         module_index, src_path, statement)
-                target_paths = absolute_targets[cache_key]
+                target_paths += absolute_targets[cache_key]
             for target_path in target_paths:
                 target_file_id = file_path_to_id[target_path]
                 if target_file_id == edge['source']:

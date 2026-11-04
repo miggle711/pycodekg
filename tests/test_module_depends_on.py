@@ -145,6 +145,34 @@ class TestModuleDependsOnResolution:
     def test_import_links_to_the_files_it_depends_on(self, tmp_path, files, expected):
         assert _module_edges(tmp_path, files) == expected
 
+    @pytest.mark.parametrize("files, relative_importer, absolute_importer", [
+        pytest.param(
+            {"pkg/__init__.py": "", "pkg/dep.py": "", "dep.py": "",
+             "pkg/a.py": "from . import dep as relative\nimport dep as absolute\n"},
+            "pkg/a.py", "pkg/a.py", id="same-file-relative-first"),
+        pytest.param(
+            {"pkg/__init__.py": "", "pkg/dep.py": "", "dep.py": "",
+             "pkg/a.py": "import dep as absolute\nfrom . import dep as relative\n"},
+            "pkg/a.py", "pkg/a.py", id="same-file-absolute-first"),
+        pytest.param(
+            {"pkg/__init__.py": "", "pkg/dep.py": "", "dep.py": "",
+             "pkg/a.py": "from . import dep\n", "zmain.py": "import dep\n"},
+            "pkg/a.py", "zmain.py", id="two-files-relative-first"),
+        pytest.param(
+            {"pkg/__init__.py": "", "pkg/dep.py": "", "dep.py": "",
+             "pkg/z.py": "from . import dep\n", "amain.py": "import dep\n"},
+            "pkg/z.py", "amain.py", id="two-files-absolute-first"),
+    ])
+    def test_each_import_statement_resolves_on_its_own(
+            self, tmp_path, files, relative_importer, absolute_importer):
+        # `import dep` and `from . import dep` share one import node, but one
+        # means the root dep.py and the other the package and pkg/dep.py.
+        assert _module_edges(tmp_path, files) == {
+            (relative_importer, "pkg/__init__.py"),
+            (relative_importer, "pkg/dep.py"),
+            (absolute_importer, "dep.py"),
+        }
+
     @pytest.mark.parametrize("files", [
         pytest.param(
             {"pkg/__init__.py": "", "pkg/utils/__init__.py": "", "pkg/utils/json.py": "",
