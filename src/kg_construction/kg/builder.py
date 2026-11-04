@@ -71,6 +71,7 @@ from kg_construction.ast.helpers import (
     _get_factory_call_sites,
     _build_func_metadata,
     _collect_file_level_info,
+    _scope_import_map,
     assign_qualnames,
     iter_calls_by_scope,
     iter_scope_defs,
@@ -138,7 +139,14 @@ MAX_FILE_LINES = 20000
 #    now produce edges (an old cached KG is missing them), and every imports
 #    edge carries metadata['statements']: the import statements (module, name,
 #    number of leading dots) of that file behind the shared import node.
-SCHEMA_VERSION = 7
+# 8: imports that are not direct children of the module are collected: under
+#    try/except or `if TYPE_CHECKING:`, and inside functions (lazy imports,
+#    visible to that function and what is nested in it). They get import
+#    nodes and imports/depends_on/module_depends_on edges, and calls through
+#    them carry import_resolved, so some calls move from a name match to
+#    qualified, and a call to an external module is no longer matched to a
+#    same named function in the repo.
+SCHEMA_VERSION = 8
 
 
 def _same_commit(a: Optional[str], b: Optional[str]) -> bool:
@@ -442,29 +450,42 @@ def _parse_file(args: Tuple[str, str, str]) -> Optional[Dict]:
         metadata={'path': rel_path, 'repo': repo, 'constants': constants, 'exports': exports}
     )))
 
-    # Emit import nodes and edges. An import node is shared by every file that
-    # imports the same name, so what a file's import statement actually says
-    # (module, name, number of leading dots) goes on that file's own imports
-    # edge, as `statements`. `import dep`, `from . import dep` and
-    # `from .. import dep` are one node but three different statements.
+    # Emit import nodes and edges for every import in the file, wherever it
+    # sits: at module level, under try/except or `if TYPE_CHECKING:`, or inside
+    # a function (a lazy import). The file depends on all of them. An import
+    # node is shared by every file that imports the same name, so what a
+    # file's import statement actually says (module, name, number of leading
+    # dots) goes on that file's own imports edge, as `statements`. `import
+    # dep`, `from . import dep` and `from .. import dep` are one node but
+    # three different statements. The same statement repeated in one file
+    # (both arms of a try/except, several functions) is recorded once.
+    imports_emitted: Set[str] = set()
     import_statements: Dict[str, List[Dict]] = {}
-    for node in ast.iter_child_nodes(tree):
+    import_stmts = sorted(
+        (n for n in ast.walk(tree) if isinstance(n, (ast.Import, ast.ImportFrom))),
+        key=lambda n: (n.lineno, n.col_offset),
+    )
+    for node in import_stmts:
         if isinstance(node, ast.Import):
             for alias in node.names:
                 mod_id = _make_id(f"import_{repo}_{alias.name}")
-                nodes.append(asdict(KGNode(id=mod_id, type='import', label=alias.name,
-                                           metadata={'repo': repo})))
+                if mod_id not in imports_emitted:
+                    imports_emitted.add(mod_id)
+                    nodes.append(asdict(KGNode(id=mod_id, type='import', label=alias.name,
+                                               metadata={'repo': repo})))
                 statement = {'module': None, 'name': alias.name, 'level': 0}
                 if statement not in import_statements.setdefault(mod_id, []):
                     import_statements[mod_id].append(statement)
-        elif isinstance(node, ast.ImportFrom):
+        else:
             mod_name = node.module or ''
             for alias in node.names:
                 full_name = f"{mod_name}.{alias.name}" if mod_name else alias.name
                 imp_id = _make_id(f"import_{repo}_{full_name}")
-                nodes.append(asdict(KGNode(id=imp_id, type='import', label=full_name,
-                                           metadata={'repo': repo, 'module': mod_name,
-                                                     'name': alias.name})))
+                if imp_id not in imports_emitted:
+                    imports_emitted.add(imp_id)
+                    nodes.append(asdict(KGNode(id=imp_id, type='import', label=full_name,
+                                               metadata={'repo': repo, 'module': mod_name,
+                                                         'name': alias.name})))
                 statement = {'module': mod_name, 'name': alias.name, 'level': node.level}
                 if statement not in import_statements.setdefault(imp_id, []):
                     import_statements[imp_id].append(statement)
@@ -796,7 +817,7 @@ def _parse_file(args: Tuple[str, str, str]) -> Optional[Dict]:
             else:
                 _emit_class(child, container_id=class_id, qualname=qualnames[id(child)])
 
-    def _emit_function(
+    def _emit_function_body(
         func_node: Union[ast.FunctionDef, ast.AsyncFunctionDef],
         container_id: str,
         qualname: str,
@@ -883,6 +904,22 @@ def _parse_file(args: Tuple[str, str, str]) -> Optional[Dict]:
                 )
             else:
                 _emit_class(child, container_id=func_id, qualname=qualnames[id(child)])
+
+    def _emit_function(func_node: Union[ast.FunctionDef, ast.AsyncFunctionDef],
+                       *args, **kwargs):
+        """Emit a function node (see _emit_function_body) with the imports it
+        can see: the module's, plus any it makes itself. A lazy import
+        (`def f(): import json`) is only in scope inside f and the functions
+        and classes nested in it, so import_map is swapped for the duration
+        and restored after. Everything nested inside reads the swapped map,
+        which is how a closure sees its enclosing function's imports."""
+        nonlocal import_map
+        outer_imports = import_map
+        import_map = {**outer_imports, **_scope_import_map(func_node)}
+        try:
+            _emit_function_body(func_node, *args, **kwargs)
+        finally:
+            import_map = outer_imports
 
     # Emit class, method, and top-level function nodes (including ones
     # nested under module-level if/try/with blocks)

@@ -1222,6 +1222,40 @@ def _build_func_metadata(
     return meta
 
 
+def iter_scope_imports(node: ast.AST):
+    """Yield the import statements that belong directly to `node`'s scope,
+    in source order.
+
+    Looks through compound statements (`try`/`except`, `if TYPE_CHECKING:`,
+    `with`, loops, `match`), which don't introduce a scope, but not into a
+    nested function or class: an import there is only visible inside it.
+    """
+    for child in ast.iter_child_nodes(node):
+        if isinstance(child, (ast.Import, ast.ImportFrom)):
+            yield child
+        elif isinstance(child, _DEF_TYPES):
+            continue
+        elif isinstance(child, _SCOPE_TRANSPARENT):
+            yield from iter_scope_imports(child)
+
+
+def _scope_import_map(node: ast.AST) -> Dict[str, str]:
+    """{local_name: fully_qualified_name} for the imports in `node`'s own
+    scope (see iter_scope_imports). A later import of the same local name
+    replaces an earlier one, as it would when the code runs."""
+    import_map: Dict[str, str] = {}
+    for stmt in iter_scope_imports(node):
+        if isinstance(stmt, ast.Import):
+            for alias in stmt.names:
+                # `import os.path` → local name is 'os', full name is 'os.path'
+                import_map[alias.asname or alias.name.split('.')[0]] = alias.name
+        else:
+            mod = stmt.module or ''
+            for alias in stmt.names:
+                import_map[alias.asname or alias.name] = f"{mod}.{alias.name}" if mod else alias.name
+    return import_map
+
+
 def _collect_file_level_info(tree: ast.Module) -> Tuple[Dict[str, str], List[str], Dict[str, str]]:
     """Collect imports, __all__ exports, and module-level constants in one pass.
 
@@ -1229,28 +1263,21 @@ def _collect_file_level_info(tree: ast.Module) -> Tuple[Dict[str, str], List[str
     three separate times.
 
     Returns:
-        import_map: {local_name: fully_qualified_name} for all imports.
+        import_map: {local_name: fully_qualified_name} for the imports in the
+            module's own scope, including ones under try/except or
+            `if TYPE_CHECKING:`. Imports inside a function are not here: they
+            belong to that function (see _scope_import_map).
             Used to annotate call edges with the source module when the
             callee was imported (e.g. 'HTTPBasicAuth' → 'requests.auth.HTTPBasicAuth').
         exports: List of names in __all__, if defined.
         constants: {NAME: value_string} for UPPER_CASE module-level assignments.
     """
-    import_map: Dict[str, str] = {}
+    import_map = _scope_import_map(tree)
     exports: List[str] = []
     constants: Dict[str, str] = {}
 
     for node in ast.iter_child_nodes(tree):
-        if isinstance(node, ast.Import):
-            for alias in node.names:
-                # `import os.path` → local name is 'os', full name is 'os.path'
-                local = alias.asname or alias.name.split('.')[0]
-                import_map[local] = alias.name
-        elif isinstance(node, ast.ImportFrom):
-            mod = node.module or ''
-            for alias in node.names:
-                local = alias.asname or alias.name
-                import_map[local] = f"{mod}.{alias.name}" if mod else alias.name
-        elif isinstance(node, ast.Assign):
+        if isinstance(node, ast.Assign):
             for target in node.targets:
                 if isinstance(target, ast.Name):
                     if target.id == '__all__' and isinstance(node.value, (ast.List, ast.Tuple)):
