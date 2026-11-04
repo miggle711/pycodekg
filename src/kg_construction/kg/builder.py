@@ -282,6 +282,22 @@ class _ModuleIndex:
                 return candidate
         return None
 
+    def package_depth(self, file_path: str) -> int:
+        """How many package levels a relative import in this file can climb:
+        the number of directories, from the file's own upward, that are
+        packages. Python rejects a relative import that goes above the
+        top-level package, whatever else sits above it (a `src/` directory,
+        say). A file outside any package sits in a namespace package at best,
+        so it gets one level; a file at the repo root gets none."""
+        directory = file_path.split('/')[:-1]
+        if not directory:
+            return 0
+        depth = 0
+        while directory and '/'.join(directory) + '/__init__.py' in self.paths:
+            depth += 1
+            directory.pop()
+        return max(depth, 1)
+
     def _is_source_root(self, directory: str) -> bool:
         return directory + '/__init__.py' not in self.paths
 
@@ -308,9 +324,9 @@ def _import_target_paths(
 
     found: List[Optional[str]] = []
     if level:
-        base = importing_path.split('/')[:-1]
-        if level - 1 > len(base):
+        if level > index.package_depth(importing_path):
             return []
+        base = importing_path.split('/')[:-1]
         base = base[:len(base) - (level - 1)]
         if module_parts:
             found.append(index.find_relative(base, module_parts))
