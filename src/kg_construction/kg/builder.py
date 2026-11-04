@@ -130,6 +130,8 @@ MAX_FILE_LINES = 20000
 #    Call sites that resolve to the same (source, target) merge into one edge
 #    with the highest confidence, direct (including super()) over closure.
 #    Calls in a nested def's annotations count as the outer function's.
+#    self.x += 1 counts as a read, and mutates_attributes covers the same
+#    write forms as side_effects.
 SCHEMA_VERSION = 6
 
 

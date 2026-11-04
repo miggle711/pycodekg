@@ -168,7 +168,7 @@ class TestNestedScopeLeakage:
 
 class TestWriteFormsAreRecorded:
     def test_side_effects_cover_every_assignment_form_and_skip_nested_scopes(self):
-        writes = _get_attribute_accesses(_func("""
+        func = _func("""
             def f(self, items, p):
                 self.n += 1
                 self.a, self.b = 1, 2
@@ -180,8 +180,17 @@ class TestWriteFormsAreRecorded:
                 self.items.append(3)
                 def callback():
                     self.hidden = 1
-        """))[1]
+        """)
+        writes = _get_attribute_accesses(func)[1]
         assert sorted(writes) == ["a", "b", "c", "d", "fh", "i", "n"]
+        assert sorted(_extract_data_flows(func)["mutates_attributes"]) == sorted(writes)
+
+    def test_augmented_assignment_reads_the_old_value(self):
+        reads, writes = _get_attribute_accesses(_func("""
+            def inc(self):
+                self.count += 1
+        """))
+        assert (reads, writes) == (["count"], ["count"])
 
     def test_class_attributes_cover_the_same_forms_and_skip_nested_scopes(self):
         cls = ast.parse(textwrap.dedent("""

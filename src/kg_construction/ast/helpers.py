@@ -739,30 +739,19 @@ def _extract_data_flows(node: Union[ast.FunctionDef, ast.AsyncFunctionDef]) -> D
                 if unparsed:
                     flows['returns'].append(unparsed)
 
-            # Track attribute mutations (only in direct scope, not nested functions):
-            # - Direct: self.x = value
-            # - Subscript: self.x[key] = value
-            elif isinstance(child, ast.Assign) and not allow_param_in_nested:
-                for target in child.targets:
-                    attr_name = None
-
-                    # Direct attribute: self.x = value
-                    if isinstance(target, ast.Attribute):
-                        if isinstance(target.value, ast.Name) and target.value.id == 'self':
-                            attr_name = target.attr
-
-                    # Subscript mutation: self.x[key] = value
-                    elif isinstance(target, ast.Subscript):
-                        if isinstance(target.value, ast.Attribute):
-                            if isinstance(target.value.value, ast.Name) and target.value.value.id == 'self':
-                                attr_name = target.value.attr
-
-                    if attr_name:
-                        if attr_name not in flows['mutates_attributes']:
-                            flows['mutates_attributes'][attr_name] = []
-                        value_unparsed = _safe_unparse(child.value)
-                        if value_unparsed:
-                            flows['mutates_attributes'][attr_name].append(value_unparsed)
+            # Track attribute mutations (only in direct scope, not nested
+            # functions), through every form _get_attribute_accesses counts
+            # as a write: self.x = value, self.x[key] = value, augmented and
+            # annotated assignment, unpacking, and for/with targets.
+            elif (isinstance(child, (ast.Assign, ast.AnnAssign, ast.AugAssign,
+                                     ast.For, ast.AsyncFor, ast.With, ast.AsyncWith))
+                  and not allow_param_in_nested):
+                value = getattr(child, 'value', None)
+                value_unparsed = _safe_unparse(value) if value is not None else None
+                for attr_name in _written_self_attrs(child, include_subscript=True):
+                    mutated = flows['mutates_attributes'].setdefault(attr_name, [])
+                    if value_unparsed:
+                        mutated.append(value_unparsed)
 
             # Track parameter usage (Name nodes in Load context)
             elif isinstance(child, ast.Name) and isinstance(child.ctx, ast.Load):
@@ -981,6 +970,8 @@ def _get_attribute_accesses(
         if names:
             writes.extend(names)
             written.update(names)
+            if isinstance(child, ast.AugAssign):
+                reads.extend(names)  # `self.x += 1` reads the old value first
         elif isinstance(child, ast.Attribute):
             if (isinstance(child.value, ast.Name) and
                     child.value.id == 'self' and
