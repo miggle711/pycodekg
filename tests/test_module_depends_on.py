@@ -159,6 +159,9 @@ class TestModuleDependsOnResolution:
         pytest.param(
             {"src/pkg/__init__.py": "", "src/outside.py": "", "src/pkg/a.py": "from ..outside import x\n"},
             id="relative-above-the-top-level-package"),
+        pytest.param(
+            {"pkg/__init__.py": "", "pkg/utils/missing_external.py": "",
+             "main.py": "import missing_external\n"}, id="plain-directory-inside-a-package"),
     ])
     def test_no_edge_when_the_target_is_not_the_repos_module(self, tmp_path, files):
         assert _module_edges(tmp_path, files) == set()

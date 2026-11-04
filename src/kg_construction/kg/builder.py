@@ -246,8 +246,8 @@ class _ModuleIndex:
     A module `a.b` lives in a/b.py or a/b/__init__.py, either at the repo root
     or under a single source root such as src/ or lib/. A match under a source
     root has to be unambiguous: a directory only counts as a source root if it
-    is not itself a package, so `import json` does not link to a deep
-    pkg/utils/json.py, and two roots holding the same module give no edge.
+    is neither a package nor inside one, so `import json` does not link to a
+    deep pkg/utils/json.py, and two roots holding the same module give no edge.
     """
 
     def __init__(self, paths: Set[str]):
@@ -299,7 +299,12 @@ class _ModuleIndex:
         return max(depth, 1)
 
     def _is_source_root(self, directory: str) -> bool:
-        return directory + '/__init__.py' not in self.paths
+        """A directory can be a source root (be on sys.path) only if neither
+        it nor any directory above it is a package: a plain subdirectory of a
+        package is not importable from outside it."""
+        parts = directory.split('/')
+        return not any('/'.join(parts[:i]) + '/__init__.py' in self.paths
+                       for i in range(1, len(parts) + 1))
 
 
 def _import_target_paths(
