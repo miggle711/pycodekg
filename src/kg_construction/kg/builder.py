@@ -308,24 +308,21 @@ class _ModuleIndex:
                        for i in range(1, len(parts) + 1))
 
 
-def _import_target_paths(
-    index: _ModuleIndex,
-    importing_path: str,
-    label: str,
-    metadata: Dict,
-    level: int,
-) -> List[str]:
+def _import_target_paths(index: _ModuleIndex, importing_path: str, statement: Dict) -> List[str]:
     """Repo files an import statement depends on.
 
-    `import a.b.c` depends on a/b/c. `from a.b import c` depends on a/b, and
-    on a/b/c as well when c is a submodule. A relative import is resolved
-    from the importing file's own package, one directory up per extra dot.
+    `statement` is {'module', 'name', 'level'}: module is None for a plain
+    `import a.b.c`, which depends on a/b/c. `from a.b import c` depends on
+    a/b, and on a/b/c as well when c is a submodule. A relative import is
+    resolved from the importing file's own package, one directory up per
+    extra dot.
     """
-    if 'module' in metadata:
-        module_parts = metadata['module'].split('.') if metadata['module'] else []
-        name = metadata.get('name')
+    level = statement['level']
+    if statement['module'] is None:
+        module_parts, name = statement['name'].split('.'), None
     else:
-        module_parts, name = label.split('.'), None
+        module_parts = statement['module'].split('.') if statement['module'] else []
+        name = statement['name']
     submodule = [name] if name and name != '*' else []
 
     found: List[Optional[str]] = []
@@ -1588,14 +1585,17 @@ class RepoASTParser:
                 continue
             level = edge.get('metadata', {}).get('level', 0)
             meta = imp_node['metadata']
-            if level:
-                target_paths = _import_target_paths(
-                    module_index, src_path, imp_node['label'], meta, level)
+            if 'module' in meta:
+                statement = {'module': meta['module'], 'name': meta['name'], 'level': level}
             else:
-                cache_key = (imp_node['label'], meta.get('module'), meta.get('name'))
+                statement = {'module': None, 'name': imp_node['label'], 'level': level}
+            if level:
+                target_paths = _import_target_paths(module_index, src_path, statement)
+            else:
+                cache_key = (statement['module'], statement['name'])
                 if cache_key not in absolute_targets:
                     absolute_targets[cache_key] = _import_target_paths(
-                        module_index, src_path, imp_node['label'], meta, 0)
+                        module_index, src_path, statement)
                 target_paths = absolute_targets[cache_key]
             for target_path in target_paths:
                 target_file_id = file_path_to_id[target_path]
