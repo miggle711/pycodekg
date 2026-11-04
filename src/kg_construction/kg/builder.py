@@ -127,6 +127,8 @@ MAX_FILE_LINES = 20000
 #    unresolvable one; caller_count / direct_callers count direct callers
 #    only, with the rest in closure_callers; side_effects and class
 #    attributes cover augmented assignment, unpacking and for/with targets.
+#    Call sites that resolve to the same (source, target) merge into one edge
+#    with the highest confidence, direct (including super()) over closure.
 SCHEMA_VERSION = 6
 
 
@@ -191,6 +193,44 @@ class KGEdge:
 # ---------------------------------------------------------------------------
 # Per-file parsing (runs in worker processes)
 # ---------------------------------------------------------------------------
+
+_CALL_CONFIDENCE_RANK = {'qualified': 3, 'exact': 2, 'name_only': 1, 'ambiguous': 0}
+
+
+def _add_call_edge(
+    call_edges: Dict[Tuple[str, str], Dict],
+    resolved_edges: List[Dict],
+    seen_edges: Set[Tuple],
+    source: str,
+    target: str,
+    meta: Dict,
+) -> None:
+    """Add a resolved calls edge, or fold it into the one already there.
+
+    Several call sites can resolve to the same (source, target), and the
+    graph keeps one edge for them, so that edge must not depend on which
+    site was seen first. It keeps the highest confidence, and it is a direct
+    call unless every site is inside a closure.
+    """
+    existing = call_edges.get((source, target))
+    if existing is None:
+        edge = asdict(KGEdge(source=source, target=target, relation='calls',
+                             metadata=dict(meta)))
+        call_edges[(source, target)] = edge
+        seen_edges.add((source, target, 'calls'))
+        resolved_edges.append(edge)
+        return
+
+    current = existing['metadata']
+    new_rank = _CALL_CONFIDENCE_RANK.get(meta.get('confidence'), 0)
+    if new_rank > _CALL_CONFIDENCE_RANK.get(current.get('confidence'), 0):
+        current['confidence'] = meta['confidence']
+        current['import_resolved'] = meta.get('import_resolved')
+    if not meta.get('via_closure'):
+        current.pop('via_closure', None)
+    if meta.get('via'):
+        current['via'] = meta['via']
+
 
 def _parse_file(args: Tuple[str, str, str]) -> Optional[Dict]:
     """Parse a single .py file and return its nodes and edges.
@@ -1188,6 +1228,9 @@ class RepoASTParser:
 
         resolved_edges: List[Dict] = []
         seen_edges: Set[Tuple] = set()
+        # The resolved calls edge for each (source, target), so a later call
+        # site resolving to the same pair is folded into it (_add_call_edge).
+        call_edges: Dict[Tuple[str, str], Dict] = {}
         # 'overrides' needs the fully-resolved 'inherits' graph to walk
         # transitive base classes, so raw edges are collected here and
         # resolved in a dedicated pass after this loop finishes.
@@ -1214,17 +1257,12 @@ class RepoASTParser:
                 if not matches:
                     continue
                 for target_id in matches:
-                    key = (edge['source'], target_id, 'calls')
-                    if key not in seen_edges:
-                        seen_edges.add(key)
-                        resolved_meta = {'confidence': confidence,
-                                         'import_resolved': meta.get('import_resolved')}
-                        if meta.get('via_closure'):
-                            resolved_meta['via_closure'] = True
-                        resolved_edges.append(asdict(KGEdge(
-                            source=edge['source'], target=target_id, relation='calls',
-                            metadata=resolved_meta
-                        )))
+                    resolved_meta = {'confidence': confidence,
+                                     'import_resolved': meta.get('import_resolved')}
+                    if meta.get('via_closure'):
+                        resolved_meta['via_closure'] = True
+                    _add_call_edge(call_edges, resolved_edges, seen_edges,
+                                   edge['source'], target_id, resolved_meta)
 
             elif edge['relation'] == 'accesses' and meta.get('unresolved'):
                 attr_name = edge['target']
@@ -1391,7 +1429,8 @@ class RepoASTParser:
 
         self._resolve_overrides(pending_overrides, resolved_edges, indices, seen_edges)
 
-        self._resolve_super_calls(pending_super_calls, resolved_edges, indices, seen_edges)
+        self._resolve_super_calls(pending_super_calls, resolved_edges, indices, seen_edges,
+                                  call_edges)
 
         self._derive_tests_edges_from_calls(resolved_edges, nodes_by_id, seen_edges)
 
@@ -1602,6 +1641,7 @@ class RepoASTParser:
         resolved_edges: List[Dict],
         indices: Dict,
         seen_edges: Set[Tuple],
+        call_edges: Dict[Tuple[str, str], Dict],
     ) -> None:
         """Resolve super().method() calls against the caller's own
         inheritance chain (kg_construction#61), instead of the bare-name
@@ -1654,16 +1694,11 @@ class RepoASTParser:
                     )
                     if target_id is None:
                         continue
-                    key = (edge['source'], target_id, 'calls')
-                    if key not in seen_edges:
-                        seen_edges.add(key)
-                        super_meta = {'confidence': 'qualified', 'via': 'super'}
-                        if edge.get('metadata', {}).get('via_closure'):
-                            super_meta['via_closure'] = True
-                        resolved_edges.append(asdict(KGEdge(
-                            source=edge['source'], target=target_id, relation='calls',
-                            metadata=super_meta
-                        )))
+                    super_meta = {'confidence': 'qualified', 'via': 'super'}
+                    if edge.get('metadata', {}).get('via_closure'):
+                        super_meta['via_closure'] = True
+                    _add_call_edge(call_edges, resolved_edges, seen_edges,
+                                   edge['source'], target_id, super_meta)
 
     def _add_call_context(self, all_nodes: List[Dict], all_edges: List[Dict]) -> None:
         """Annotate functions with caller_count, direct_callers and closure_callers.

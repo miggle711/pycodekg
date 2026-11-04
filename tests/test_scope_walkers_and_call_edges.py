@@ -77,6 +77,21 @@ class TestClosureCallsAreKeptAndTagged:
         """})
         assert _edges(kg, "calls")[("create_index", "normalize")].get("via_closure") is None
 
+    def test_a_direct_super_call_wins_over_the_closures_call_to_the_same_target(self, tmp_path):
+        kg = _build(tmp_path, {"m.py": """
+            class P:
+                def helper(self): ...
+
+            class C(P):
+                def go(self):
+                    super().helper()
+                    def cb():
+                        self.helper()
+        """})
+        meta = _edges(kg, "calls")[("go", "helper")]
+        assert meta["via"] == "super"
+        assert "via_closure" not in meta
+
     def test_caller_counts_and_queries_separate_direct_from_closure_callers(self, tmp_path):
         kg = _build(tmp_path, {"m.py": CLOSURE_SOURCE})
         normalize = next(n for n in kg["nodes"] if n["label"] == "normalize")
@@ -106,12 +121,18 @@ class TestClosureCallsAreKeptAndTagged:
 
 class TestCallsOnDifferentReceiversAreNotCollapsed:
     @pytest.mark.parametrize("untyped_first", [True, False])
-    def test_typed_call_resolves_whatever_the_statement_order(self, tmp_path, untyped_first):
+    @pytest.mark.parametrize("other_class", [True, False])
+    def test_typed_call_resolves_whatever_the_statement_order(
+            self, tmp_path, untyped_first, other_class):
+        # With a second class defining save, the untyped call cannot resolve
+        # at all. With only one, it resolves to Model.save at lower
+        # confidence, and the two edges must merge to the higher one.
         calls = ["x.save()", "m = Model()\n    m.save()"]
         body = "\n    ".join(calls if untyped_first else reversed(calls))
+        other = "class Other:\n    def save(self): pass\n" if other_class else ""
         kg = _build(tmp_path, {"m.py": (
             "class Model:\n    def save(self): pass\n"
-            "class Other:\n    def save(self): pass\n"
+            f"{other}"
             f"def f(x):\n    {body}\n"
         )})
         meta = _edges(kg, "calls")[("f", "save")]
