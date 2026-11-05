@@ -75,7 +75,9 @@ from kg_construction.ast.helpers import (
     _collect_file_level_info,
     ImportScopes,
     call_scope_chains,
+    call_expression_scope_names,
     scope_import_map_over,
+    LocalTypeScopes,
     assign_qualnames,
     iter_calls_by_scope,
     iter_scope_defs,
@@ -152,7 +154,12 @@ MAX_FILE_LINES = 20000
 #    them carry import_resolved, so some calls move from a name match to
 #    qualified, and a call to an external module is no longer matched to a
 #    same named function in the repo.
-SCHEMA_VERSION = 8
+# 9: a call is resolved with the types of the function that makes it, not of
+#    the outer function: in a closure, a parameter or a local that rebinds a
+#    name uses its own type (or none), so the outer function's closure edge no
+#    longer points at the wrong class, and a type assigned inside the closure
+#    now reaches the outer function's copy of the edge.
+SCHEMA_VERSION = 9
 
 
 def _same_commit(a: Optional[str], b: Optional[str]) -> bool:
@@ -432,7 +439,7 @@ def _parse_file(args: Tuple[str, str, str]) -> Optional[Dict]:
     seen_call_targets: Set[Tuple[str, str, Optional[str]]] = set()
     # The same call can go through a different import before and after a
     # name is re-imported, so the import is part of what makes a call unique.
-    seen_call_hints: Set[Tuple[str, str, Optional[str], Optional[str]]] = set()
+    seen_call_hints: Set[Tuple[str, str, Optional[str], Optional[str], Optional[str]]] = set()
 
     # Factory-call assignment sites recorded for optional pyright type
     # resolution (see kg/type_inference.py). Each site is
@@ -454,6 +461,9 @@ def _parse_file(args: Tuple[str, str, str]) -> Optional[Dict]:
     # imports, plus those of the functions around it. Its own imports apply
     # from the line they are on (see ImportScopes).
     enclosing_imports = import_map
+    # The functions being emitted, outermost first (the innermost is the one
+    # whose edges are being built).
+    enclosing_funcs: List[ast.AST] = []
     # Unique qualname per def in this file (see assign_qualnames); node IDs
     # and metadata['qualname'] are derived from it rather than rebuilt from
     # nesting so two same-named defs can't share an ID.
@@ -549,6 +559,11 @@ def _parse_file(args: Tuple[str, str, str]) -> Optional[Dict]:
         own_calls, closure_calls = iter_calls_by_scope(func_node)
         scopes = ImportScopes(enclosing_imports)
         chains = call_scope_chains(func_node)
+        expression_names = call_expression_scope_names(func_node)
+        local_scopes = LocalTypeScopes(func_node, local_types)
+        # The functions this one is nested in: a closure's own pass has to see
+        # their variables, not only the ones in the closure.
+        outer_funcs = [f for f in enclosing_funcs if f is not func_node]
         # Own scope first, so a direct call takes the dedup slot before the
         # same call found inside a closure.
         tagged_calls = [(c, False) for c in own_calls] + [(c, True) for c in closure_calls]
@@ -571,6 +586,12 @@ def _parse_file(args: Tuple[str, str, str]) -> Optional[Dict]:
             local_type_hint: Optional[str] = None
             import_resolved: Optional[str] = None
             is_super_call = receiver == 'super()'
+            chain = chains[id(call)]
+            receiver_is_local, local_type = (
+                local_scopes.lookup(receiver, outer_funcs + chain) if receiver else (False, None))
+            if receiver in expression_names.get(id(call), ()):
+                # A lambda parameter or comprehension variable: its own name.
+                receiver_is_local, local_type = True, None
 
             if is_super_call:
                 pass  # resolved in pass 2 via the caller's own inherits chain
@@ -579,11 +600,12 @@ def _parse_file(args: Tuple[str, str, str]) -> Optional[Dict]:
                 # The exact class node, so pass 2 does not have to guess
                 # between same named classes in different files.
                 class_hint_id = class_id
-            elif receiver and receiver in local_types:
-                local_type_hint = local_types[receiver]
+            elif local_type is not None:
+                local_type_hint = local_type
             else:
-                chain = chains[id(call)]
-                bound = scopes.lookup(receiver, call, chain) if receiver else None
+                # A receiver that is a local of some function around the call
+                # is not the module of the same name, even with no known type.
+                bound = scopes.lookup(receiver, call, chain) if receiver and not receiver_is_local else None
                 if bound is not None:
                     # e.g. json.loads where 'json' was imported
                     import_resolved = f"{bound}.{callee}"
@@ -591,9 +613,10 @@ def _parse_file(args: Tuple[str, str, str]) -> Optional[Dict]:
                     # Bare-name call: foo() where foo was imported
                     import_resolved = scopes.lookup(callee, call, chain)
 
-            if (func_id, callee, receiver, import_resolved) in seen_call_hints:
+            hints_key = (func_id, callee, receiver, import_resolved, local_type_hint)
+            if hints_key in seen_call_hints:
                 continue
-            seen_call_hints.add((func_id, callee, receiver, import_resolved))
+            seen_call_hints.add(hints_key)
             seen_call_targets.add((func_id, callee, receiver))
 
             call_meta = {
@@ -937,9 +960,11 @@ def _parse_file(args: Tuple[str, str, str]) -> Optional[Dict]:
         outer_imports, outer_enclosing = import_map, enclosing_imports
         enclosing_imports = outer_imports
         import_map = scope_import_map_over(outer_imports, func_node)
+        enclosing_funcs.append(func_node)
         try:
             _emit_function_body(func_node, *args, **kwargs)
         finally:
+            enclosing_funcs.pop()
             import_map, enclosing_imports = outer_imports, outer_enclosing
 
     # Emit class, method, and top-level function nodes (including ones
