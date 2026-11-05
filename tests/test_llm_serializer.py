@@ -740,3 +740,49 @@ class TestContextItemsAreCapped:
 
         kept_names = [c["name"] for c in result["context"]["callers"]]
         assert kept_names == [f"fn{i}" for i in range(10)]
+
+
+class TestTestClassesAreExcludedFromRelated:
+    """A name match can link a production class to a class in a test file,
+    such as collections.Counter to a test model called Counter. Listed as a
+    related class, that names the test file in the prompt (testgeneval#87).
+    """
+
+    def _serialize(self, relation, targets):
+        seed = {
+            "id": "seed", "label": "Apps", "type": "class",
+            "metadata": {"filepath": "django/apps/registry.py"},
+        }
+        edges = [
+            {"source": "seed", "target": t["id"], "relation": relation,
+             "metadata": {"confidence": "exact"}}
+            for t in targets
+        ]
+        return LLMSerializer().serialize(
+            {"seeds": [seed], "context_nodes": targets, "edges": edges, "test_nodes": []}
+        )
+
+    def _class(self, node_id, label, filepath):
+        return {"id": node_id, "label": label, "type": "class", "metadata": {"filepath": filepath}}
+
+    def test_instantiated_test_class_is_excluded(self):
+        test_class = self._class("t", "Counter", "tests/force_insert_update/models.py")
+        real_class = self._class("r", "AppConfig", "django/apps/config.py")
+
+        result = self._serialize("uses", [test_class, real_class])
+
+        assert [c["name"] for c in result["context"]["related"]] == ["AppConfig"]
+
+    def test_parent_class_in_a_test_file_is_excluded(self):
+        test_class = self._class("t", "ServerHandler", "tests/builtin_server/tests.py")
+
+        result = self._serialize("inherits", [test_class])
+
+        assert result["context"]["related"] == []
+
+    def test_class_in_a_shipped_testing_package_is_kept(self):
+        shipped = self._class("s", "Function", "sympy/testing/benchmarking.py")
+
+        result = self._serialize("uses", [shipped])
+
+        assert [c["name"] for c in result["context"]["related"]] == ["Function"]

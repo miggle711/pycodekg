@@ -270,6 +270,11 @@ class TestFrameworkTestPackageIsNotATestFile:
         ("test/conftest.py", True),
         ("test/helpers.py", True),
         ("pkg/a_test.py", True),
+        ("testing/python/collect.py", True),
+        ("conftest.py", True),
+        ("lib/pkg/conftest.py", True),
+        ("sympy/testing/runtests.py", False),
+        ("lib/matplotlib/testing/decorators.py", False),
     ])
     def test_is_test_file(self, path, expected):
         assert _is_test_file(path) is expected

@@ -45,18 +45,20 @@ def _make_id(text: str) -> str:
 def _is_test_file(filepath: str) -> bool:
     """Return True if the file path matches common Python test file conventions.
 
-    A `tests` directory anywhere in the path counts. A `test` directory counts
-    only at the repository root: a deeper one is usually a framework package
-    (django/test/) and not tests. Nested test directories such as Lib/test/
-    are therefore typed as normal files.
+    A `tests` directory anywhere in the path counts. A `test` or `testing`
+    directory counts only at the repository root: a deeper one is usually a
+    framework package (django/test/, sympy/testing/) and not tests. Nested
+    test directories such as Lib/test/ are therefore typed as normal files.
+    conftest.py is pytest configuration for tests, wherever it is.
     """
     parts = Path(filepath).parts
     name = Path(filepath).name
     return (
         name.startswith('test_') or
         name.endswith('_test.py') or
+        name == 'conftest.py' or
         'tests' in parts or
-        parts[:1] == ('test',)
+        parts[:1] in (('test',), ('testing',))
     )
 
 

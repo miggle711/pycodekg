@@ -22,8 +22,8 @@ from kg_construction.ast.helpers import _is_test_file
 
 
 def _is_test_code(node: Dict) -> bool:
-    """True if a caller or callee node is test code, which must not reach the
-    prompt.
+    """True if a caller, callee or related class is test code, which must not
+    reach the prompt.
 
     Full-setting generation is a from-scratch task for both arms, so existing
     tests (and helpers defined in test files) are never shown to the model.
@@ -266,11 +266,14 @@ class LLMSerializer:
             # same-named-class candidates, at most 1 can be the real parent
             # (measured 98.58% of real inherits edges are ambiguous; one
             # seed pulled in 929 unrelated "parent_class" entries before
-            # this filter).
+            # this filter). Test classes are skipped like test callers: a name
+            # match can link a production class to one in a test file, which
+            # would name that file in the prompt (testgeneval#87).
             elif (
                 relation == "inherits"
                 and (src_id in seed_ids or src_id in seed_class_ids)
                 and edge.get("metadata", {}).get("confidence") == "exact"
+                and not _is_test_code(tgt_node)
             ):
                 related.append(
                     {
@@ -290,6 +293,7 @@ class LLMSerializer:
                 relation == "uses"
                 and (src_id in seed_ids or src_id in seed_class_ids)
                 and edge.get("metadata", {}).get("confidence") == "exact"
+                and not _is_test_code(tgt_node)
             ):
                 related.append(
                     {
