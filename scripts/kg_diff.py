@@ -114,7 +114,7 @@ def compare(name: str, before: dict, after: dict, sample: int):
 
     conf_b = {(r, s, t): c for r, s, t, c in before["edges"]}
     conf_a = {(r, s, t): c for r, s, t, c in after["edges"]}
-    raised = [k for k in conf_b.keys() & conf_a.keys() if conf_b[k] != conf_a[k]]
+    moved = Counter((conf_b[k], conf_a[k]) for k in conf_b.keys() & conf_a.keys() if conf_b[k] != conf_a[k])
 
     nodes = {**before["nodes"], **after["nodes"]}
     label = lambda i: f"{nodes[i][1]} ({nodes[i][0]})" if i in nodes else i
@@ -126,13 +126,17 @@ def compare(name: str, before: dict, after: dict, sample: int):
 
     detail = [f"{name}: nodes {len(before['nodes'])} -> {len(after['nodes'])}, "
               f"edges {len(before['edges'])} -> {len(after['edges'])}, "
-              f"confidence changed on {len(raised)} kept edges"]
+              f"confidence changed on {sum(moved.values())} kept edges"
+              + (": " + ", ".join(f"{old} -> {new} x{n}" for (old, new), n in sorted(moved.items())) if moved else "")]
     for title, es in (("removed", removed), ("added", added)):
         for rel, s, t in sorted(es)[:sample]:
             detail.append(f"  {title}: {rel}: {label(s)} -> {label(t)}")
+    kept_moved = sorted(k for k in conf_b.keys() & conf_a.keys() if conf_b[k] != conf_a[k])
+    for rel, src, tgt in kept_moved[:sample]:
+        detail.append(f"  confidence {conf_b[(rel, src, tgt)]} -> {conf_a[(rel, src, tgt)]}: {rel}: {label(src)} -> {label(tgt)}")
     for old, new, i in changed_type[:sample]:
         detail.append(f"  type changed: {old} -> {new}: {after['nodes'][i][2] or after['nodes'][i][1]}")
-    differs = bool(removed or added or raised or changed_type or set(before["nodes"]) != set(after["nodes"]))
+    differs = bool(removed or added or moved or changed_type or set(before["nodes"]) != set(after["nodes"]))
     return rows, type_rows, detail, differs
 
 
