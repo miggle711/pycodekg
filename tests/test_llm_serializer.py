@@ -542,6 +542,121 @@ class TestSiblingMethods:
         assert "existing_tests" not in result["context"]
 
 
+class TestTestCallersAreExcluded:
+    """Existing tests also reach a seed through 'calls' edges (a test calls
+    the function it tests), not only through 'tests' edges. Rendering them
+    as callers showed kg_only real tests, some from the very file it is asked
+    to write (testgeneval#87), so callers that are test code are skipped.
+    """
+
+    def _serialize(self, caller_nodes):
+        seed_node = {
+            "id": "seed", "label": "send", "type": "method",
+            "metadata": {"filepath": "requests/sessions.py"},
+        }
+        edges = [
+            {"source": n["id"], "target": seed_node["id"], "relation": "calls"}
+            for n in caller_nodes
+        ]
+        return LLMSerializer().serialize(
+            {"seeds": [seed_node], "context_nodes": caller_nodes, "edges": edges, "test_nodes": []}
+        )
+
+    def test_test_function_caller_is_excluded(self):
+        test_caller = {
+            "id": "t", "label": "test_send", "type": "test_function",
+            "metadata": {"filepath": "tests/test_sessions.py"},
+        }
+        result = self._serialize([test_caller])
+
+        assert result["context"]["callers"] == []
+
+    def test_non_test_named_caller_in_a_test_file_is_excluded(self):
+        # e.g. setUp or a helper in a test class: not named test_*, but still test code.
+        helper = {
+            "id": "h", "label": "setUp", "type": "method",
+            "metadata": {"filepath": "tests/test_sessions.py"},
+        }
+        real_caller = {
+            "id": "r", "label": "request", "type": "method",
+            "metadata": {"filepath": "requests/sessions.py"},
+        }
+        result = self._serialize([helper, real_caller])
+
+        assert [c["name"] for c in result["context"]["callers"]] == ["request"]
+
+    def test_test_callers_do_not_use_up_the_cap(self):
+        test_callers = [
+            {"id": f"t{i}", "label": f"test_{i}", "type": "test_function",
+             "metadata": {"filepath": "tests/test_sessions.py"}}
+            for i in range(10)
+        ]
+        real_caller = {
+            "id": "r", "label": "request", "type": "method",
+            "metadata": {"filepath": "requests/sessions.py"},
+        }
+        result = self._serialize(test_callers + [real_caller])
+
+        assert [c["name"] for c in result["context"]["callers"]] == ["request"]
+
+
+class TestTestCalleesAreExcluded:
+    """A name match can link a production call to a fake or helper in a test
+    file. Rendered as a callee, that would show the model test code through
+    the same one-sided route as callers (testgeneval#87).
+    """
+
+    def _serialize(self, callee_nodes):
+        seed_node = {
+            "id": "seed", "label": "send", "type": "method",
+            "metadata": {"filepath": "requests/sessions.py"},
+        }
+        edges = [
+            {"source": seed_node["id"], "target": n["id"], "relation": "calls"}
+            for n in callee_nodes
+        ]
+        return LLMSerializer().serialize(
+            {"seeds": [seed_node], "context_nodes": callee_nodes, "edges": edges, "test_nodes": []}
+        )
+
+    def test_test_function_callee_is_excluded(self):
+        test_callee = {
+            "id": "t", "label": "test_send", "type": "test_function",
+            "metadata": {"filepath": "tests/test_sessions.py"},
+        }
+        result = self._serialize([test_callee])
+
+        assert result["context"]["callees"] == []
+
+    def test_non_test_named_callee_in_a_test_file_is_excluded(self):
+        # e.g. a fake's read() that a production `.read()` call matched by name.
+        fake = {
+            "id": "f", "label": "read", "type": "method",
+            "metadata": {"filepath": "tests/test_sessions.py"},
+        }
+        real_callee = {
+            "id": "r", "label": "merge_setting", "type": "function",
+            "metadata": {"filepath": "requests/sessions.py"},
+        }
+        result = self._serialize([fake, real_callee])
+
+        assert [c["name"] for c in result["context"]["callees"]] == ["merge_setting"]
+
+    def test_test_callees_do_not_use_up_the_cap(self):
+        test_callees = [
+            {"id": f"f{i}", "label": f"read_{i}", "type": "method",
+             "metadata": {"filepath": "tests/test_sessions.py"}}
+            for i in range(10)
+        ]
+        real_callee = {
+            "id": "r", "label": "merge_setting", "type": "function",
+            "metadata": {"filepath": "requests/sessions.py"},
+        }
+        result = self._serialize(test_callees + [real_callee])
+
+        assert [c["name"] for c in result["context"]["callees"]] == ["merge_setting"]
+
+
 class TestContextItemsAreCapped:
     """A high fan-in/fan-out seed (e.g. sklearn's check_array, called from
     hundreds of sites) produced uncapped callers/callees/sibling_methods
@@ -625,3 +740,49 @@ class TestContextItemsAreCapped:
 
         kept_names = [c["name"] for c in result["context"]["callers"]]
         assert kept_names == [f"fn{i}" for i in range(10)]
+
+
+class TestTestClassesAreExcludedFromRelated:
+    """A name match can link a production class to a class in a test file,
+    such as collections.Counter to a test model called Counter. Listed as a
+    related class, that names the test file in the prompt (testgeneval#87).
+    """
+
+    def _serialize(self, relation, targets):
+        seed = {
+            "id": "seed", "label": "Apps", "type": "class",
+            "metadata": {"filepath": "django/apps/registry.py"},
+        }
+        edges = [
+            {"source": "seed", "target": t["id"], "relation": relation,
+             "metadata": {"confidence": "exact"}}
+            for t in targets
+        ]
+        return LLMSerializer().serialize(
+            {"seeds": [seed], "context_nodes": targets, "edges": edges, "test_nodes": []}
+        )
+
+    def _class(self, node_id, label, filepath):
+        return {"id": node_id, "label": label, "type": "class", "metadata": {"filepath": filepath}}
+
+    def test_instantiated_test_class_is_excluded(self):
+        test_class = self._class("t", "Counter", "tests/force_insert_update/models.py")
+        real_class = self._class("r", "AppConfig", "django/apps/config.py")
+
+        result = self._serialize("uses", [test_class, real_class])
+
+        assert [c["name"] for c in result["context"]["related"]] == ["AppConfig"]
+
+    def test_parent_class_in_a_test_file_is_excluded(self):
+        test_class = self._class("t", "ServerHandler", "tests/builtin_server/tests.py")
+
+        result = self._serialize("inherits", [test_class])
+
+        assert result["context"]["related"] == []
+
+    def test_class_in_a_shipped_testing_package_is_kept(self):
+        shipped = self._class("s", "Function", "sympy/testing/benchmarking.py")
+
+        result = self._serialize("uses", [shipped])
+
+        assert [c["name"] for c in result["context"]["related"]] == ["Function"]

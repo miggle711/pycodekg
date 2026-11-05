@@ -17,10 +17,10 @@ commits or different `build()` calls, without needing any persistent
 counter or database.
 
 **`_is_test_file(filepath)`** -- convention-based: filename starts with
-`test_`, ends with `_test.py`, a `tests` directory appears anywhere in the
-path, or the path starts with a `test` directory at the repository root. A
-deeper `test` directory is usually a framework package (`django/test/`) and
-is typed as a normal file. Used both to decide a file's own node `type`
+`test_`, ends with `_test.py`, is `conftest.py`, a `tests` directory appears
+anywhere in the path, or the path starts with a `test` or `testing` directory
+at the repository root. A deeper one is usually a framework package
+(`django/test/`, `sympy/testing/`) and is typed as a normal file. Used both to decide a file's own node `type`
 (`file`/`test_file`) and to gate `assert_patterns` extraction (see
 `_build_func_metadata` below) to test files only.
 
