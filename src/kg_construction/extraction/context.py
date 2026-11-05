@@ -32,6 +32,7 @@ from kg_construction.ast.helpers import (
     _get_decorators,
     _get_docstring,
     _get_signature_and_source_text,
+    split_source_lines,
 )
 from kg_construction.kg.query import KGQueryEngine
 from kg_construction.kg.repo_manager import RepoManager
@@ -326,7 +327,7 @@ class TestContextExtractor:
             except SyntaxError:
                 post_tree = None
             if post_tree is not None:
-                post_patch_lines = post_patch_source.splitlines(keepends=True)
+                post_patch_lines = split_source_lines(post_patch_source)
                 post_patch_by_qualname, post_patch_ranges = self._index_post_patch_defs(post_tree)
 
         # Find the code file node
@@ -620,7 +621,7 @@ class TestContextExtractor:
 
         tree = ast.parse(source)
         import_map, _, _ = _collect_file_level_info(tree)
-        source_lines = source.splitlines(keepends=True)
+        source_lines = split_source_lines(source)
         repo = instance['repo']
         rel_path = instance['code_file']
 
