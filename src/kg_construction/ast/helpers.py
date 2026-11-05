@@ -31,6 +31,19 @@ from typing import List, Dict, Set, Optional, Tuple, Union
 # Identity & path helpers
 # ---------------------------------------------------------------------------
 
+def split_source_lines(source: str) -> List[str]:
+    """Split source into the lines `ast` numbers, keeping line endings.
+
+    Splits after \\n only. str.splitlines also splits on form feeds and other
+    separators that `ast` does not count, which would shift every later line
+    number (#157). Source has already been through universal newline
+    translation, so \\n is the only line ending left.
+    """
+    lines = [line + '\n' for line in source.split('\n')]
+    lines[-1] = lines[-1][:-1]
+    return lines if lines[-1] else lines[:-1]
+
+
 def _make_id(text: str) -> str:
     """Generate a deterministic 16-character ID from a qualified name string.
 
@@ -1165,7 +1178,7 @@ def _build_func_metadata(
         import_map: {local_name: fully_qualified_name} dict for resolving
                     external type dependencies. Defaults to {}.
         source_lines: The enclosing file's source, split via
-                      str.splitlines(keepends=True), used to slice out this
+                      split_source_lines, used to slice out this
                       function's exact source text and its `def` line(s) for
                       the 'source_code'/'signature' metadata fields. If not
                       given (e.g. a caller with no file text handy), both

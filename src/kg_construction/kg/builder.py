@@ -47,6 +47,7 @@ from typing import List, Dict, Set, Optional, Tuple, Union
 from kg_construction.ast.helpers import (
     _make_id,
     _is_test_file,
+    split_source_lines,
     _safe_unparse,
     _extract_callee_name,
     _extract_call_receiver,
@@ -267,7 +268,7 @@ def _parse_file(args: Tuple[str, str, str]) -> Optional[Dict]:
         source = Path(abs_path).read_text(encoding='utf-8', errors='replace')
     except OSError:
         return None
-    source_lines = source.splitlines(keepends=True)
+    source_lines = split_source_lines(source)
 
     if source.count('\n') > MAX_FILE_LINES:
         return None
