@@ -905,7 +905,7 @@ def _get_class_attributes(node: ast.ClassDef) -> List[str]:
     included, as they may not always exist on the instance.
     """
     attrs = []
-    for child in ast.iter_child_nodes(node):
+    for child in iter_scope_defs(node):
         if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)) and child.name == '__init__':
             for stmt in _walk_own_scope(child):
                 attrs.extend(_written_self_attrs(stmt, include_subscript=False))
@@ -929,7 +929,7 @@ def _get_instantiated_classes_in_class(class_node: ast.ClassDef) -> List[str]:
         to class node IDs via class_label_to_ids.
     """
     seen: List[str] = []
-    for child in ast.iter_child_nodes(class_node):
+    for child in iter_scope_defs(class_node):
         if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
             for name in _get_instantiated_classes(child):
                 if name not in seen:
