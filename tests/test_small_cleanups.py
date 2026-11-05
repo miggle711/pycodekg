@@ -14,6 +14,8 @@ Each class covers one finding from the correctness audit:
   follow the builder's qualname scheme.
 * TestPytestDoesNotCollectDomainClasses: classes named Test* that are not
   tests.
+* TestFrameworkTestPackageIsNotATestFile: a package directory named `test`
+  below the root (django/test/) was typed as a test file.
 """
 
 import difflib
@@ -21,7 +23,9 @@ import json
 from pathlib import Path
 from unittest.mock import patch
 
-from kg_construction.ast.helpers import _make_id
+import pytest
+
+from kg_construction.ast.helpers import _is_test_file, _make_id
 from kg_construction.cli import _cmd_build, _cmd_query, build_parser
 from kg_construction.extraction.context import TestContext, TestContextExtractor
 from kg_construction.extraction.validator import TestContextValidator
@@ -254,3 +258,18 @@ class TestPytestDoesNotCollectDomainClasses:
         assert TestContext.__test__ is False
         assert TestContextExtractor.__test__ is False
         assert TestContextValidator.__test__ is False
+
+
+class TestFrameworkTestPackageIsNotATestFile:
+    @pytest.mark.parametrize("path, expected", [
+        ("django/test/client.py", False),
+        ("django/test/utils.py", False),
+        ("tests/helpers.py", True),
+        ("pkg/tests/helpers.py", True),
+        ("test/test_a.py", True),
+        ("test/conftest.py", True),
+        ("test/helpers.py", True),
+        ("pkg/a_test.py", True),
+    ])
+    def test_is_test_file(self, path, expected):
+        assert _is_test_file(path) is expected
