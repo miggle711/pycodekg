@@ -131,6 +131,9 @@ def compare(name: str, before: dict, after: dict, sample: int):
     for title, es in (("removed", removed), ("added", added)):
         for rel, s, t in sorted(es)[:sample]:
             detail.append(f"  {title}: {rel}: {label(s)} -> {label(t)}")
+    kept_moved = sorted(k for k in conf_b.keys() & conf_a.keys() if conf_b[k] != conf_a[k])
+    for rel, src, tgt in kept_moved[:sample]:
+        detail.append(f"  confidence {conf_b[(rel, src, tgt)]} -> {conf_a[(rel, src, tgt)]}: {rel}: {label(src)} -> {label(tgt)}")
     for old, new, i in changed_type[:sample]:
         detail.append(f"  type changed: {old} -> {new}: {after['nodes'][i][2] or after['nodes'][i][1]}")
     differs = bool(removed or added or moved or changed_type or set(before["nodes"]) != set(after["nodes"]))
