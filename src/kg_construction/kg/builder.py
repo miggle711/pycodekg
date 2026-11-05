@@ -33,6 +33,7 @@ Module layout (post-split):
 import ast
 import json
 import re
+import sys
 import tempfile
 import time
 from pathlib import Path
@@ -133,7 +134,12 @@ MAX_FILE_LINES = 20000
 #    Calls in a nested def's annotations count as the outer function's.
 #    self.x += 1 counts as a read, and mutates_attributes covers the same
 #    write forms as side_effects.
-SCHEMA_VERSION = 6
+# 7: module_depends_on edges are resolved per importing file: src/ layouts,
+#    packages (__init__.py), `from pkg import submodule` and relative imports
+#    now produce edges (an old cached KG is missing them), and every imports
+#    edge carries metadata['statements']: the import statements (module, name,
+#    number of leading dots) of that file behind the shared import node.
+SCHEMA_VERSION = 7
 
 
 def _same_commit(a: Optional[str], b: Optional[str]) -> bool:
@@ -236,6 +242,132 @@ def _add_call_edge(
         current['via'] = meta['via']
 
 
+class _ModuleIndex:
+    """Maps dotted module paths to the repo files that define them.
+
+    A module `a.b` lives in a/b.py or a/b/__init__.py, either at the repo root
+    or under a single source root such as src/ or lib/. A match under a source
+    root has to be unambiguous: a directory only counts as a source root if it
+    is neither a package nor inside one, so `import json` does not link to a
+    deep pkg/utils/json.py, and two roots holding the same module give no edge.
+    """
+
+    def __init__(self, paths: Set[str]):
+        self.paths = paths
+        self._by_suffix: Dict[str, List[str]] = defaultdict(list)
+        for path in paths:
+            parts = path.split('/')
+            for i in range(len(parts)):
+                self._by_suffix['/'.join(parts[i:])].append(path)
+
+    def find(self, module_parts: List[str]) -> Tuple[Optional[str], bool]:
+        """(file, ambiguous): the file for a top level module path, or None
+        if there is none or more than one. `ambiguous` says it was the second
+        reason, so the caller does not guess a file another way."""
+        # A package wins over a same named module, as it does when imported.
+        candidates = ['/'.join(module_parts) + '/__init__.py', '/'.join(module_parts) + '.py']
+        for candidate in candidates:
+            if candidate in self.paths:
+                return candidate, False
+        if module_parts[0] in sys.stdlib_module_names:
+            return None, False
+        for candidate in candidates:
+            hits = [
+                path for path in self._by_suffix.get(candidate, [])
+                if path != candidate and self._is_source_root(path[:-len(candidate) - 1])
+            ]
+            if hits:
+                return (hits[0], False) if len(hits) == 1 else (None, True)
+        return None, False
+
+    def find_relative(self, base_parts: List[str], module_parts: List[str]) -> Optional[str]:
+        """The file for a module path relative to a package directory."""
+        stem = '/'.join(base_parts + module_parts)
+        for candidate in (stem + '/__init__.py', stem + '.py'):
+            if candidate in self.paths:
+                return candidate
+        return None
+
+    def package_depth(self, file_path: str) -> int:
+        """How many package levels a relative import in this file can climb:
+        the number of directories, from the file's own upward, that are
+        packages. Python rejects a relative import that goes above the
+        top-level package, whatever else sits above it (a `src/` directory,
+        say). A file outside any package sits in a namespace package at best,
+        so it gets one level; a file at the repo root gets none, unless the
+        repo root is itself a package (a repo built from inside the package)."""
+        directory = file_path.split('/')[:-1]
+        if not directory and '__init__.py' not in self.paths:
+            return 0
+        depth = 0
+        while '/'.join(directory + ['__init__.py']) in self.paths:
+            depth += 1
+            if not directory:
+                break
+            directory.pop()
+        return max(depth, 1)
+
+    def may_be_own_package(self, top_level_name: str) -> bool:
+        """Whether an import of `top_level_name` can be the repo's own package
+        (a repo built from inside it). A standard library name can be, as when
+        asyncio itself is the repo, only if the repo root is a package;
+        otherwise `import os.path` would link to an unrelated root path.py."""
+        return top_level_name not in sys.stdlib_module_names or '__init__.py' in self.paths
+
+    def _is_source_root(self, directory: str) -> bool:
+        """A directory can be a source root (be on sys.path) only if neither
+        it nor any directory above it is a package: a plain subdirectory of a
+        package is not importable from outside it."""
+        parts = directory.split('/')
+        return not any('/'.join(parts[:i]) + '/__init__.py' in self.paths
+                       for i in range(1, len(parts) + 1))
+
+
+def _import_target_paths(index: _ModuleIndex, importing_path: str, statement: Dict) -> List[str]:
+    """Repo files an import statement depends on.
+
+    `statement` is {'module', 'name', 'level'} as recorded on the imports edge:
+    module is None for a plain `import a.b.c`, which depends on a/b/c.
+    `from a.b import c` depends on a/b, and on a/b/c as well when c is a
+    submodule. A relative import is resolved from the importing file's own
+    package, one directory up per extra dot.
+    """
+    level = statement['level']
+    if statement['module'] is None:
+        module_parts, name = statement['name'].split('.'), None
+    else:
+        module_parts = statement['module'].split('.') if statement['module'] else []
+        name = statement['name']
+    submodule = [name] if name and name != '*' else []
+
+    found: List[Optional[str]] = []
+    if level:
+        if level > index.package_depth(importing_path):
+            return []
+        base = importing_path.split('/')[:-1]
+        base = base[:len(base) - (level - 1)]
+        if module_parts:
+            found.append(index.find_relative(base, module_parts))
+        else:
+            found.append(index.find_relative(base, ['__init__']))  # the package itself
+        if submodule:
+            found.append(index.find_relative(base, module_parts + submodule))
+    else:
+        if module_parts:
+            main, ambiguous = index.find(module_parts)
+            found.append(main)
+            if main is None and not ambiguous and index.may_be_own_package(module_parts[0]):
+                # A repo built from inside the package: `pkg.sub.mod` is sub/mod.py.
+                for i in range(1, len(module_parts)):
+                    exact = '/'.join(module_parts[i:]) + '.py'
+                    if exact in index.paths:
+                        found.append(exact)
+                        break
+        if submodule:
+            found.append(index.find(module_parts + submodule)[0])
+    return [path for path in found if path]
+
+
 def _parse_file(args: Tuple[str, str, str]) -> Optional[Dict]:
     """Parse a single .py file and return its nodes and edges.
 
@@ -312,14 +444,21 @@ def _parse_file(args: Tuple[str, str, str]) -> Optional[Dict]:
         metadata={'path': rel_path, 'repo': repo, 'constants': constants, 'exports': exports}
     )))
 
-    # Emit import nodes and edges
+    # Emit import nodes and edges. An import node is shared by every file that
+    # imports the same name, so what a file's import statement actually says
+    # (module, name, number of leading dots) goes on that file's own imports
+    # edge, as `statements`. `import dep`, `from . import dep` and
+    # `from .. import dep` are one node but three different statements.
+    import_statements: Dict[str, List[Dict]] = {}
     for node in ast.iter_child_nodes(tree):
         if isinstance(node, ast.Import):
             for alias in node.names:
                 mod_id = _make_id(f"import_{repo}_{alias.name}")
                 nodes.append(asdict(KGNode(id=mod_id, type='import', label=alias.name,
                                            metadata={'repo': repo})))
-                edges.append(asdict(KGEdge(source=file_id, target=mod_id, relation='imports')))
+                statement = {'module': None, 'name': alias.name, 'level': 0}
+                if statement not in import_statements.setdefault(mod_id, []):
+                    import_statements[mod_id].append(statement)
         elif isinstance(node, ast.ImportFrom):
             mod_name = node.module or ''
             for alias in node.names:
@@ -328,7 +467,12 @@ def _parse_file(args: Tuple[str, str, str]) -> Optional[Dict]:
                 nodes.append(asdict(KGNode(id=imp_id, type='import', label=full_name,
                                            metadata={'repo': repo, 'module': mod_name,
                                                      'name': alias.name})))
-                edges.append(asdict(KGEdge(source=file_id, target=imp_id, relation='imports')))
+                statement = {'module': mod_name, 'name': alias.name, 'level': node.level}
+                if statement not in import_statements.setdefault(imp_id, []):
+                    import_statements[imp_id].append(statement)
+    for imp_id, statements in import_statements.items():
+        edges.append(asdict(KGEdge(source=file_id, target=imp_id, relation='imports',
+                                   metadata={'statements': statements})))
 
     def _emit_call_edges(func_id: str, func_node: Union[ast.FunctionDef, ast.AsyncFunctionDef],
                          local_types: Dict[str, str], class_name: Optional[str] = None,
@@ -1440,41 +1584,47 @@ class RepoASTParser:
         self._derive_tests_edges_from_calls(resolved_edges, nodes_by_id, seen_edges)
 
         # Add module_depends_on edges
-        # Keyed by full relative path (e.g. 'pkg_a/utils.py'), not bare filename,
-        # so same-named files in different packages (pkg_a/utils.py vs
-        # pkg_b/utils.py) don't collide and misattribute the dependency edge.
+        # Resolved per importing file against full relative paths (e.g.
+        # 'pkg_a/utils.py'), not bare filenames, so same-named files in
+        # different packages don't collide. See _ModuleIndex for how a dotted
+        # module path maps to a file (src/ layouts, packages) and
+        # _import_target_paths for submodule and relative imports.
         file_path_to_id: Dict[str, str] = {
             n['metadata'].get('path', ''): n['id'] for n in all_nodes
             if n['type'] in ('file', 'test_file')
         }
-        import_to_files: Dict[str, List[str]] = defaultdict(list)
-        for edge in resolved_edges:
-            if edge['relation'] == 'imports':
-                import_to_files[edge['target']].append(edge['source'])
+        file_id_to_path = {file_id: path for path, file_id in file_path_to_id.items()}
+        module_index = _ModuleIndex(set(file_path_to_id))
+        # Absolute imports resolve the same from every file, so cache them.
+        absolute_targets: Dict[Tuple, List[str]] = {}
 
-        for imp_node in all_nodes:
-            if imp_node['type'] != 'import':
+        for edge in list(resolved_edges):
+            if edge['relation'] != 'imports':
                 continue
-            module = imp_node['metadata'].get('module', '')
-            parts = (module or imp_node['label']).split('.')
-            # Try progressively shorter path suffixes: for 'pkg.sub.mod' try
-            # 'pkg/sub/mod.py', then 'sub/mod.py', then 'mod.py', matching
-            # against full file paths so identically-named files in different
-            # packages resolve to the correct one.
-            for i in range(len(parts)):
-                candidate = '/'.join(parts[i:]) + '.py'
-                target_file_id = file_path_to_id.get(candidate)
-                if target_file_id:
-                    for src_file_id in import_to_files.get(imp_node['id'], []):
-                        if src_file_id != target_file_id:
-                            key = (src_file_id, target_file_id, 'module_depends_on')
-                            if key not in seen_edges:
-                                seen_edges.add(key)
-                                resolved_edges.append(asdict(KGEdge(
-                                    source=src_file_id, target=target_file_id,
-                                    relation='module_depends_on'
-                                )))
-                    break
+            src_path = file_id_to_path.get(edge['source'])
+            if src_path is None:
+                continue
+            target_paths: List[str] = []
+            for statement in edge.get('metadata', {}).get('statements', []):
+                if statement['level']:
+                    target_paths += _import_target_paths(module_index, src_path, statement)
+                    continue
+                cache_key = (statement['module'], statement['name'])
+                if cache_key not in absolute_targets:
+                    absolute_targets[cache_key] = _import_target_paths(
+                        module_index, src_path, statement)
+                target_paths += absolute_targets[cache_key]
+            for target_path in target_paths:
+                target_file_id = file_path_to_id[target_path]
+                if target_file_id == edge['source']:
+                    continue
+                key = (edge['source'], target_file_id, 'module_depends_on')
+                if key not in seen_edges:
+                    seen_edges.add(key)
+                    resolved_edges.append(asdict(KGEdge(
+                        source=edge['source'], target=target_file_id,
+                        relation='module_depends_on'
+                    )))
 
         return resolved_edges
 
