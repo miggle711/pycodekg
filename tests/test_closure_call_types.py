@@ -23,11 +23,12 @@ MODEL_ONLY = """
     class Model:
         def save(self): ...
 """
+IMPORTS_M = "\n    import models as m\n"
 
 
 def _outer_save_edges(tmp_path: Path, source: str):
     """(class of the target, confidence, via_closure) for outer's calls to save."""
-    (tmp_path / "m.py").write_text(textwrap.dedent(source))
+    (tmp_path / "m.py").write_text(source)
     kg = RepoASTParser(max_workers=1).parse_repo("test/repo", tmp_path)
     nodes = {n["id"]: n for n in kg["nodes"]}
     owner = {e["target"]: nodes[e["source"]]["label"]
@@ -77,7 +78,55 @@ def _outer_save_edges(tmp_path: Path, source: str):
             def cb(m: Other):
                 m.save()
     """, [("Model", "qualified", False), ("Other", "qualified", True)]),
+    # A comprehension's loop variable is its own scope, not a binding of the closure.
+    (MODEL_ONLY, """
+        def outer():
+            m = Model()
+            def cb(items):
+                vals = [m for m in items]
+                m.save()
+    """, [("Model", "qualified", True)]),
+    # A name bound without a known type does not fall through to a module import.
+    (IMPORTS_M + MODEL_ONLY, """
+        def outer():
+            def cb(m):
+                m.save()
+    """, [("Model", "name_only", True)]),
+    # A nested def binds its name in the enclosing function.
+    (IMPORTS_M + MODEL_ONLY, """
+        def outer():
+            def m(): ...
+            def cb():
+                m.save()
+    """, [("Model", "name_only", True)]),
+    # `global m` names the module level variable, not outer's.
+    (MODEL_ONLY, """
+        def outer():
+            m = Model()
+            def cb():
+                global m
+                m.save()
+    """, [("Model", "name_only", True)]),
+    # `global m` then `m = Model()` in the closure: the assignment says what m holds there.
+    (MODEL_ONLY, """
+        def outer():
+            def cb():
+                global m
+                m = Model()
+                m.save()
+    """, [("Model", "qualified", True)]),
+    # `case ... as m` binds m, with no known type.
+    (MODEL_ONLY, """
+        def outer():
+            m = Model()
+            def cb(x):
+                match x:
+                    case Other() as m:
+                        m.save()
+    """, [("Model", "name_only", True)]),
 ], ids=["typed_parameter_rebinds", "type_assigned_in_closure", "untyped_parameter_hides_outer",
-        "free_variable_keeps_outer_type", "same_call_text_two_types"])
+        "free_variable_keeps_outer_type", "same_call_text_two_types", "comprehension_variable",
+        "parameter_hides_import", "nested_def_hides_import", "global_declaration", "global_then_assigned",
+        "match_capture"])
 def test_closure_call_uses_the_closures_own_types(tmp_path, classes, body, expected):
-    assert _outer_save_edges(tmp_path, classes + body) == expected
+    assert _outer_save_edges(tmp_path, textwrap.dedent(classes) + textwrap.dedent(body)) == expected

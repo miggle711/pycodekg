@@ -217,51 +217,99 @@ def call_scope_chains(
     return chains
 
 
-def _bound_names(func_node: Union[ast.FunctionDef, ast.AsyncFunctionDef]) -> Set[str]:
-    """Names a function binds in its own scope: its parameters, and every
-    name it assigns, loops over, imports, or catches an exception as."""
+_COMPREHENSIONS = (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)
+
+
+def _bound_names(
+    func_node: Union[ast.FunctionDef, ast.AsyncFunctionDef],
+) -> Tuple[Set[str], Set[str], Set[str]]:
+    """The names a function binds in its own scope, as (bound, nonlocal, global).
+
+    `bound` has its parameters, the names it assigns, loops over, or captures
+    (`except ... as e`, `case ... as e`), and the names of the defs and classes
+    it defines. A comprehension's loop variables are its own scope and are not
+    included (a walrus inside one binds in the function, so it is). Imports are
+    not included: ImportScopes handles those, in source order. A name declared
+    `nonlocal` or `global` is not bound here, whatever is assigned to it.
+    """
     args = func_node.args
-    params = args.posonlyargs + args.args + args.kwonlyargs
-    names = {a.arg for a in params}
-    names |= {a.arg for a in (args.vararg, args.kwarg) if a is not None}
-    for node in _walk_own_scope(func_node):
+    bound = {a.arg for a in args.posonlyargs + args.args + args.kwonlyargs}
+    bound |= {a.arg for a in (args.vararg, args.kwarg) if a is not None}
+    bound |= {d.name for d in iter_scope_defs(func_node)}
+    nonlocals: Set[str] = set()
+    globals_: Set[str] = set()
+
+    def visit(node: ast.AST):
         if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
-            names.add(node.id)
+            bound.add(node.id)
         elif isinstance(node, ast.ExceptHandler) and node.name:
-            names.add(node.name)
-        elif isinstance(node, (ast.Import, ast.ImportFrom)):
-            names.update((a.asname or a.name).split('.')[0] for a in node.names)
-    return names
+            bound.add(node.name)
+        elif isinstance(node, (ast.MatchAs, ast.MatchStar)) and node.name:
+            bound.add(node.name)
+        elif isinstance(node, ast.MatchMapping) and node.rest:
+            bound.add(node.rest)
+        elif isinstance(node, ast.Nonlocal):
+            nonlocals.update(node.names)
+        elif isinstance(node, ast.Global):
+            globals_.update(node.names)
+        if isinstance(node, _COMPREHENSIONS):
+            for gen in node.generators:
+                visit(gen.iter)
+                for cond in gen.ifs:
+                    visit(cond)
+            for expr in (getattr(node, 'elt', None), getattr(node, 'key', None), getattr(node, 'value', None)):
+                if expr is not None:
+                    visit(expr)
+            return
+        for child in ast.iter_child_nodes(node):
+            if not isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                visit(child)
+
+    for stmt in func_node.body:
+        if not isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            visit(stmt)
+    return bound - nonlocals - globals_, nonlocals, globals_
 
 
-def local_type_in_scopes(
-    receiver: str,
-    chain: List[ast.AST],
-    scope_types: Dict[int, Dict[str, str]],
-) -> Optional[str]:
-    """The class a receiver name is known to hold at a call, looked up the
-    way Python resolves the name: in the innermost function around the call
-    first, then outward (see call_scope_chains).
+class LocalTypeScopes:
+    """Looks up the class a receiver name holds at a call, the way Python
+    resolves the name: in the innermost function around the call first, then
+    outward (see call_scope_chains). Created once per outermost function; it
+    caches what it computes per function.
 
     The first function in the chain that binds the name decides. If it knows
     the name's type (an annotated parameter, `x = SomeClass()`) that is the
-    answer; if it binds the name without a known type, the answer is None and
-    an outer function's type for the same name is not used, since that is a
+    answer; if it binds the name without a known type there is none, and an
+    outer function's type for the same name is not used, since that is a
     different variable. A name no function in the chain binds is a free
-    variable of the outermost one, so its types apply.
-
-    `scope_types` caches _collect_local_types per function, keyed by id(),
-    and should be seeded with the outermost function's map.
+    variable of the outermost one, or a module level name.
     """
-    for func in reversed(chain):
-        types = scope_types.get(id(func))
-        if types is None:
-            types = scope_types[id(func)] = _collect_local_types(func)
-        if receiver in types:
-            return types[receiver]
-        if receiver in _bound_names(func):
-            return None
-    return None
+
+    def __init__(self, outer_func: ast.AST, outer_types: Dict[str, str]):
+        self._types: Dict[int, Dict[str, str]] = {id(outer_func): outer_types}
+        self._names: Dict[int, Tuple[Set[str], Set[str], Set[str]]] = {}
+
+    def lookup(self, receiver: str, chain: List[ast.AST]) -> Tuple[bool, Optional[str]]:
+        """(is the receiver a local of a function around the call, its type)."""
+        for func in reversed(chain):
+            names = self._names.get(id(func))
+            if names is None:
+                names = self._names[id(func)] = _bound_names(func)
+            bound, nonlocals, globals_ = names
+            if receiver in bound or receiver in globals_ or receiver in nonlocals:
+                types = self._types.get(id(func))
+                if types is None:
+                    types = self._types[id(func)] = _collect_local_types(func)
+                if receiver in bound:
+                    return True, types.get(receiver)
+                if receiver in types:
+                    # `global x` / `nonlocal x` then `x = SomeClass()`: not a
+                    # local, but this assignment says what the name holds here.
+                    return False, types[receiver]
+                if receiver in globals_:
+                    return False, None  # a module level name: no enclosing function owns it
+                # nonlocal: an enclosing function owns it, keep looking outward
+        return False, None
 
 
 def iter_calls_by_scope(

@@ -75,7 +75,7 @@ from kg_construction.ast.helpers import (
     ImportScopes,
     call_scope_chains,
     scope_import_map_over,
-    local_type_in_scopes,
+    LocalTypeScopes,
     assign_qualnames,
     iter_calls_by_scope,
     iter_scope_defs,
@@ -552,7 +552,7 @@ def _parse_file(args: Tuple[str, str, str]) -> Optional[Dict]:
         own_calls, closure_calls = iter_calls_by_scope(func_node)
         scopes = ImportScopes(enclosing_imports)
         chains = call_scope_chains(func_node)
-        scope_types = {id(func_node): local_types}
+        local_scopes = LocalTypeScopes(func_node, local_types)
         # Own scope first, so a direct call takes the dedup slot before the
         # same call found inside a closure.
         tagged_calls = [(c, False) for c in own_calls] + [(c, True) for c in closure_calls]
@@ -575,6 +575,8 @@ def _parse_file(args: Tuple[str, str, str]) -> Optional[Dict]:
             local_type_hint: Optional[str] = None
             import_resolved: Optional[str] = None
             is_super_call = receiver == 'super()'
+            chain = chains[id(call)]
+            receiver_is_local, local_type = local_scopes.lookup(receiver, chain) if receiver else (False, None)
 
             if is_super_call:
                 pass  # resolved in pass 2 via the caller's own inherits chain
@@ -583,12 +585,12 @@ def _parse_file(args: Tuple[str, str, str]) -> Optional[Dict]:
                 # The exact class node, so pass 2 does not have to guess
                 # between same named classes in different files.
                 class_hint_id = class_id
-            elif receiver and (local_type := local_type_in_scopes(
-                    receiver, chains[id(call)], scope_types)) is not None:
+            elif local_type is not None:
                 local_type_hint = local_type
             else:
-                chain = chains[id(call)]
-                bound = scopes.lookup(receiver, call, chain) if receiver else None
+                # A receiver that is a local of some function around the call
+                # is not the module of the same name, even with no known type.
+                bound = scopes.lookup(receiver, call, chain) if receiver and not receiver_is_local else None
                 if bound is not None:
                     # e.g. json.loads where 'json' was imported
                     import_resolved = f"{bound}.{callee}"
