@@ -72,6 +72,9 @@ from kg_construction.ast.helpers import (
     _get_factory_call_sites,
     _build_func_metadata,
     _collect_file_level_info,
+    ImportScopes,
+    call_scope_chains,
+    scope_import_map_over,
     assign_qualnames,
     iter_calls_by_scope,
     iter_scope_defs,
@@ -139,7 +142,14 @@ MAX_FILE_LINES = 20000
 #    now produce edges (an old cached KG is missing them), and every imports
 #    edge carries metadata['statements']: the import statements (module, name,
 #    number of leading dots) of that file behind the shared import node.
-SCHEMA_VERSION = 7
+# 8: imports that are not direct children of the module are collected: under
+#    try/except or `if TYPE_CHECKING:`, and inside functions (lazy imports,
+#    visible to that function and what is nested in it). They get import
+#    nodes and imports/depends_on/module_depends_on edges, and calls through
+#    them carry import_resolved, so some calls move from a name match to
+#    qualified, and a call to an external module is no longer matched to a
+#    same named function in the repo.
+SCHEMA_VERSION = 8
 
 
 def _same_commit(a: Optional[str], b: Optional[str]) -> bool:
@@ -417,6 +427,9 @@ def _parse_file(args: Tuple[str, str, str]) -> Optional[Dict]:
     # Deduplicate call edges within this file at creation time to avoid
     # accumulating one edge per call-site for frequently called functions
     seen_call_targets: Set[Tuple[str, str, Optional[str]]] = set()
+    # The same call can go through a different import before and after a
+    # name is re-imported, so the import is part of what makes a call unique.
+    seen_call_hints: Set[Tuple[str, str, Optional[str], Optional[str]]] = set()
 
     # Factory-call assignment sites recorded for optional pyright type
     # resolution (see kg/type_inference.py). Each site is
@@ -434,6 +447,10 @@ def _parse_file(args: Tuple[str, str, str]) -> Optional[Dict]:
     file_id = _make_id(f"file_{repo}_{rel_path}")
     file_type = 'test_file' if _is_test_file(rel_path) else 'file'
     import_map, exports, constants = _collect_file_level_info(tree)
+    # What the function being emitted sees from outside itself: the module's
+    # imports, plus those of the functions around it. Its own imports apply
+    # from the line they are on (see ImportScopes).
+    enclosing_imports = import_map
     # Unique qualname per def in this file (see assign_qualnames); node IDs
     # and metadata['qualname'] are derived from it rather than rebuilt from
     # nesting so two same-named defs can't share an ID.
@@ -444,29 +461,42 @@ def _parse_file(args: Tuple[str, str, str]) -> Optional[Dict]:
         metadata={'path': rel_path, 'repo': repo, 'constants': constants, 'exports': exports}
     )))
 
-    # Emit import nodes and edges. An import node is shared by every file that
-    # imports the same name, so what a file's import statement actually says
-    # (module, name, number of leading dots) goes on that file's own imports
-    # edge, as `statements`. `import dep`, `from . import dep` and
-    # `from .. import dep` are one node but three different statements.
+    # Emit import nodes and edges for every import in the file, wherever it
+    # sits: at module level, under try/except or `if TYPE_CHECKING:`, or inside
+    # a function (a lazy import). The file depends on all of them. An import
+    # node is shared by every file that imports the same name, so what a
+    # file's import statement actually says (module, name, number of leading
+    # dots) goes on that file's own imports edge, as `statements`. `import
+    # dep`, `from . import dep` and `from .. import dep` are one node but
+    # three different statements. The same statement repeated in one file
+    # (both arms of a try/except, several functions) is recorded once.
+    imports_emitted: Set[str] = set()
     import_statements: Dict[str, List[Dict]] = {}
-    for node in ast.iter_child_nodes(tree):
+    import_stmts = sorted(
+        (n for n in ast.walk(tree) if isinstance(n, (ast.Import, ast.ImportFrom))),
+        key=lambda n: (n.lineno, n.col_offset),
+    )
+    for node in import_stmts:
         if isinstance(node, ast.Import):
             for alias in node.names:
                 mod_id = _make_id(f"import_{repo}_{alias.name}")
-                nodes.append(asdict(KGNode(id=mod_id, type='import', label=alias.name,
-                                           metadata={'repo': repo})))
+                if mod_id not in imports_emitted:
+                    imports_emitted.add(mod_id)
+                    nodes.append(asdict(KGNode(id=mod_id, type='import', label=alias.name,
+                                               metadata={'repo': repo})))
                 statement = {'module': None, 'name': alias.name, 'level': 0}
                 if statement not in import_statements.setdefault(mod_id, []):
                     import_statements[mod_id].append(statement)
-        elif isinstance(node, ast.ImportFrom):
+        else:
             mod_name = node.module or ''
             for alias in node.names:
                 full_name = f"{mod_name}.{alias.name}" if mod_name else alias.name
                 imp_id = _make_id(f"import_{repo}_{full_name}")
-                nodes.append(asdict(KGNode(id=imp_id, type='import', label=full_name,
-                                           metadata={'repo': repo, 'module': mod_name,
-                                                     'name': alias.name})))
+                if imp_id not in imports_emitted:
+                    imports_emitted.add(imp_id)
+                    nodes.append(asdict(KGNode(id=imp_id, type='import', label=full_name,
+                                               metadata={'repo': repo, 'module': mod_name,
+                                                         'name': alias.name})))
                 statement = {'module': mod_name, 'name': alias.name, 'level': node.level}
                 if statement not in import_statements.setdefault(imp_id, []):
                     import_statements[imp_id].append(statement)
@@ -514,6 +544,8 @@ def _parse_file(args: Tuple[str, str, str]) -> Optional[Dict]:
                          same function body twice for the same data.
         """
         own_calls, closure_calls = iter_calls_by_scope(func_node)
+        scopes = ImportScopes(enclosing_imports)
+        chains = call_scope_chains(func_node)
         # Own scope first, so a direct call takes the dedup slot before the
         # same call found inside a closure.
         tagged_calls = [(c, False) for c in own_calls] + [(c, True) for c in closure_calls]
@@ -531,10 +563,6 @@ def _parse_file(args: Tuple[str, str, str]) -> Optional[Dict]:
             if callee == 'super' and receiver is None:
                 continue
 
-            if (func_id, callee, receiver) in seen_call_targets:
-                continue
-            seen_call_targets.add((func_id, callee, receiver))
-
             class_hint: Optional[str] = None
             class_hint_id: Optional[str] = None
             local_type_hint: Optional[str] = None
@@ -550,12 +578,20 @@ def _parse_file(args: Tuple[str, str, str]) -> Optional[Dict]:
                 class_hint_id = class_id
             elif receiver and receiver in local_types:
                 local_type_hint = local_types[receiver]
-            elif receiver and receiver in import_map:
-                # e.g. json.loads where 'json' was imported
-                import_resolved = f"{import_map[receiver]}.{callee}"
             else:
-                # Bare-name call: foo() where foo was imported
-                import_resolved = import_map.get(callee)
+                chain = chains[id(call)]
+                bound = scopes.lookup(receiver, call, chain) if receiver else None
+                if bound is not None:
+                    # e.g. json.loads where 'json' was imported
+                    import_resolved = f"{bound}.{callee}"
+                else:
+                    # Bare-name call: foo() where foo was imported
+                    import_resolved = scopes.lookup(callee, call, chain)
+
+            if (func_id, callee, receiver, import_resolved) in seen_call_hints:
+                continue
+            seen_call_hints.add((func_id, callee, receiver, import_resolved))
+            seen_call_targets.add((func_id, callee, receiver))
 
             call_meta = {
                 'unresolved': True,
@@ -798,7 +834,7 @@ def _parse_file(args: Tuple[str, str, str]) -> Optional[Dict]:
             else:
                 _emit_class(child, container_id=class_id, qualname=qualnames[id(child)])
 
-    def _emit_function(
+    def _emit_function_body(
         func_node: Union[ast.FunctionDef, ast.AsyncFunctionDef],
         container_id: str,
         qualname: str,
@@ -885,6 +921,23 @@ def _parse_file(args: Tuple[str, str, str]) -> Optional[Dict]:
                 )
             else:
                 _emit_class(child, container_id=func_id, qualname=qualnames[id(child)])
+
+    def _emit_function(func_node: Union[ast.FunctionDef, ast.AsyncFunctionDef],
+                       *args, **kwargs):
+        """Emit a function node (see _emit_function_body) with the imports it
+        can see: the module's, plus any it makes itself. A lazy import
+        (`def f(): import json`) is only in scope inside f and the functions
+        and classes nested in it, so import_map is swapped for the duration
+        and restored after. Everything nested inside reads the swapped map,
+        which is how a closure sees its enclosing function's imports."""
+        nonlocal import_map, enclosing_imports
+        outer_imports, outer_enclosing = import_map, enclosing_imports
+        enclosing_imports = outer_imports
+        import_map = scope_import_map_over(outer_imports, func_node)
+        try:
+            _emit_function_body(func_node, *args, **kwargs)
+        finally:
+            import_map, enclosing_imports = outer_imports, outer_enclosing
 
     # Emit class, method, and top-level function nodes (including ones
     # nested under module-level if/try/with blocks)

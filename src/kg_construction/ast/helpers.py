@@ -182,6 +182,41 @@ def _extract_callee_name(call: ast.Call) -> Optional[str]:
     return None
 
 
+def _outer_scope_exprs(def_node: Union[ast.FunctionDef, ast.AsyncFunctionDef]) -> List[ast.AST]:
+    """The expressions of a def that run in the scope the def sits in, not in
+    its own: decorators, default values and annotations."""
+    args = def_node.args
+    defaults = args.defaults + [d for d in args.kw_defaults if d is not None]
+    params = args.posonlyargs + args.args + args.kwonlyargs
+    params += [a for a in (args.vararg, args.kwarg) if a is not None]
+    annotations = [a.annotation for a in params if a.annotation is not None]
+    if def_node.returns is not None:
+        annotations.append(def_node.returns)
+    return def_node.decorator_list + defaults + annotations
+
+
+def call_scope_chains(
+    func_node: Union[ast.FunctionDef, ast.AsyncFunctionDef],
+) -> Dict[int, List[ast.AST]]:
+    """For every Call in a function, keyed by id(call): the functions around
+    it, from `func_node` down to the innermost one. A call in `func_node`'s
+    own body maps to [func_node]; one in a closure `inner` defined in it maps
+    to [func_node, inner]. Walks the same way as iter_calls_by_scope."""
+    chains: Dict[int, List[ast.AST]] = {}
+    stack: List[Tuple[ast.AST, Tuple[ast.AST, ...]]] = [(func_node, (func_node,))]
+    while stack:
+        node, chain = stack.pop()
+        if isinstance(node, ast.Call):
+            chains[id(node)] = list(chain)
+        if node is not func_node and isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            kids = [(expr, chain) for expr in _outer_scope_exprs(node)]
+            kids += [(stmt, chain + (node,)) for stmt in node.body]
+        else:
+            kids = [(child, chain) for child in ast.iter_child_nodes(node)]
+        stack.extend(reversed(kids))
+    return chains
+
+
 def iter_calls_by_scope(
     func_node: Union[ast.FunctionDef, ast.AsyncFunctionDef],
 ) -> Tuple[List[ast.Call], List[ast.Call]]:
@@ -202,14 +237,7 @@ def iter_calls_by_scope(
         if isinstance(node, ast.Call):
             (in_closure if nested else own).append(node)
         if node is not func_node and isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            args = node.args
-            defaults = args.defaults + [d for d in args.kw_defaults if d is not None]
-            params = args.posonlyargs + args.args + args.kwonlyargs
-            params += [a for a in (args.vararg, args.kwarg) if a is not None]
-            annotations = [a.annotation for a in params if a.annotation is not None]
-            if node.returns is not None:
-                annotations.append(node.returns)
-            kids = [(d, nested) for d in node.decorator_list + defaults + annotations]
+            kids = [(expr, nested) for expr in _outer_scope_exprs(node)]
             kids += [(stmt, True) for stmt in node.body]
         else:
             kids = [(child, nested) for child in ast.iter_child_nodes(node)]
@@ -1241,6 +1269,151 @@ def _build_func_metadata(
     return meta
 
 
+def _is_type_checking_test(test: ast.AST) -> bool:
+    """`TYPE_CHECKING`, `typing.TYPE_CHECKING` or any `x.TYPE_CHECKING`."""
+    return ((isinstance(test, ast.Name) and test.id == 'TYPE_CHECKING')
+            or (isinstance(test, ast.Attribute) and test.attr == 'TYPE_CHECKING'))
+
+
+def _type_only_branch(test: ast.AST) -> Optional[str]:
+    """Which branch of `if test:` only runs for a type checker: 'body' for
+    `if TYPE_CHECKING:`, 'orelse' for `if not TYPE_CHECKING:`, else None."""
+    if _is_type_checking_test(test):
+        return 'body'
+    if isinstance(test, ast.UnaryOp) and isinstance(test.op, ast.Not) and _is_type_checking_test(test.operand):
+        return 'orelse'
+    return None
+
+
+def _iter_scope_imports_flagged(node: ast.AST, type_only: bool = False):
+    """Yield (import statement, type_only) for the imports in `node`'s own
+    scope, in source order. type_only is True for an import in the body of
+    `if TYPE_CHECKING:` (or the `else` of `if not TYPE_CHECKING:`): it never
+    runs, so it must not replace a name the code really binds (the other
+    branch does run and is not type only)."""
+    for child in ast.iter_child_nodes(node):
+        yield from _flagged_scope_imports(child, type_only)
+
+
+def _flagged_scope_imports(child: ast.AST, type_only: bool):
+    if isinstance(child, (ast.Import, ast.ImportFrom)):
+        yield child, type_only
+    elif isinstance(child, _DEF_TYPES):
+        return
+    elif isinstance(child, ast.If) and _type_only_branch(child.test):
+        branch = _type_only_branch(child.test)
+        for stmt in child.body:
+            yield from _flagged_scope_imports(stmt, type_only or branch == 'body')
+        for stmt in child.orelse:
+            yield from _flagged_scope_imports(stmt, type_only or branch == 'orelse')
+    elif isinstance(child, _SCOPE_TRANSPARENT):
+        yield from _iter_scope_imports_flagged(child, type_only)
+
+
+def iter_scope_imports(node: ast.AST):
+    """Yield the import statements that belong directly to `node`'s scope,
+    in source order.
+
+    Looks through compound statements (`try`/`except`, `if TYPE_CHECKING:`,
+    `with`, loops, `match`), which don't introduce a scope, but not into a
+    nested function or class: an import there is only visible inside it.
+    """
+    for stmt, _ in _iter_scope_imports_flagged(node):
+        yield stmt
+
+
+def _import_bindings(stmt: Union[ast.Import, ast.ImportFrom]) -> List[Tuple[str, str]]:
+    """(local name, fully qualified name) pairs an import statement binds."""
+    if isinstance(stmt, ast.Import):
+        # `import os.path` → local name is 'os', full name is 'os.path'
+        return [(alias.asname or alias.name.split('.')[0], alias.name) for alias in stmt.names]
+    mod = stmt.module or ''
+    return [(alias.asname or alias.name, f"{mod}.{alias.name}" if mod else alias.name)
+            for alias in stmt.names]
+
+
+def _split_scope_imports(node: ast.AST) -> Tuple[Dict[str, str], Dict[str, str]]:
+    """(runtime, type only) {local name: qualified name} for the imports in
+    `node`'s own scope. A later import of a name replaces an earlier one."""
+    runtime: Dict[str, str] = {}
+    type_only: Dict[str, str] = {}
+    for stmt, is_type_only in _iter_scope_imports_flagged(node):
+        (type_only if is_type_only else runtime).update(_import_bindings(stmt))
+    return runtime, type_only
+
+
+def _scope_import_map(node: ast.AST) -> Dict[str, str]:
+    """{local_name: fully_qualified_name} for the imports in `node`'s own
+    scope (see iter_scope_imports). A later import of the same local name
+    replaces an earlier one, as it would when the code runs. An import under
+    `if TYPE_CHECKING:` only supplies a name with no runtime import, so it
+    never replaces the binding the code runs with."""
+    runtime, type_only = _split_scope_imports(node)
+    return {**type_only, **runtime}
+
+
+def scope_import_map_over(outer: Dict[str, str], node: ast.AST) -> Dict[str, str]:
+    """`outer` (the imports visible around `node`) plus the imports in `node`'s
+    own scope. A runtime import of `node` replaces a name in `outer`; a type
+    only one fills a name `outer` does not have, but never replaces one, so it
+    can not reach a closure as the binding the code runs with."""
+    runtime, type_only = _split_scope_imports(node)
+    return {**type_only, **outer, **runtime}
+
+
+def scope_import_bindings(node: ast.AST) -> Dict[str, List[Tuple[Tuple[int, int], str]]]:
+    """{local name: [((line, col), qualified name), ...]} in source order for
+    the runtime imports in `node`'s own scope. Type only imports are left out:
+    they never run, so a call can not be going through them."""
+    bindings: Dict[str, List[Tuple[Tuple[int, int], str]]] = {}
+    for stmt, is_type_only in _iter_scope_imports_flagged(node):
+        if is_type_only:
+            continue
+        position = (stmt.lineno, stmt.col_offset)
+        for local, qualified in _import_bindings(stmt):
+            bindings.setdefault(local, []).append((position, qualified))
+    for hits in bindings.values():
+        hits.sort(key=lambda hit: hit[0])
+    return bindings
+
+
+class ImportScopes:
+    """What a name means at a point in a function: the module it was imported
+    from, given the imports that have run by then.
+
+    A function's own imports apply from the line they are on, so a call before
+    `import b as client` still goes through the earlier `import a as client`.
+    `enclosing` is what the function sees from outside itself (the module's
+    imports, and those of the functions around it), where the last binding
+    wins because that code has run by the time the function is called.
+    """
+
+    def __init__(self, enclosing: Dict[str, str]):
+        self.enclosing = enclosing
+        self._bindings: Dict[int, Dict[str, List[Tuple[Tuple[int, int], str]]]] = {}
+
+    def lookup(self, name: str, node: ast.AST, chain: List[ast.AST]) -> Optional[str]:
+        """The qualified name `name` refers to at `node`, or None if it is not
+        an imported name. `chain` is the functions around `node`, outermost
+        first (see call_scope_chains). The innermost one is searched first and
+        only up to the line of `node`; for each function around it the last
+        import wins, since a closure runs after its enclosing function has."""
+        position = (node.lineno, node.col_offset)
+        for depth, scope in enumerate(reversed(chain)):
+            if id(scope) not in self._bindings:
+                self._bindings[id(scope)] = scope_import_bindings(scope)
+            hits = self._bindings[id(scope)].get(name)
+            if not hits:
+                continue
+            if depth == 0:
+                earlier = [qualified for hit_position, qualified in hits if hit_position < position]
+                if earlier:
+                    return earlier[-1]
+            else:
+                return hits[-1][1]
+        return self.enclosing.get(name)
+
+
 def _collect_file_level_info(tree: ast.Module) -> Tuple[Dict[str, str], List[str], Dict[str, str]]:
     """Collect imports, __all__ exports, and module-level constants in one pass.
 
@@ -1248,28 +1421,21 @@ def _collect_file_level_info(tree: ast.Module) -> Tuple[Dict[str, str], List[str
     three separate times.
 
     Returns:
-        import_map: {local_name: fully_qualified_name} for all imports.
+        import_map: {local_name: fully_qualified_name} for the imports in the
+            module's own scope, including ones under try/except or
+            `if TYPE_CHECKING:`. Imports inside a function are not here: they
+            belong to that function (see _scope_import_map).
             Used to annotate call edges with the source module when the
             callee was imported (e.g. 'HTTPBasicAuth' → 'requests.auth.HTTPBasicAuth').
         exports: List of names in __all__, if defined.
         constants: {NAME: value_string} for UPPER_CASE module-level assignments.
     """
-    import_map: Dict[str, str] = {}
+    import_map = _scope_import_map(tree)
     exports: List[str] = []
     constants: Dict[str, str] = {}
 
     for node in ast.iter_child_nodes(tree):
-        if isinstance(node, ast.Import):
-            for alias in node.names:
-                # `import os.path` → local name is 'os', full name is 'os.path'
-                local = alias.asname or alias.name.split('.')[0]
-                import_map[local] = alias.name
-        elif isinstance(node, ast.ImportFrom):
-            mod = node.module or ''
-            for alias in node.names:
-                local = alias.asname or alias.name
-                import_map[local] = f"{mod}.{alias.name}" if mod else alias.name
-        elif isinstance(node, ast.Assign):
+        if isinstance(node, ast.Assign):
             for target in node.targets:
                 if isinstance(target, ast.Name):
                     if target.id == '__all__' and isinstance(node.value, (ast.List, ast.Tuple)):
