@@ -217,6 +217,53 @@ def call_scope_chains(
     return chains
 
 
+def _bound_names(func_node: Union[ast.FunctionDef, ast.AsyncFunctionDef]) -> Set[str]:
+    """Names a function binds in its own scope: its parameters, and every
+    name it assigns, loops over, imports, or catches an exception as."""
+    args = func_node.args
+    params = args.posonlyargs + args.args + args.kwonlyargs
+    names = {a.arg for a in params}
+    names |= {a.arg for a in (args.vararg, args.kwarg) if a is not None}
+    for node in _walk_own_scope(func_node):
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
+            names.add(node.id)
+        elif isinstance(node, ast.ExceptHandler) and node.name:
+            names.add(node.name)
+        elif isinstance(node, (ast.Import, ast.ImportFrom)):
+            names.update((a.asname or a.name).split('.')[0] for a in node.names)
+    return names
+
+
+def local_type_in_scopes(
+    receiver: str,
+    chain: List[ast.AST],
+    scope_types: Dict[int, Dict[str, str]],
+) -> Optional[str]:
+    """The class a receiver name is known to hold at a call, looked up the
+    way Python resolves the name: in the innermost function around the call
+    first, then outward (see call_scope_chains).
+
+    The first function in the chain that binds the name decides. If it knows
+    the name's type (an annotated parameter, `x = SomeClass()`) that is the
+    answer; if it binds the name without a known type, the answer is None and
+    an outer function's type for the same name is not used, since that is a
+    different variable. A name no function in the chain binds is a free
+    variable of the outermost one, so its types apply.
+
+    `scope_types` caches _collect_local_types per function, keyed by id(),
+    and should be seeded with the outermost function's map.
+    """
+    for func in reversed(chain):
+        types = scope_types.get(id(func))
+        if types is None:
+            types = scope_types[id(func)] = _collect_local_types(func)
+        if receiver in types:
+            return types[receiver]
+        if receiver in _bound_names(func):
+            return None
+    return None
+
+
 def iter_calls_by_scope(
     func_node: Union[ast.FunctionDef, ast.AsyncFunctionDef],
 ) -> Tuple[List[ast.Call], List[ast.Call]]:
