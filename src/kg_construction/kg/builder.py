@@ -73,7 +73,7 @@ from kg_construction.ast.helpers import (
     _collect_file_level_info,
     ImportScopes,
     call_scope_chains,
-    _scope_import_map,
+    scope_import_map_over,
     assign_qualnames,
     iter_calls_by_scope,
     iter_scope_defs,
@@ -931,7 +931,7 @@ def _parse_file(args: Tuple[str, str, str]) -> Optional[Dict]:
         nonlocal import_map, enclosing_imports
         outer_imports, outer_enclosing = import_map, enclosing_imports
         enclosing_imports = outer_imports
-        import_map = {**outer_imports, **_scope_import_map(func_node)}
+        import_map = scope_import_map_over(outer_imports, func_node)
         try:
             _emit_function_body(func_node, *args, **kwargs)
         finally:

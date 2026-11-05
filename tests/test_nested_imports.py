@@ -85,7 +85,8 @@ class TestImportsOutsideTheModuleBody:
     @pytest.mark.parametrize("header", [
         "import a as client\nif TYPE_CHECKING:\n    import b as client\n",
         "if TYPE_CHECKING:\n    import b as client\nimport a as client\n",
-    ], ids=["runtime-first", "type-checking-first"])
+        "if not TYPE_CHECKING:\n    import a as client\nelse:\n    import b as client\n",
+    ], ids=["runtime-first", "type-checking-first", "not-type-checking"])
     def test_type_checking_import_does_not_replace_a_runtime_binding(self, tmp_path, header):
         kg = _build(tmp_path, {
             "a.py": "def run(): ...\n",
@@ -95,6 +96,24 @@ class TestImportsOutsideTheModuleBody:
         # The call is to a.run, and b is still recorded as a dependency.
         assert _run_targets(kg) == [("f", "a.py")]
         assert ("m.py", "b") in _labels(kg, "imports")
+
+    def test_type_checking_import_in_a_function_does_not_reach_its_closure(self, tmp_path):
+        kg = _build(tmp_path, {
+            "a.py": "def run(): ...\n",
+            "b.py": "def run(): ...\n",
+            "m.py": """
+                from typing import TYPE_CHECKING
+                import a as client
+                def outer():
+                    if TYPE_CHECKING:
+                        import b as client
+                    def inner():
+                        return client.run()
+                    return client.run()
+            """,
+        })
+        # The module's runtime import is what both calls go through.
+        assert _run_targets(kg) == [("inner", "a.py"), ("outer", "a.py")]
 
     @pytest.mark.parametrize("body, expected", [
         pytest.param(

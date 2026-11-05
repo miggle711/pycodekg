@@ -1256,11 +1256,22 @@ def _is_type_checking_test(test: ast.AST) -> bool:
             or (isinstance(test, ast.Attribute) and test.attr == 'TYPE_CHECKING'))
 
 
+def _type_only_branch(test: ast.AST) -> Optional[str]:
+    """Which branch of `if test:` only runs for a type checker: 'body' for
+    `if TYPE_CHECKING:`, 'orelse' for `if not TYPE_CHECKING:`, else None."""
+    if _is_type_checking_test(test):
+        return 'body'
+    if isinstance(test, ast.UnaryOp) and isinstance(test.op, ast.Not) and _is_type_checking_test(test.operand):
+        return 'orelse'
+    return None
+
+
 def _iter_scope_imports_flagged(node: ast.AST, type_only: bool = False):
     """Yield (import statement, type_only) for the imports in `node`'s own
     scope, in source order. type_only is True for an import in the body of
-    `if TYPE_CHECKING:`: it never runs, so it must not replace a name the
-    code really binds (its `else` branch does run and is not type only)."""
+    `if TYPE_CHECKING:` (or the `else` of `if not TYPE_CHECKING:`): it never
+    runs, so it must not replace a name the code really binds (the other
+    branch does run and is not type only)."""
     for child in ast.iter_child_nodes(node):
         yield from _flagged_scope_imports(child, type_only)
 
@@ -1270,11 +1281,12 @@ def _flagged_scope_imports(child: ast.AST, type_only: bool):
         yield child, type_only
     elif isinstance(child, _DEF_TYPES):
         return
-    elif isinstance(child, ast.If) and _is_type_checking_test(child.test):
+    elif isinstance(child, ast.If) and _type_only_branch(child.test):
+        branch = _type_only_branch(child.test)
         for stmt in child.body:
-            yield from _flagged_scope_imports(stmt, True)
+            yield from _flagged_scope_imports(stmt, type_only or branch == 'body')
         for stmt in child.orelse:
-            yield from _flagged_scope_imports(stmt, type_only)
+            yield from _flagged_scope_imports(stmt, type_only or branch == 'orelse')
     elif isinstance(child, _SCOPE_TRANSPARENT):
         yield from _iter_scope_imports_flagged(child, type_only)
 
@@ -1301,17 +1313,33 @@ def _import_bindings(stmt: Union[ast.Import, ast.ImportFrom]) -> List[Tuple[str,
             for alias in stmt.names]
 
 
+def _split_scope_imports(node: ast.AST) -> Tuple[Dict[str, str], Dict[str, str]]:
+    """(runtime, type only) {local name: qualified name} for the imports in
+    `node`'s own scope. A later import of a name replaces an earlier one."""
+    runtime: Dict[str, str] = {}
+    type_only: Dict[str, str] = {}
+    for stmt, is_type_only in _iter_scope_imports_flagged(node):
+        (type_only if is_type_only else runtime).update(_import_bindings(stmt))
+    return runtime, type_only
+
+
 def _scope_import_map(node: ast.AST) -> Dict[str, str]:
     """{local_name: fully_qualified_name} for the imports in `node`'s own
     scope (see iter_scope_imports). A later import of the same local name
     replaces an earlier one, as it would when the code runs. An import under
     `if TYPE_CHECKING:` only supplies a name with no runtime import, so it
     never replaces the binding the code runs with."""
-    runtime: Dict[str, str] = {}
-    type_only: Dict[str, str] = {}
-    for stmt, is_type_only in _iter_scope_imports_flagged(node):
-        (type_only if is_type_only else runtime).update(_import_bindings(stmt))
+    runtime, type_only = _split_scope_imports(node)
     return {**type_only, **runtime}
+
+
+def scope_import_map_over(outer: Dict[str, str], node: ast.AST) -> Dict[str, str]:
+    """`outer` (the imports visible around `node`) plus the imports in `node`'s
+    own scope. A runtime import of `node` replaces a name in `outer`; a type
+    only one fills a name `outer` does not have, but never replaces one, so it
+    can not reach a closure as the binding the code runs with."""
+    runtime, type_only = _split_scope_imports(node)
+    return {**type_only, **outer, **runtime}
 
 
 def scope_import_bindings(node: ast.AST) -> Dict[str, List[Tuple[Tuple[int, int], str]]]:
