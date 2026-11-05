@@ -166,6 +166,15 @@ def _changed_pre_patch_lines(patch: str, code_file: str) -> Tuple[Set[int], Set[
     return removed_lines, insertion_anchor_lines
 
 
+def _normalize_patch_text(patch: str) -> str:
+    """Put patch text in the form RepoManager reads source: \\n line endings
+    and no BOM. A diff keeps both, so a CRLF or BOM file's lines would
+    otherwise never match the source they apply to (#161, #163).
+    """
+    patch = patch.replace('\r\n', '\n')
+    return re.sub(r'^([ +-])\ufeff', r'\1', patch, flags=re.MULTILINE)
+
+
 def reconstruct_post_patch_source(pre_patch_source: str, patch: str, code_file: str) -> Optional[str]:
     """Reconstruct code_file's post-patch text by applying patch's hunks
     for that file directly to pre_patch_source, in memory.
@@ -182,6 +191,7 @@ def reconstruct_post_patch_source(pre_patch_source: str, patch: str, code_file: 
         The reconstructed post-patch text, or None if patch has no hunks
         for code_file at all (nothing to reconstruct).
     """
+    patch = _normalize_patch_text(patch)
     pre_lines = pre_patch_source.split('\n')
     out_lines: List[str] = []
     pre_idx = 0  # 0-indexed cursor into pre_lines
