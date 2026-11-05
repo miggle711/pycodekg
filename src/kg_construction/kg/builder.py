@@ -270,11 +270,14 @@ class _ModuleIndex:
                 return candidate, False
         if module_parts[0] in sys.stdlib_module_names:
             return None, False
-        hits = [
-            path for candidate in candidates for path in self._by_suffix.get(candidate, [])
-            if path != candidate and self._is_source_root(path[:-len(candidate) - 1])
-        ]
-        return (hits[0], False) if len(hits) == 1 else (None, len(hits) > 1)
+        for candidate in candidates:
+            hits = [
+                path for path in self._by_suffix.get(candidate, [])
+                if path != candidate and self._is_source_root(path[:-len(candidate) - 1])
+            ]
+            if hits:
+                return (hits[0], False) if len(hits) == 1 else (None, True)
+        return None, False
 
     def find_relative(self, base_parts: List[str], module_parts: List[str]) -> Optional[str]:
         """The file for a module path relative to a package directory."""
@@ -290,15 +293,25 @@ class _ModuleIndex:
         packages. Python rejects a relative import that goes above the
         top-level package, whatever else sits above it (a `src/` directory,
         say). A file outside any package sits in a namespace package at best,
-        so it gets one level; a file at the repo root gets none."""
+        so it gets one level; a file at the repo root gets none, unless the
+        repo root is itself a package (a repo built from inside the package)."""
         directory = file_path.split('/')[:-1]
-        if not directory:
+        if not directory and '__init__.py' not in self.paths:
             return 0
         depth = 0
-        while directory and '/'.join(directory) + '/__init__.py' in self.paths:
+        while '/'.join(directory + ['__init__.py']) in self.paths:
             depth += 1
+            if not directory:
+                break
             directory.pop()
         return max(depth, 1)
+
+    def may_be_own_package(self, top_level_name: str) -> bool:
+        """Whether an import of `top_level_name` can be the repo's own package
+        (a repo built from inside it). A standard library name can be, as when
+        asyncio itself is the repo, only if the repo root is a package;
+        otherwise `import os.path` would link to an unrelated root path.py."""
+        return top_level_name not in sys.stdlib_module_names or '__init__.py' in self.paths
 
     def _is_source_root(self, directory: str) -> bool:
         """A directory can be a source root (be on sys.path) only if neither
@@ -342,7 +355,7 @@ def _import_target_paths(index: _ModuleIndex, importing_path: str, statement: Di
         if module_parts:
             main, ambiguous = index.find(module_parts)
             found.append(main)
-            if main is None and not ambiguous:
+            if main is None and not ambiguous and index.may_be_own_package(module_parts[0]):
                 # A repo built from inside the package: `pkg.sub.mod` is sub/mod.py.
                 for i in range(1, len(module_parts)):
                     exact = '/'.join(module_parts[i:]) + '.py'

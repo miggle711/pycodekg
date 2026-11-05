@@ -141,6 +141,24 @@ class TestModuleDependsOnResolution:
              "pkg/a.py": "from . import feature\n"},
             {("pkg/a.py", "pkg/__init__.py"), ("pkg/a.py", "pkg/feature/__init__.py")},
             id="package-wins-over-module-relative"),
+        pytest.param(
+            {"src/pkg/__init__.py": "", "src/pkg/feature.py": "", "src/pkg/feature/__init__.py": "",
+             "main.py": "import pkg.feature\n"},
+            {("main.py", "src/pkg/feature/__init__.py")}, id="package-wins-under-a-source-root"),
+        pytest.param(
+            {"src/pkg/__init__.py": "", "src/pkg/feature.py": "", "src/pkg/feature/__init__.py": "",
+             "main.py": "from pkg import feature\n"},
+            {("main.py", "src/pkg/__init__.py"), ("main.py", "src/pkg/feature/__init__.py")},
+            id="package-wins-under-a-source-root-submodule"),
+        pytest.param(
+            {"__init__.py": "", "b.py": "", "a.py": "from .b import f\n"},
+            {("a.py", "b.py")}, id="relative-when-the-repo-root-is-a-package"),
+        pytest.param(
+            {"__init__.py": "", "b.py": "", "sub/__init__.py": "", "sub/c.py": "from ..b import f\n"},
+            {("sub/c.py", "b.py")}, id="relative-two-levels-when-the-repo-root-is-a-package"),
+        pytest.param(
+            {"__init__.py": "", "events.py": "", "tasks.py": "import asyncio.events\n"},
+            {("tasks.py", "events.py")}, id="stdlib-named-repo-built-from-inside-the-package"),
     ])
     def test_import_links_to_the_files_it_depends_on(self, tmp_path, files, expected):
         assert _module_edges(tmp_path, files) == expected
@@ -194,6 +212,8 @@ class TestModuleDependsOnResolution:
         pytest.param(
             {"pkg/__init__.py": "", "pkg/utils/missing_external.py": "",
              "main.py": "import missing_external\n"}, id="plain-directory-inside-a-package"),
+        pytest.param(
+            {"main.py": "import os.path\n", "path.py": ""}, id="stdlib-submodule-and-a-root-file-of-that-name"),
     ])
     def test_no_edge_when_the_target_is_not_the_repos_module(self, tmp_path, files):
         assert _module_edges(tmp_path, files) == set()
