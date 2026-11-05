@@ -19,6 +19,7 @@ from kg_construction.ast.helpers import (
     _extract_data_flows,
     _get_attribute_accesses,
     _get_class_attributes,
+    _get_instantiated_classes_in_class,
 )
 from kg_construction.kg.builder import RepoASTParser
 from kg_construction.kg.query import KGQueryEngine
@@ -208,3 +209,48 @@ class TestWriteFormsAreRecorded:
                         self.hidden = 1
         """)).body[0]
         assert _get_class_attributes(cls) == ["n", "a", "b", "total"]
+
+
+_COMPOUND_WRAPPERS = {
+    "if": "if FLAG:\n{body}\nelse:\n    pass",
+    "try": "try:\n{body}\nexcept Exception:\n    pass",
+}
+
+
+def _class_with_body_under(wrapper: str, method_src: str) -> ast.ClassDef:
+    """Parse `class K:` whose body is `method_src` inside an if or try."""
+    body = textwrap.indent(textwrap.dedent(method_src).strip(), "    ")
+    block = textwrap.indent(_COMPOUND_WRAPPERS[wrapper].format(body=body), "    ")
+    return ast.parse(f"class K:\n{block}\n").body[0]
+
+
+class TestClassScansSeeMethodsUnderCompoundStatements:
+    """A method defined under if/try in a class body belongs to the class, so
+    the class-level scans must see it. A method of a nested class must not
+    leak into the outer class."""
+
+    @pytest.mark.parametrize("wrapper", ["if", "try"])
+    def test_attributes_from_init_under_compound_statement(self, wrapper):
+        cls = _class_with_body_under(wrapper, """
+            def __init__(self):
+                self.x = 1
+        """)
+        assert _get_class_attributes(cls) == ["x"]
+
+    @pytest.mark.parametrize("wrapper", ["if", "try"])
+    def test_instantiations_from_method_under_compound_statement(self, wrapper):
+        cls = _class_with_body_under(wrapper, """
+            def m(self):
+                return B()
+        """)
+        assert _get_instantiated_classes_in_class(cls) == ["B"]
+
+    def test_nested_class_methods_do_not_leak_into_the_outer_class(self):
+        cls = ast.parse(textwrap.dedent("""
+            class Outer:
+                class Inner:
+                    def __init__(self):
+                        self.hidden = Other()
+        """)).body[0]
+        assert _get_class_attributes(cls) == []
+        assert _get_instantiated_classes_in_class(cls) == []
