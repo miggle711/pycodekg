@@ -865,3 +865,44 @@ class TestClassLevelAnchorRedundancy:
         changed = PatchParser.extract_changed_functions_with_scope(patch, 'mod.py', source)
         assert ('NewClass', None) in changed
         assert ('new_method', 'NewClass') in changed
+
+
+class TestReconstructNormalizesPatchText:
+    """The source is read with BOM removed and \\n line endings, so the patch
+    text has to be compared in that same form (#161, #163)."""
+
+    def test_crlf_patch_applies_to_lf_source(self):
+        pre = "def f():\n    return 1\n\n\ndef g():\n    return 2\n"
+        patch = (
+            "--- a/m.py\n+++ b/m.py\n@@ -3,4 +3,4 @@\n"
+            " \r\n \r\n def g():\r\n-    return 2\r\n+    return 3\r\n"
+        )
+        assert reconstruct_post_patch_source(pre, patch, 'm.py') == (
+            "def f():\n    return 1\n\n\ndef g():\n    return 3\n"
+        )
+
+    def test_new_function_in_crlf_patch_has_lf_endings(self):
+        pre = "def f():\n    return 1\n"
+        patch = (
+            "--- a/m.py\n+++ b/m.py\n@@ -1,2 +1,5 @@\n"
+            " def f():\r\n     return 1\r\n+\r\n+def g():\r\n+    return 2\r\n"
+        )
+        post = reconstruct_post_patch_source(pre, patch, 'm.py')
+        assert post == "def f():\n    return 1\n\ndef g():\n    return 2\n"
+
+    def test_bom_on_first_line_of_patch_is_ignored(self):
+        pre = "def a():\n    return 1\n"
+        patch = (
+            "--- a/m.py\n+++ b/m.py\n@@ -1,2 +1,2 @@\n"
+            " \ufeffdef a():\n-    return 1\n+    return 2\n"
+        )
+        assert reconstruct_post_patch_source(pre, patch, 'm.py') == "def a():\n    return 2\n"
+
+    def test_removed_first_line_with_bom_is_matched(self):
+        pre = "import os\nimport sys\n"
+        patch = "--- a/m.py\n+++ b/m.py\n@@ -1,2 +1,1 @@\n-\ufeffimport os\n import sys\n"
+        assert reconstruct_post_patch_source(pre, patch, 'm.py') == "import sys\n"
+
+    def test_new_file_with_bom_parses(self):
+        patch = "--- /dev/null\n+++ b/m.py\n@@ -0,0 +1,2 @@\n+\ufeffdef a():\n+    return 1\n"
+        assert reconstruct_post_patch_source("", patch, 'm.py') == "def a():\n    return 1\n"

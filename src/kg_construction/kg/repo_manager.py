@@ -154,8 +154,10 @@ class RepoManager:
                 ) from e
 
     def _show(self, repo_path: Path, commit: str, path: str) -> str:
+        # Decoded the way the KG builder reads files: no BOM, \n line endings.
         result = subprocess.run(
             ['git', '--git-dir', str(repo_path), 'show', f'{commit}:{path}'],
             check=True, timeout=GIT_TIMEOUT, capture_output=True, text=True,
+            encoding='utf-8-sig', errors='replace',
         )
         return result.stdout

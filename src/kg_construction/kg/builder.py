@@ -265,7 +265,8 @@ def _parse_file(args: Tuple[str, str, str]) -> Optional[Dict]:
     """
     repo, rel_path, abs_path = args
     try:
-        source = Path(abs_path).read_text(encoding='utf-8', errors='replace')
+        # utf-8-sig drops a leading BOM, which ast.parse rejects in a str.
+        source = Path(abs_path).read_text(encoding='utf-8-sig', errors='replace')
     except OSError:
         return None
     source_lines = split_source_lines(source)

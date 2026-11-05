@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+from kg_construction.extraction.patch import reconstruct_post_patch_source
 from kg_construction.kg.repo_manager import RepoManager
 
 
@@ -126,6 +127,43 @@ class TestReadFileAtCommit:
 
         with pytest.raises(ValueError, match="not found in test/repo"):
             manager.read_file_at_commit("test/repo", first_commit, "nonexistent.py")
+
+
+class TestReadFileAtCommitEncoding:
+    """read_file_at_commit must return text in the same form the KG builder
+    reads it: no BOM, and \\n line endings (#161, #163)."""
+
+    def _commit(self, remote_repo, data):
+        # A developer's global core.autocrlf would strip the \\r on commit.
+        _run(["git", "config", "core.autocrlf", "false"], cwd=remote_repo)
+        (remote_repo / "mod.py").write_bytes(data)
+        _run(["git", "add", "mod.py"], cwd=remote_repo)
+        _run(["git", "commit", "-q", "-m", "add mod"], cwd=remote_repo)
+        return _head_commit(remote_repo)
+
+    def test_utf8_bom_is_removed(self, tmp_path, remote_repo):
+        commit = self._commit(remote_repo, b"\xef\xbb\xbfdef a():\n    return 1\n")
+        manager = LocalRepoManager(tmp_path / "cache", remote_repo)
+        source = manager.read_file_at_commit("owner/repo", commit, "mod.py")
+        assert source == "def a():\n    return 1\n"
+
+    def test_crlf_diff_applies_to_the_source_read_from_git(self, tmp_path, remote_repo):
+        """The real path: a diff git produced for a CRLF file, applied to
+        what read_file_at_commit returns for that file."""
+        base = self._commit(remote_repo, b"def f():\r\n    return 1\r\n\r\n\r\ndef g():\r\n    return 2\r\n")
+        self._commit(remote_repo, b"def f():\r\n    return 1\r\n\r\n\r\ndef g():\r\n    return 3\r\n")
+        patch = subprocess.run(
+            ["git", "diff", base, "HEAD"], cwd=remote_repo,
+            check=True, capture_output=True, timeout=30,
+        ).stdout.decode()
+        assert "\r" in patch
+
+        manager = LocalRepoManager(tmp_path / "cache", remote_repo)
+        source = manager.read_file_at_commit("owner/repo", base, "mod.py")
+
+        assert reconstruct_post_patch_source(source, patch, "mod.py") == (
+            "def f():\n    return 1\n\n\ndef g():\n    return 3\n"
+        )
 
 
 @pytest.fixture
