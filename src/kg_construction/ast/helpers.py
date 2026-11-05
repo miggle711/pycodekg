@@ -49,8 +49,7 @@ def _is_test_file(filepath: str) -> bool:
     return (
         name.startswith('test_') or
         name.endswith('_test.py') or
-        'tests' in parts or
-        'test' in parts
+        'tests' in parts
     )
 
 
