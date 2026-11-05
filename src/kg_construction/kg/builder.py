@@ -32,6 +32,7 @@ Module layout (post-split):
 
 import ast
 import json
+import logging
 import re
 import sys
 import tempfile
@@ -81,6 +82,8 @@ from kg_construction.ast.helpers import (
 )
 from kg_construction.kg.repo_manager import RepoManager
 from kg_construction.kg import type_inference
+
+logger = logging.getLogger(__name__)
 
 
 # Directories to skip during repo traversal — typically non-source content
@@ -959,6 +962,19 @@ def _parse_file(args: Tuple[str, str, str]) -> Optional[Dict]:
 # Parallel driver and second-pass resolution
 # ---------------------------------------------------------------------------
 
+
+def _parse_file_or_skip(args: Tuple[str, str, str]) -> Optional[Dict]:
+    """_parse_file, skipping a file nested too deeply to walk. An expression
+    of about a thousand chained operators or calls exceeds Python's recursion
+    limit, and left uncaught that would abort the whole build.
+    """
+    try:
+        return _parse_file(args)
+    except RecursionError:
+        logger.warning("Skipping %s: too deeply nested to parse", args[1])
+        return None
+
+
 class RepoASTParser:
     """Parses all Python files in a repo directory and assembles a structural KG.
 
@@ -1164,7 +1180,7 @@ class RepoASTParser:
         builds of the same repo+commit.
         """
         with ProcessPoolExecutor(max_workers=self.max_workers) as executor:
-            results = list(executor.map(_parse_file, file_args))
+            results = list(executor.map(_parse_file_or_skip, file_args))
         return [r for r in results if r]
 
     def _aggregate_and_index(self, results: List[Dict]) -> Tuple[List[Dict], List[Dict], Dict]:
