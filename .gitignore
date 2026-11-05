@@ -10,6 +10,7 @@ scripts/*
 !scripts/build_kgs_for_instances.py
 !scripts/build_kg_prompts.py
 !scripts/aggregate_build_times.py
+!scripts/kg_diff.py
 
 # kg_output
 kg_output/
