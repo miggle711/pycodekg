@@ -26,17 +26,18 @@ MODEL_ONLY = """
 IMPORTS_M = "\n    import models as m\n"
 
 
-def _outer_save_edges(tmp_path: Path, source: str):
-    """(class of the target, confidence, via_closure) for outer's calls to save."""
+def _save_edges(tmp_path: Path, source: str, caller: str = "outer"):
+    """(class of the target or "<module>" for a plain function, confidence,
+    via_closure) for the caller's calls to save."""
     (tmp_path / "m.py").write_text(source)
     kg = RepoASTParser(max_workers=1).parse_repo("test/repo", tmp_path)
     nodes = {n["id"]: n for n in kg["nodes"]}
     owner = {e["target"]: nodes[e["source"]]["label"]
              for e in kg["edges"] if e["relation"] == "contains" and nodes[e["source"]]["type"] == "class"}
     return sorted(
-        (owner[e["target"]], e["metadata"]["confidence"], bool(e["metadata"].get("via_closure")))
+        (owner.get(e["target"], "<module>"), e["metadata"]["confidence"], bool(e["metadata"].get("via_closure")))
         for e in kg["edges"]
-        if e["relation"] == "calls" and nodes[e["source"]]["label"] == "outer"
+        if e["relation"] == "calls" and nodes[e["source"]]["label"] == caller
         and nodes[e["target"]]["label"] == "save"
     )
 
@@ -129,4 +130,72 @@ def _outer_save_edges(tmp_path: Path, source: str):
         "parameter_hides_import", "nested_def_hides_import", "global_declaration", "global_then_assigned",
         "match_capture"])
 def test_closure_call_uses_the_closures_own_types(tmp_path, classes, body, expected):
-    assert _outer_save_edges(tmp_path, textwrap.dedent(classes) + textwrap.dedent(body)) == expected
+    assert _save_edges(tmp_path, textwrap.dedent(classes) + textwrap.dedent(body)) == expected
+
+
+MODELS_PY = "def save(): ...\n"
+
+
+@pytest.mark.parametrize("body, caller, expected", [
+    # The closure's own node sees the function around it, not only itself.
+    ("""
+        import models as m
+        def outer():
+            def m(): ...
+            def cb():
+                m.save()
+    """, "cb", []),
+    ("""
+        import models as m
+        def outer(m):
+            def cb():
+                m.save()
+    """, "cb", []),
+    ("""
+        import models as m
+        def outer():
+            m = Model()
+            def cb():
+                m.save()
+    """, "cb", [("Model", "qualified", False)]),
+    # An import in the closure hides outer's variable, in the closure and in outer's copy.
+    ("""
+        def outer():
+            m = Model()
+            def cb():
+                import models as m
+                m.save()
+    """, "cb", [("<module>", "qualified", False)]),
+    ("""
+        def outer():
+            m = Model()
+            def cb():
+                import models as m
+                m.save()
+    """, "outer", [("<module>", "qualified", True)]),
+    # A comprehension variable or lambda parameter is its own name.
+    ("""
+        def outer(items):
+            m = Model()
+            return [m.save() for m in items]
+    """, "outer", [("Model", "name_only", False)]),
+    ("""
+        def outer():
+            m = Model()
+            return lambda m: m.save()
+    """, "outer", [("Model", "name_only", False)]),
+    # The first iterable is evaluated in the enclosing scope, so it is still outer's m.
+    ("""
+        def outer():
+            m = Model()
+            return [x for x in m.save()]
+    """, "outer", [("Model", "qualified", False)]),
+], ids=["closure_node_nested_def_hides_import", "closure_node_param_hides_import",
+        "closure_node_sees_outer_type", "closure_import_hides_outer_variable",
+        "outer_copy_of_closure_import", "comprehension_receiver", "lambda_receiver",
+        "first_iterable_is_enclosing_scope"])
+def test_a_name_resolves_in_the_scope_that_binds_it(tmp_path, body, caller, expected):
+    if "import models" in body:
+        (tmp_path / "models.py").write_text(MODELS_PY)
+    source = textwrap.dedent(MODEL_ONLY) + textwrap.dedent(body)
+    assert _save_edges(tmp_path, source, caller) == expected

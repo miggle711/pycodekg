@@ -74,6 +74,7 @@ from kg_construction.ast.helpers import (
     _collect_file_level_info,
     ImportScopes,
     call_scope_chains,
+    call_expression_scope_names,
     scope_import_map_over,
     LocalTypeScopes,
     assign_qualnames,
@@ -457,6 +458,9 @@ def _parse_file(args: Tuple[str, str, str]) -> Optional[Dict]:
     # imports, plus those of the functions around it. Its own imports apply
     # from the line they are on (see ImportScopes).
     enclosing_imports = import_map
+    # The functions being emitted, outermost first (the innermost is the one
+    # whose edges are being built).
+    enclosing_funcs: List[ast.AST] = []
     # Unique qualname per def in this file (see assign_qualnames); node IDs
     # and metadata['qualname'] are derived from it rather than rebuilt from
     # nesting so two same-named defs can't share an ID.
@@ -552,7 +556,11 @@ def _parse_file(args: Tuple[str, str, str]) -> Optional[Dict]:
         own_calls, closure_calls = iter_calls_by_scope(func_node)
         scopes = ImportScopes(enclosing_imports)
         chains = call_scope_chains(func_node)
+        expression_names = call_expression_scope_names(func_node)
         local_scopes = LocalTypeScopes(func_node, local_types)
+        # The functions this one is nested in: a closure's own pass has to see
+        # their variables, not only the ones in the closure.
+        outer_funcs = [f for f in enclosing_funcs if f is not func_node]
         # Own scope first, so a direct call takes the dedup slot before the
         # same call found inside a closure.
         tagged_calls = [(c, False) for c in own_calls] + [(c, True) for c in closure_calls]
@@ -576,7 +584,11 @@ def _parse_file(args: Tuple[str, str, str]) -> Optional[Dict]:
             import_resolved: Optional[str] = None
             is_super_call = receiver == 'super()'
             chain = chains[id(call)]
-            receiver_is_local, local_type = local_scopes.lookup(receiver, chain) if receiver else (False, None)
+            receiver_is_local, local_type = (
+                local_scopes.lookup(receiver, outer_funcs + chain) if receiver else (False, None))
+            if receiver in expression_names.get(id(call), ()):
+                # A lambda parameter or comprehension variable: its own name.
+                receiver_is_local, local_type = True, None
 
             if is_super_call:
                 pass  # resolved in pass 2 via the caller's own inherits chain
@@ -945,9 +957,11 @@ def _parse_file(args: Tuple[str, str, str]) -> Optional[Dict]:
         outer_imports, outer_enclosing = import_map, enclosing_imports
         enclosing_imports = outer_imports
         import_map = scope_import_map_over(outer_imports, func_node)
+        enclosing_funcs.append(func_node)
         try:
             _emit_function_body(func_node, *args, **kwargs)
         finally:
+            enclosing_funcs.pop()
             import_map, enclosing_imports = outer_imports, outer_enclosing
 
     # Emit class, method, and top-level function nodes (including ones

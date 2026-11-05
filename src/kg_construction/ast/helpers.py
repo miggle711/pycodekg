@@ -24,7 +24,7 @@ Organised into sections (in file order):
 import ast
 import hashlib
 from pathlib import Path
-from typing import List, Dict, Set, Optional, Tuple, Union
+from typing import List, Dict, FrozenSet, Set, Optional, Tuple, Union
 
 
 # ---------------------------------------------------------------------------
@@ -217,6 +217,51 @@ def call_scope_chains(
     return chains
 
 
+def _lambda_params(args: ast.arguments) -> Set[str]:
+    names = {a.arg for a in args.posonlyargs + args.args + args.kwonlyargs}
+    names |= {a.arg for a in (args.vararg, args.kwarg) if a is not None}
+    return names
+
+
+def call_expression_scope_names(
+    func_node: Union[ast.FunctionDef, ast.AsyncFunctionDef],
+) -> Dict[int, FrozenSet[str]]:
+    """For a Call inside a lambda or a comprehension, keyed by id(call): the
+    names that expression's own scope binds (a lambda's parameters, a
+    comprehension's loop variables). Calls with none are left out. A name in
+    here is not the function's variable of the same name, whatever type that
+    has. A comprehension's first iterable is evaluated in the enclosing scope,
+    so it does not see the loop variables."""
+    hidden: Dict[int, FrozenSet[str]] = {}
+    none: FrozenSet[str] = frozenset()
+    stack: List[Tuple[ast.AST, FrozenSet[str]]] = [(func_node, none)]
+    while stack:
+        node, names = stack.pop()
+        if isinstance(node, ast.Call) and names:
+            hidden[id(node)] = names
+        if node is not func_node and isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            kids = [(expr, names) for expr in _outer_scope_exprs(node)]
+            kids += [(stmt, none) for stmt in node.body]
+        elif isinstance(node, ast.Lambda):
+            defaults = node.args.defaults + [d for d in node.args.kw_defaults if d is not None]
+            kids = [(d, names) for d in defaults]
+            kids.append((node.body, names | _lambda_params(node.args)))
+        elif isinstance(node, _COMPREHENSIONS):
+            inner = names | {n.id for gen in node.generators for n in ast.walk(gen.target)
+                             if isinstance(n, ast.Name)}
+            kids = []
+            for i, gen in enumerate(node.generators):
+                kids.append((gen.iter, names if i == 0 else inner))
+                kids += [(cond, inner) for cond in gen.ifs]
+            kids += [(expr, inner) for expr in
+                     (getattr(node, 'elt', None), getattr(node, 'key', None), getattr(node, 'value', None))
+                     if expr is not None]
+        else:
+            kids = [(child, names) for child in ast.iter_child_nodes(node)]
+        stack.extend(reversed(kids))
+    return hidden
+
+
 _COMPREHENSIONS = (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)
 
 
@@ -288,6 +333,7 @@ class LocalTypeScopes:
     def __init__(self, outer_func: ast.AST, outer_types: Dict[str, str]):
         self._types: Dict[int, Dict[str, str]] = {id(outer_func): outer_types}
         self._names: Dict[int, Tuple[Set[str], Set[str], Set[str]]] = {}
+        self._imported: Dict[int, Set[str]] = {}
 
     def lookup(self, receiver: str, chain: List[ast.AST]) -> Tuple[bool, Optional[str]]:
         """(is the receiver a local of a function around the call, its type)."""
@@ -309,7 +355,18 @@ class LocalTypeScopes:
                 if receiver in globals_:
                     return False, None  # a module level name: no enclosing function owns it
                 # nonlocal: an enclosing function owns it, keep looking outward
+            elif receiver in self._imports_of(func):
+                # A function that imports the name has its own binding of it,
+                # so an outer variable of that name is not what the call uses.
+                # It is not a local with a type: ImportScopes resolves it.
+                return False, None
         return False, None
+
+    def _imports_of(self, func: ast.AST) -> Set[str]:
+        imported = self._imported.get(id(func))
+        if imported is None:
+            imported = self._imported[id(func)] = set(scope_import_bindings(func))
+        return imported
 
 
 def iter_calls_by_scope(
