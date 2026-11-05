@@ -15,7 +15,7 @@ Each class covers one finding from the correctness audit:
 * TestPytestDoesNotCollectDomainClasses: classes named Test* that are not
   tests.
 * TestFrameworkTestPackageIsNotATestFile: a package directory named `test`
-  (django/test/) was typed as a test file.
+  below the root (django/test/) was typed as a test file.
 """
 
 import difflib
@@ -267,6 +267,8 @@ class TestFrameworkTestPackageIsNotATestFile:
         ("tests/helpers.py", True),
         ("pkg/tests/helpers.py", True),
         ("test/test_a.py", True),
+        ("test/conftest.py", True),
+        ("test/helpers.py", True),
         ("pkg/a_test.py", True),
     ])
     def test_is_test_file(self, path, expected):
