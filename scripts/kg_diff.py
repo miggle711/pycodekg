@@ -4,7 +4,8 @@
 
 Builds a KG from the same source tree with the code at two git refs and
 compares them: per relation edge counts, how many edges were removed and
-added, and a labelled sample of each. Unit tests cover synthetic cases; this
+added, a labelled sample of each, and the nodes whose type changed (for
+example `test_file` to `file`). Unit tests cover synthetic cases; this
 catches what a change does to real code (false links going away, edges being
 retargeted, new edges appearing), so run it for any PR that changes KG
 contents and paste the table into the PR description.
@@ -23,9 +24,10 @@ matches the clone whose directory ends in `__requests`. Their HEAD is
 exported once and used for both builds, so the only difference between the
 two KGs is the code under test. Django takes a few minutes per build.
 
-Edges are compared by (relation, source id, target id). Node IDs are
-deterministic hashes of the qualified name, so a difference is a real change
-and not ordering noise.
+Edges are compared by (relation, source id, target id), and nodes by id. Node
+IDs are deterministic hashes of the qualified name, so a difference is a real
+change and not ordering noise. A node that keeps its id but changes type is
+invisible to the edge comparison, so it is reported in its own table.
 
 If the KGs differ but SCHEMA_VERSION is the same at both refs, a reminder is
 printed: cached KGs from before the change would otherwise be loaded as if
@@ -85,7 +87,7 @@ def dump_kg(name: str, source_dir: str, out: str):
     from kg_construction.kg.builder import RepoKGBuilder
 
     kg = RepoKGBuilder().build_from_dir(name, Path(source_dir))
-    nodes = {n["id"]: [n["type"], n["label"]] for n in kg["nodes"]}
+    nodes = {n["id"]: [n["type"], n["label"], (n.get("metadata") or {}).get("path", "")] for n in kg["nodes"]}
     edges = [[e["relation"], e["source"], e["target"], (e.get("metadata") or {}).get("confidence", "")]
              for e in kg["edges"]]
     Path(out).write_text(json.dumps({"nodes": nodes, "edges": edges}))
@@ -98,7 +100,7 @@ def _build(src: Path, name: str, source_dir: Path, out: Path):
 
 
 def compare(name: str, before: dict, after: dict, sample: int):
-    """Return (table rows, detail lines, differs) for one repository."""
+    """Return (edge table rows, node type rows, detail lines, differs) for one repository."""
     eb = {(r, s, t) for r, s, t, _ in before["edges"]}
     ea = {(r, s, t) for r, s, t, _ in after["edges"]}
     removed, added = eb - ea, ea - eb
@@ -116,14 +118,22 @@ def compare(name: str, before: dict, after: dict, sample: int):
 
     nodes = {**before["nodes"], **after["nodes"]}
     label = lambda i: f"{nodes[i][1]} ({nodes[i][0]})" if i in nodes else i
+    changed_type = sorted((before["nodes"][i][0], after["nodes"][i][0], i)
+                          for i in before["nodes"].keys() & after["nodes"].keys()
+                          if before["nodes"][i][0] != after["nodes"][i][0])
+    type_rows = [(name if k == 0 else "", f"{old} -> {new}", n)
+                 for k, ((old, new), n) in enumerate(sorted(Counter((o, n) for o, n, _ in changed_type).items()))]
+
     detail = [f"{name}: nodes {len(before['nodes'])} -> {len(after['nodes'])}, "
               f"edges {len(before['edges'])} -> {len(after['edges'])}, "
               f"confidence changed on {len(raised)} kept edges"]
     for title, es in (("removed", removed), ("added", added)):
         for rel, s, t in sorted(es)[:sample]:
             detail.append(f"  {title}: {rel}: {label(s)} -> {label(t)}")
-    differs = bool(removed or added or raised or set(before["nodes"]) != set(after["nodes"]))
-    return rows, detail, differs
+    for old, new, i in changed_type[:sample]:
+        detail.append(f"  type changed: {old} -> {new}: {after['nodes'][i][2] or after['nodes'][i][1]}")
+    differs = bool(removed or added or raised or changed_type or set(before["nodes"]) != set(after["nodes"]))
+    return rows, type_rows, detail, differs
 
 
 def main():
@@ -149,21 +159,26 @@ def main():
             _export(["-C", str(REPO_ROOT)], ref, tmp / side, "src")
             srcs[side] = tmp / side / "src"
 
-        rows, details, any_diff = [], [], False
+        rows, type_rows, details, any_diff = [], [], [], False
         for short in args.repos:
             clone = _find_clone(args.cache_dir, short)
             source = tmp / f"source_{short}"
             _export(["--git-dir", str(clone)], "HEAD", source)
             print(f"building {short} ...", flush=True)
             kgs = {side: _build(srcs[side], short, source, tmp / f"{side}_{short}.json") for side in refs}
-            r, d, differs = compare(short, kgs["before"], kgs["after"], args.sample)
+            r, t, d, differs = compare(short, kgs["before"], kgs["after"], args.sample)
             rows += r or [(short, "(no edge differences)", "", "", "", "")]
+            type_rows += t
             details += d
             any_diff |= differs
 
         print("\n| Repo | relation | before | after | removed | added |\n|---|---|---|---|---|---|")
         for row in rows:
             print("| " + " | ".join(str(c) for c in row) + " |")
+        if type_rows:
+            print("\n| Repo | node type change | nodes |\n|---|---|---|")
+            for row in type_rows:
+                print("| " + " | ".join(str(c) for c in row) + " |")
         print("\n" + "\n".join(details))
 
         versions = {side: _schema_version(srcs[side]) for side in refs}
