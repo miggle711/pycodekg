@@ -600,6 +600,63 @@ class TestTestCallersAreExcluded:
         assert [c["name"] for c in result["context"]["callers"]] == ["request"]
 
 
+class TestTestCalleesAreExcluded:
+    """A name match can link a production call to a fake or helper in a test
+    file. Rendered as a callee, that would show the model test code through
+    the same one-sided route as callers (testgeneval#87).
+    """
+
+    def _serialize(self, callee_nodes):
+        seed_node = {
+            "id": "seed", "label": "send", "type": "method",
+            "metadata": {"filepath": "requests/sessions.py"},
+        }
+        edges = [
+            {"source": seed_node["id"], "target": n["id"], "relation": "calls"}
+            for n in callee_nodes
+        ]
+        return LLMSerializer().serialize(
+            {"seeds": [seed_node], "context_nodes": callee_nodes, "edges": edges, "test_nodes": []}
+        )
+
+    def test_test_function_callee_is_excluded(self):
+        test_callee = {
+            "id": "t", "label": "test_send", "type": "test_function",
+            "metadata": {"filepath": "tests/test_sessions.py"},
+        }
+        result = self._serialize([test_callee])
+
+        assert result["context"]["callees"] == []
+
+    def test_non_test_named_callee_in_a_test_file_is_excluded(self):
+        # e.g. a fake's read() that a production `.read()` call matched by name.
+        fake = {
+            "id": "f", "label": "read", "type": "method",
+            "metadata": {"filepath": "tests/test_sessions.py"},
+        }
+        real_callee = {
+            "id": "r", "label": "merge_setting", "type": "function",
+            "metadata": {"filepath": "requests/sessions.py"},
+        }
+        result = self._serialize([fake, real_callee])
+
+        assert [c["name"] for c in result["context"]["callees"]] == ["merge_setting"]
+
+    def test_test_callees_do_not_use_up_the_cap(self):
+        test_callees = [
+            {"id": f"f{i}", "label": f"read_{i}", "type": "method",
+             "metadata": {"filepath": "tests/test_sessions.py"}}
+            for i in range(10)
+        ]
+        real_callee = {
+            "id": "r", "label": "merge_setting", "type": "function",
+            "metadata": {"filepath": "requests/sessions.py"},
+        }
+        result = self._serialize(test_callees + [real_callee])
+
+        assert [c["name"] for c in result["context"]["callees"]] == ["merge_setting"]
+
+
 class TestContextItemsAreCapped:
     """A high fan-in/fan-out seed (e.g. sklearn's check_array, called from
     hundreds of sites) produced uncapped callers/callees/sibling_methods

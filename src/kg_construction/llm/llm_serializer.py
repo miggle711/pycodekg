@@ -21,8 +21,9 @@ from dataclasses import dataclass
 from kg_construction.ast.helpers import _is_test_file
 
 
-def _is_test_caller(node: Dict) -> bool:
-    """True if a caller node is test code, which must not reach the prompt.
+def _is_test_code(node: Dict) -> bool:
+    """True if a caller or callee node is test code, which must not reach the
+    prompt.
 
     Full-setting generation is a from-scratch task for both arms, so existing
     tests (and helpers defined in test files) are never shown to the model.
@@ -226,13 +227,17 @@ class LLMSerializer:
             # show the model existing tests, some from the very file it is
             # asked to write (testgeneval#87).
             if tgt_id in seed_ids and relation == "calls":
-                if _is_test_caller(src_node):
+                if _is_test_code(src_node):
                     continue
                 if len(callers) < MAX_CONTEXT_ITEMS_PER_CATEGORY:
                     callers.append(self._node_to_snippet(src_node))
 
-            # Edges from seed = callees
+            # Edges from seed = callees. Test code is skipped here too: a
+            # name match can link a production call to a fake or helper in a
+            # test file, which would show the model that file's source.
             elif src_id in seed_ids and relation == "calls":
+                if _is_test_code(tgt_node):
+                    continue
                 if len(callees) < MAX_CONTEXT_ITEMS_PER_CATEGORY:
                     callees.append(self._node_to_snippet(tgt_node))
 
