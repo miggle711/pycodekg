@@ -1246,10 +1246,15 @@ class RepoASTParser:
                     fp = node.get('metadata', {}).get('filepath')
                     if fp and ntype in ('function', 'method', 'class', 'test_function'):
                         mod = fp.removesuffix('.py').replace('/', '.')
-                        qualified_to_ids[f"{mod}.{label}"].append(node['id'])
                         parent = node.get('metadata', {}).get('class')
                         if parent:
+                            # A method is only reachable as mod.Class.name;
+                            # indexing it as mod.name too let a bare call or a
+                            # call on the module (`from vec import cross`,
+                            # `vec.cross()`) reach a method of that name (#203).
                             qualified_to_ids[f"{mod}.{parent}.{label}"].append(node['id'])
+                        else:
+                            qualified_to_ids[f"{mod}.{label}"].append(node['id'])
 
         nodes_by_id: Dict[str, Dict] = {n['id']: n for n in all_nodes}
         all_edges: List[Dict] = [edge for result in results for edge in result['edges']]
