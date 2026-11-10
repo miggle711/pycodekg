@@ -159,7 +159,11 @@ MAX_FILE_LINES = 20000
 #    name uses its own type (or none), so the outer function's closure edge no
 #    longer points at the wrong class, and a type assigned inside the closure
 #    now reaches the outer function's copy of the edge.
-SCHEMA_VERSION = 9
+# 10: an attribute call (`v.cross(w)`) is no longer resolved through an
+#    import of its method name (`from vec import cross`), so it stops being
+#    linked to that imported function. A call on an import-bound receiver
+#    (`json.loads`) is unchanged.
+SCHEMA_VERSION = 10
 
 
 def _same_commit(a: Optional[str], b: Optional[str]) -> bool:
@@ -609,8 +613,10 @@ def _parse_file(args: Tuple[str, str, str]) -> Optional[Dict]:
                 if bound is not None:
                     # e.g. json.loads where 'json' was imported
                     import_resolved = f"{bound}.{callee}"
-                else:
-                    # Bare-name call: foo() where foo was imported
+                elif receiver is None:
+                    # Bare-name call: foo() where foo was imported. Not for
+                    # an attribute call: v.foo() is a method call whatever v
+                    # is, not a call of the imported function foo.
                     import_resolved = scopes.lookup(callee, call, chain)
 
             hints_key = (func_id, callee, receiver, import_resolved, local_type_hint)
