@@ -612,6 +612,12 @@ def _parse_file(args: Tuple[str, str, str]) -> Optional[Dict]:
             if receiver in expression_names.get(id(call), ()):
                 # A lambda parameter or comprehension variable: its own name.
                 receiver_is_local, local_type = True, None
+            elif (receiver_is_local and local_type is None
+                  and scopes.lookup_all(receiver, call, outer_funcs + chain)):
+                # Bound locally somewhere in the function, but an import can
+                # be what reaches this call (`except ImportError: m = None`,
+                # `if m is None: import a as m`): resolve through it.
+                receiver_is_local = False
 
             if is_super_call:
                 pass  # resolved in pass 2 via the caller's own inherits chain

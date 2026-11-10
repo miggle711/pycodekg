@@ -149,3 +149,81 @@ def test_depends_on_covers_every_branch(tmp_path):
 ], ids=["try_import_or_none", "parameter_default_then_import"])
 def test_a_name_both_imported_and_assigned_keeps_its_import(tmp_path, source):
     assert _run_targets(tmp_path, source) == [("f", "a.py")]
+
+
+@pytest.mark.parametrize("source, expected", [
+    # An if with no else keeps the binding from before it.
+    ("""
+        import sys
+        import a as c
+        if sys.platform == "win32":
+            import b as c
+        def f():
+            c.run()
+    """, [("f", "a.py"), ("f", "b.py")]),
+    ("""
+        import sys
+        def f():
+            import a as c
+            if sys.platform == "win32":
+                import b as c
+            c.run()
+    """, [("f", "a.py"), ("f", "b.py")]),
+    # Nested if/else: every branch of both.
+    ("""
+        import sys
+        def f():
+            if sys.platform == "win32":
+                if sys.maxsize > 2:
+                    import a as c
+                else:
+                    import b as c
+            else:
+                import d as c
+            c.run()
+    """, [("f", "a.py"), ("f", "b.py"), ("f", "d.py")]),
+    # In the else branch, before its own import, the if branch's import has
+    # not run.
+    ("""
+        import sys
+        def f():
+            if sys.platform == "win32":
+                import a as c
+            else:
+                c.run()
+                import b as c
+    """, []),
+    # A branch that returns does not reach the code after the if.
+    ("""
+        import sys
+        def f():
+            import a as c
+            if sys.platform == "win32":
+                import b as c
+                return
+            c.run()
+    """, [("f", "a.py")]),
+], ids=["module_if_without_else", "function_if_without_else", "nested_if_else",
+        "else_before_its_import", "returning_branch"])
+def test_bindings_follow_every_path_to_the_call(tmp_path, source, expected):
+    assert _run_targets(tmp_path, source) == expected
+
+
+@pytest.mark.parametrize("source", [
+    # The parameter is what m.run() uses; the import comes later.
+    """
+        import b as m
+        def f(m=None):
+            m.run()
+            import a as m
+    """,
+    # m is None by the time of the call.
+    """
+        def f():
+            import a as m
+            m = None
+            m.run()
+    """,
+], ids=["parameter_before_later_import", "assigned_after_import"])
+def test_a_local_binding_at_the_call_is_not_an_import(tmp_path, source):
+    assert _run_targets(tmp_path, source) == []

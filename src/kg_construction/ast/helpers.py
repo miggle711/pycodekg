@@ -360,12 +360,6 @@ class LocalTypeScopes:
                 if types is None:
                     types = self._types[id(func)] = _collect_local_types(func)
                 if receiver in bound:
-                    if receiver not in types and receiver in self._imports_of(func):
-                        # Both imported and assigned in this function
-                        # (`try: import m` / `except ImportError: m = None`):
-                        # the import is what a call normally goes through, so
-                        # leave it to ImportScopes.
-                        return False, None
                     return True, types.get(receiver)
                 if receiver in types:
                     # `global x` / `nonlocal x` then `x = SomeClass()`: not a
@@ -1485,17 +1479,12 @@ class _ScopeImport(NamedTuple):
     type_only: in the body of `if TYPE_CHECKING:` (or the `else` of `if not
         TYPE_CHECKING:`): it never runs, so it must not replace a name the
         code really binds.
-    branch: (if statement, where that statement ends) when the import is in a
-        branch of an `if`/`elif`/`else` with more than one branch: after the
-        statement, a name bound in several of its branches can hold any of
-        those imports.
     shadowed: names the `try` body around this `except` handler imports.
         The handler's import of one of them is the fallback for when the
         body's failed; the body's is the one that normally runs.
     """
     stmt: ast.AST
     type_only: bool
-    branch: Optional[Tuple[int, Tuple[int, int]]]
     shadowed: FrozenSet[str]
 
     def bindings(self) -> List[Tuple[str, str]]:
@@ -1508,64 +1497,40 @@ _NO_NAMES: FrozenSet[str] = frozenset()
 
 
 def _iter_scope_imports_flagged(node: ast.AST, type_only: bool = False,
-                                branch=None, shadowed: FrozenSet[str] = _NO_NAMES):
+                                shadowed: FrozenSet[str] = _NO_NAMES):
     """Yield a _ScopeImport for each import in `node`'s own scope, in source
     order."""
     for child in ast.iter_child_nodes(node):
-        yield from _flagged_scope_imports(child, type_only, branch, shadowed)
+        yield from _flagged_scope_imports(child, type_only, shadowed)
 
 
-def _flagged_scope_imports(child: ast.AST, type_only: bool, branch, shadowed: FrozenSet[str]):
+def _flagged_scope_imports(child: ast.AST, type_only: bool, shadowed: FrozenSet[str]):
     if isinstance(child, (ast.Import, ast.ImportFrom)):
-        yield _ScopeImport(child, type_only, branch, shadowed)
+        yield _ScopeImport(child, type_only, shadowed)
     elif isinstance(child, _DEF_TYPES):
         return
     elif isinstance(child, ast.If) and _type_only_branch(child.test):
         which = _type_only_branch(child.test)
         for stmt in child.body:
-            yield from _flagged_scope_imports(stmt, type_only or which == 'body', branch, shadowed)
+            yield from _flagged_scope_imports(stmt, type_only or which == 'body', shadowed)
         for stmt in child.orelse:
-            yield from _flagged_scope_imports(stmt, type_only or which == 'orelse', branch, shadowed)
-    elif isinstance(child, ast.If):
-        yield from _flagged_if_imports(child, type_only, branch, shadowed)
+            yield from _flagged_scope_imports(stmt, type_only or which == 'orelse', shadowed)
     elif isinstance(child, _TRY_TYPES):
         body_names = frozenset(
             local
             for stmt in child.body
-            for found in _flagged_scope_imports(stmt, type_only, branch, shadowed)
+            for found in _flagged_scope_imports(stmt, type_only, shadowed)
             if not found.type_only
             for local, _ in found.bindings()
         )
         for stmt in child.body:
-            yield from _flagged_scope_imports(stmt, type_only, branch, shadowed)
+            yield from _flagged_scope_imports(stmt, type_only, shadowed)
         for handler in child.handlers:
-            yield from _iter_scope_imports_flagged(handler, type_only, branch, shadowed | body_names)
+            yield from _iter_scope_imports_flagged(handler, type_only, shadowed | body_names)
         for stmt in child.orelse + child.finalbody:
-            yield from _flagged_scope_imports(stmt, type_only, branch, shadowed)
+            yield from _flagged_scope_imports(stmt, type_only, shadowed)
     elif isinstance(child, _SCOPE_TRANSPARENT):
-        yield from _iter_scope_imports_flagged(child, type_only, branch, shadowed)
-
-
-def _flagged_if_imports(node: ast.If, type_only: bool, branch, shadowed: FrozenSet[str],
-                        chain_branch=None):
-    """The imports in an `if` statement. An `elif` is an `if` nested as the
-    only statement of its parent's `else`, so the whole chain shares one
-    branch tag, ending where the outermost `if` ends."""
-    if not node.orelse:
-        # A single branch: no alternative to the binding before it.
-        for stmt in node.body:
-            yield from _flagged_scope_imports(stmt, type_only, branch, shadowed)
-        return
-    tag = chain_branch or (id(node), (node.end_lineno, node.end_col_offset))
-    for stmt in node.body:
-        yield from _flagged_scope_imports(stmt, type_only, tag, shadowed)
-    is_elif = (len(node.orelse) == 1 and isinstance(node.orelse[0], ast.If)
-               and not _type_only_branch(node.orelse[0].test))
-    if is_elif:
-        yield from _flagged_if_imports(node.orelse[0], type_only, branch, shadowed, chain_branch=tag)
-    else:
-        for stmt in node.orelse:
-            yield from _flagged_scope_imports(stmt, type_only, tag, shadowed)
+        yield from _iter_scope_imports_flagged(child, type_only, shadowed)
 
 
 def iter_scope_imports(node: ast.AST):
@@ -1621,51 +1586,229 @@ def scope_import_map_over(outer: Dict[str, str], node: ast.AST) -> Dict[str, str
     return {**type_only, **outer, **runtime}
 
 
-ImportBinding = Tuple[Tuple[int, int], str, Optional[Tuple[int, Tuple[int, int]]]]
-
-
-def scope_import_bindings(node: ast.AST) -> Dict[str, List[ImportBinding]]:
-    """{local name: [((line, col), qualified name, branch), ...]} in source
-    order for the runtime imports in `node`'s own scope (see _ScopeImport for
-    branch). Type only imports are left out: they never run, so a call can
-    not be going through them. So is an `except` handler's import of a name
-    its `try` body imports."""
-    bindings: Dict[str, List[ImportBinding]] = {}
+def scope_import_bindings(node: ast.AST) -> Dict[str, List[Tuple[Tuple[int, int], str]]]:
+    """{local name: [((line, col), qualified name), ...]} in source order for
+    the runtime imports in `node`'s own scope. Type only imports are left
+    out: they never run, so a call can not be going through them. So is an
+    `except` handler's import of a name its `try` body imports."""
+    bindings: Dict[str, List[Tuple[Tuple[int, int], str]]] = {}
     for found in _iter_scope_imports_flagged(node):
         if found.type_only:
             continue
         position = (found.stmt.lineno, found.stmt.col_offset)
         for local, qualified in found.bindings():
-            bindings.setdefault(local, []).append((position, qualified, found.branch))
+            bindings.setdefault(local, []).append((position, qualified))
     for hits in bindings.values():
         hits.sort(key=lambda hit: hit[0])
     return bindings
 
 
-def _branch_alternatives(hits: List[ImportBinding]) -> List[str]:
-    """The qualified names the last binding in `hits` stands for: just its
-    own, or, when it is in a branch of an `if`/`else`, every import of the
-    name in that statement's branches, in source order."""
-    last = hits[-1]
-    if last[2] is None:
-        return [last[1]]
-    names: List[str] = []
-    for _, qualified, branch in hits:
-        if branch == last[2] and qualified not in names:
-            names.append(qualified)
-    return names
+# A name bound to something other than an import (a parameter, an assignment,
+# a def): what ScopeFlow records instead of a module path.
+_LOCAL = None
+
+_FlowState = Dict[str, Tuple[Optional[str], ...]]
+
+
+def _merge_states(a: Optional[_FlowState], b: Optional[_FlowState]) -> Optional[_FlowState]:
+    """The state after two paths join. None is a path that does not get there
+    (it returned or raised). A name bound on only one path keeps that path's
+    values: on the other it is unbound, which binds nothing."""
+    if a is None:
+        return b
+    if b is None:
+        return a
+    merged = dict(a)
+    for name, values in b.items():
+        current = merged.get(name, ())
+        merged[name] = current + tuple(v for v in values if v not in current)
+    return merged
+
+
+def _stored_names(node: ast.AST) -> List[str]:
+    """Names a target expression (or a walrus inside an expression) binds."""
+    return [n.id for n in ast.walk(node)
+            if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store)]
+
+
+class ScopeFlow:
+    """What each name of one scope (a function, or a module) can be bound to
+    at each point, following the paths through it: after an `if`/`elif`/
+    `else` a name can hold what any branch (or, with no `else`, the code before
+    it) bound; after a loop, what it held before or after an iteration; after
+    `try`/`except`, the `try` body's import of a name rather than an `except`
+    handler's fallback (the body's normally runs). A path that returns or
+    raises does not reach the code after it. Values are module paths for
+    imports and _LOCAL for any other binding. Nested functions and classes are
+    other scopes: only the expressions evaluated where they are defined
+    (decorators, defaults, bases) belong to this one.
+    """
+
+    def __init__(self, scope: ast.AST):
+        self._at: Dict[int, _FlowState] = {}
+        self._seen: Dict[str, Tuple[Optional[str], ...]] = {}
+        self._outer: Set[str] = set()
+        # >0 while walking a branch that never runs (`if TYPE_CHECKING:`):
+        # its nodes are mapped, but what it binds is not recorded.
+        self._never_runs = 0
+        state: _FlowState = {}
+        if isinstance(scope, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+            args = scope.args
+            for arg in args.posonlyargs + args.args + args.kwonlyargs + [args.vararg, args.kwarg]:
+                if arg is not None:
+                    state[arg.arg] = (_LOCAL,)
+        body = scope.body if isinstance(scope.body, list) else [ast.Expr(scope.body)]
+        self._record(state)
+        self.end = self._block(body, state)
+
+    def binds(self, name: str) -> bool:
+        """Whether this scope binds `name` anywhere (so it is this scope's)."""
+        return name in self._seen and name not in self._outer
+
+    def at(self, node: ast.AST) -> Optional[_FlowState]:
+        """The state just before the statement containing `node`, or None if
+        `node` is not one this scope evaluates."""
+        return self._at.get(id(node))
+
+    def all_values(self, name: str) -> Tuple[Optional[str], ...]:
+        """Everything `name` is bound to at any point (what a closure, which
+        can run at any time, may see)."""
+        return self._seen.get(name, ())
+
+    def _record(self, state: _FlowState):
+        if self._never_runs:
+            return
+        for name, values in state.items():
+            current = self._seen.get(name, ())
+            self._seen[name] = current + tuple(v for v in values if v not in current)
+
+    def _map(self, node: Optional[ast.AST], state: _FlowState):
+        if node is None:
+            return
+        for sub in ast.walk(node):
+            self._at[id(sub)] = state
+
+    def _bind(self, state: _FlowState, names, value) -> _FlowState:
+        new = dict(state)
+        for name in names:
+            new[name] = (value,)
+        self._record(new)
+        return new
+
+    def _block(self, stmts: List[ast.stmt], state: Optional[_FlowState]) -> Optional[_FlowState]:
+        for stmt in stmts:
+            if state is None:
+                # Unreachable code: still map it, with nothing bound by flow.
+                self._stmt(stmt, {})
+                continue
+            state = self._stmt(stmt, state)
+        return state
+
+    def _stmt(self, stmt: ast.stmt, state: _FlowState) -> Optional[_FlowState]:
+        if isinstance(stmt, (ast.Import, ast.ImportFrom)):
+            self._map(stmt, state)
+            new = dict(state)
+            for local, qualified in _import_bindings(stmt):
+                new[local] = (qualified,)
+            self._record(new)
+            return new
+        if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            for expr in stmt.decorator_list + stmt.args.defaults + stmt.args.kw_defaults:
+                self._map(expr, state)
+            return self._bind(state, [stmt.name], _LOCAL)
+        if isinstance(stmt, ast.ClassDef):
+            for expr in stmt.decorator_list + stmt.bases + [k.value for k in stmt.keywords]:
+                self._map(expr, state)
+            return self._bind(state, [stmt.name], _LOCAL)
+        if isinstance(stmt, (ast.Global, ast.Nonlocal)):
+            self._outer.update(stmt.names)
+            return state
+        if isinstance(stmt, (ast.Return, ast.Raise)):
+            self._map(stmt, state)
+            return None
+        if isinstance(stmt, ast.If):
+            self._map(stmt.test, state)
+            which = _type_only_branch(stmt.test)
+            if which == 'body':
+                self._never_runs += 1
+                self._block(stmt.body, dict(state))
+                self._never_runs -= 1
+                return self._block(stmt.orelse, state) if stmt.orelse else state
+            if which == 'orelse':
+                self._never_runs += 1
+                self._block(stmt.orelse, dict(state))
+                self._never_runs -= 1
+                return self._block(stmt.body, state)
+            body = self._block(stmt.body, state)
+            orelse = self._block(stmt.orelse, state) if stmt.orelse else state
+            return _merge_states(body, orelse)
+        if isinstance(stmt, (ast.For, ast.AsyncFor, ast.While)):
+            self._map(stmt.iter if isinstance(stmt, (ast.For, ast.AsyncFor)) else stmt.test, state)
+            entry = state
+            if isinstance(stmt, (ast.For, ast.AsyncFor)):
+                self._map(stmt.target, state)
+                entry = self._bind(state, _stored_names(stmt.target), _LOCAL)
+            after = _merge_states(state, self._block(stmt.body, entry))
+            return self._block(stmt.orelse, after) if stmt.orelse else after
+        if isinstance(stmt, (ast.With, ast.AsyncWith)):
+            for item in stmt.items:
+                self._map(item.context_expr, state)
+            names = [n for item in stmt.items if item.optional_vars is not None
+                     for n in _stored_names(item.optional_vars)]
+            return self._block(stmt.body, self._bind(state, names, _LOCAL))
+        if isinstance(stmt, _TRY_TYPES):
+            body = self._block(stmt.body, state)
+            body_names = {local for found in _iter_scope_imports_flagged(ast.Module(body=stmt.body, type_ignores=[]))
+                          if not found.type_only for local, _ in found.bindings()}
+            after = self._block(stmt.orelse, body) if stmt.orelse and body is not None else body
+            for handler in stmt.handlers:
+                self._map(handler.type, state)
+                entry = self._bind(state, [handler.name], _LOCAL) if handler.name else state
+                result = self._block(handler.body, entry)
+                if result is not None and after is not None:
+                    # The try body's import of a name is the one that normally
+                    # runs; the handler's binding of it is the fallback.
+                    result = {k: v for k, v in result.items() if k not in body_names}
+                after = _merge_states(after, result)
+            return self._block(stmt.finalbody, after) if stmt.finalbody else after
+        if hasattr(ast, 'Match') and isinstance(stmt, ast.Match):
+            self._map(stmt.subject, state)
+            after = state
+            for case in stmt.cases:
+                captured = [n.name for n in ast.walk(case.pattern)
+                            if isinstance(getattr(n, 'name', None), str)]
+                captured += [n for p in ast.walk(case.pattern) for n in getattr(p, 'names', []) if isinstance(n, str)]
+                entry = self._bind(state, captured, _LOCAL)
+                self._map(case.guard, entry)
+                after = _merge_states(after, self._block(case.body, entry))
+            return after
+        if isinstance(stmt, ast.Delete):
+            self._map(stmt, state)
+            new = dict(state)
+            for target in stmt.targets:
+                if isinstance(target, ast.Name):
+                    new.pop(target.id, None)
+            return new
+        # Any other simple statement: an assignment, an expression. Its names
+        # are evaluated before its own targets (and walrus targets) bind.
+        self._map(stmt, state)
+        stored = _stored_names(stmt)
+        return self._bind(state, stored, _LOCAL) if stored else state
 
 
 def scope_import_alternatives(node: ast.AST) -> Dict[str, List[str]]:
-    """{local name: [qualified name, ...]} for the names in `node`'s own scope
-    whose last import is in an `if`/`else` that imports the name in more than
-    one branch: after it, the name can be any of them. Other names are left
-    out (the import map has their one binding)."""
+    """{local name: [module path, ...]} for the names in `node`'s own scope
+    that can hold more than one import where the scope ends (an `if`/`else`
+    importing a name in several branches, or an `if` that rebinds an earlier
+    import): any of them can be what code after it, or a nested function,
+    uses. Other names are left out (the import map has their one binding)."""
+    flow = ScopeFlow(node)
     alternatives: Dict[str, List[str]] = {}
-    for local, hits in scope_import_bindings(node).items():
-        names = _branch_alternatives(hits)
-        if len(names) > 1:
-            alternatives[local] = names
+    names = flow.end if flow.end is not None else flow._seen
+    for local, values in names.items():
+        imports = [v for v in values if v is not _LOCAL]
+        if len(imports) > 1:
+            alternatives[local] = imports
     return alternatives
 
 
@@ -1679,55 +1822,56 @@ def scope_import_alternatives_over(outer: Dict[str, List[str]], node: ast.AST) -
 
 
 class ImportScopes:
-    """What a name means at a point in a function: the module it was imported
-    from, given the imports that have run by then.
+    """What a name means at a point in a function: the modules it can have
+    been imported from, given the paths that reach that point (ScopeFlow).
 
-    A function's own imports apply from the line they are on, so a call before
-    `import b as client` still goes through the earlier `import a as client`.
-    `enclosing` is what the function sees from outside itself (the module's
-    imports, and those of the functions around it), where the last binding
-    wins because that code has run by the time the function is called.
-    `enclosing_alternatives` lists, for a name of `enclosing` bound in several
-    branches of an `if`/`else`, every module it can be (see
-    scope_import_alternatives).
+    A function's own bindings decide for a name it binds: the ones that can
+    reach the point of use, or, if none has yet, the binding outside it (so a
+    call before `import b as client` still goes through the module's `import
+    a as client`). A name bound in an enclosing function is looked up there,
+    with any binding that function makes. `enclosing` is what the outermost
+    function sees from outside (the module's imports, last one winning), and
+    `enclosing_alternatives` lists, for a name of `enclosing` that can hold
+    several imports, all of them (see scope_import_alternatives).
     """
 
     def __init__(self, enclosing: Dict[str, str],
                  enclosing_alternatives: Optional[Dict[str, List[str]]] = None):
         self.enclosing = enclosing
         self.enclosing_alternatives = enclosing_alternatives or {}
-        self._bindings: Dict[int, Dict[str, List[ImportBinding]]] = {}
+        self._flows: Dict[int, ScopeFlow] = {}
+
+    def _flow(self, scope: ast.AST) -> ScopeFlow:
+        if id(scope) not in self._flows:
+            self._flows[id(scope)] = ScopeFlow(scope)
+        return self._flows[id(scope)]
 
     def lookup(self, name: str, node: ast.AST, chain: List[ast.AST]) -> Optional[str]:
         """The qualified name `name` refers to at `node`, or None if it is not
-        an imported name. `chain` is the functions around `node`, outermost
-        first (see call_scope_chains). The innermost one is searched first and
-        only up to the line of `node`; for each function around it the last
-        import wins, since a closure runs after its enclosing function has.
-        When the name can be several modules (see lookup_all), the last one."""
+        an imported name there. When it can be several modules (see
+        lookup_all), the last one."""
         found = self.lookup_all(name, node, chain)
         return found[-1] if found else None
 
     def lookup_all(self, name: str, node: ast.AST, chain: List[ast.AST]) -> List[str]:
-        """Every qualified name `name` can refer to at `node`, in source order:
-        one, or, after an `if`/`else` that imports it in several branches,
-        one per branch. Empty if it is not an imported name."""
-        position = (node.lineno, node.col_offset)
+        """Every module `name` can be imported from at `node`, in the order
+        its imports appear. Empty if it is not an imported name there, which
+        includes a name the innermost function has bound locally (a parameter,
+        an assignment) by that point. `chain` is the functions around `node`,
+        outermost first (see call_scope_chains)."""
         for depth, scope in enumerate(reversed(chain)):
-            if id(scope) not in self._bindings:
-                self._bindings[id(scope)] = scope_import_bindings(scope)
-            hits = self._bindings[id(scope)].get(name)
-            if not hits:
+            flow = self._flow(scope)
+            if not flow.binds(name):
                 continue
             if depth == 0:
-                hits = [hit for hit in hits if hit[0] < position]
-                if not hits:
+                state = flow.at(node)
+                values = state.get(name) if state is not None else flow.all_values(name)
+                if not values:
+                    # Not bound on any path to here yet: the binding outside.
                     continue
-                branch = hits[-1][2]
-                if branch is not None and position < branch[1]:
-                    # Inside the if/else itself: only this branch's import ran.
-                    return [hits[-1][1]]
-            return _branch_alternatives(hits)
+            else:
+                values = flow.all_values(name)
+            return [v for v in values if v is not _LOCAL]
         if name in self.enclosing:
             return list(self.enclosing_alternatives.get(name) or [self.enclosing[name]])
         return []
