@@ -45,3 +45,18 @@ def _cross_targets(tmp_path: Path, use: str):
 ], ids=["attribute_call", "bare_call", "module_receiver"])
 def test_attribute_call_is_not_resolved_through_an_imported_function(tmp_path, use, expected):
     assert _cross_targets(tmp_path, use) == expected
+
+
+def test_attribute_call_on_a_dotted_module_path_still_reaches_the_function(tmp_path):
+    # `import pkg.util` then `pkg.util.helper()`: the receiver is the module
+    # path, which is not looked up as an import, so this edge comes from the
+    # unique name match. Dropping plain functions from attribute calls would
+    # lose it (requests' `requests.utils.rewind_body(prep)` is one).
+    (tmp_path / "pkg").mkdir()
+    (tmp_path / "pkg" / "__init__.py").write_text("")
+    (tmp_path / "pkg" / "util.py").write_text("def helper(): ...\n")
+    (tmp_path / "use.py").write_text("import pkg.util\ndef f():\n    return pkg.util.helper()\n")
+    kg = RepoASTParser(max_workers=1).parse_repo("test/repo", tmp_path)
+    nodes = {n["id"]: n for n in kg["nodes"]}
+    assert [(nodes[e["target"]]["type"], e["metadata"]["confidence"]) for e in kg["edges"]
+            if e["relation"] == "calls" and nodes[e["source"]]["label"] == "f"] == [("function", "name_only")]
