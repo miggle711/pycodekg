@@ -1219,10 +1219,23 @@ def _get_used_imports(
     """
     used: List[str] = []
     chains = scope_chains(func_node, (ast.Name,))
+    # A function's own `if TYPE_CHECKING:` imports are not runtime bindings,
+    # so ImportScopes does not see them, but a name used only for an
+    # annotation still depends on that module. Used when no runtime import
+    # binds the name; computed once per function.
+    type_only: Dict[int, Dict[str, str]] = {}
     for child in ast.walk(func_node):
         if not isinstance(child, ast.Name):
             continue
-        qualified = scopes.lookup(child.id, child, chains.get(id(child), [func_node]))
+        chain = chains.get(id(child), [func_node])
+        qualified = scopes.lookup(child.id, child, chain)
+        if qualified is None:
+            for scope in reversed(chain):
+                if id(scope) not in type_only:
+                    type_only[id(scope)] = _split_scope_imports(scope)[1]
+                qualified = type_only[id(scope)].get(child.id)
+                if qualified is not None:
+                    break
         if qualified and qualified not in used:
             used.append(qualified)
     return used
