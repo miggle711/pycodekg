@@ -1327,14 +1327,31 @@ class RepoASTParser:
         qualified_to_ids = indices['qualified_to_ids']
         nodes_by_id = indices['nodes_by_id']
 
+        # Nodes defined in a test file. Production code never imports from a
+        # test file, so a name used outside the tests can not refer to one of
+        # these, however unique its name (#210): a builtin or library name such
+        # as `int` or `Counter` would otherwise link to a test-local definition.
+        in_test_file: Set[str] = {
+            n['id'] for n in all_nodes
+            if _is_test_file(n.get('metadata', {}).get('filepath')
+                             or n.get('metadata', {}).get('path') or '')
+        }
+
+        def _visible_from(source_id: str, ids: List[str]) -> List[str]:
+            """The candidates `source_id` can refer to: all of them from a test
+            file, none in a test file from anywhere else."""
+            if source_id in in_test_file:
+                return ids
+            return [i for i in ids if i not in in_test_file]
+
         def _base_matches(class_id: str, base: str) -> List[str]:
             """Class nodes a base class expression can refer to. The class
             itself is excluded: `class Foo(a.Foo)` names the OTHER Foo, and
             matching by simple name alone would link Foo to itself."""
-            return [
+            return _visible_from(class_id, [
                 cid for cid in class_label_to_ids.get(_base_name(base), [])
                 if cid != class_id
-            ]
+            ])
 
         # class ID -> parent class IDs, built from the raw inherits edges up
         # front so self.method() calls can follow the parent chain while
@@ -1347,7 +1364,7 @@ class RepoASTParser:
                     if parent_id not in base_ids_by_class[raw['source']]:
                         base_ids_by_class[raw['source']].append(parent_id)
 
-        def _resolve_access(meta: Dict, attr_name: str) -> Tuple[List[str], str]:
+        def _resolve_access(meta: Dict, attr_name: str, source_id: str) -> Tuple[List[str], str]:
             """Resolve an accesses-edge target against known @property methods.
 
             Unlike _resolve_call, there is no bare-name fallback against
@@ -1357,13 +1374,13 @@ class RepoASTParser:
             """
             class_hint = meta.get('class_hint')
             if class_hint:
-                hits = property_method_to_ids.get((class_hint, attr_name), [])
+                hits = _visible_from(source_id, property_method_to_ids.get((class_hint, attr_name), []))
                 if hits:
                     return hits, 'qualified'
 
             local_hint = meta.get('local_type_hint')
             if local_hint:
-                hits = property_method_to_ids.get((local_hint, attr_name), [])
+                hits = _visible_from(source_id, property_method_to_ids.get((local_hint, attr_name), []))
                 if hits:
                     return hits, 'qualified'
 
@@ -1371,13 +1388,14 @@ class RepoASTParser:
             if qualified:
                 parts = qualified.rsplit('.', 2)
                 if len(parts) == 3:
-                    hits = property_method_to_ids.get((parts[1], parts[2]), [])
+                    hits = _visible_from(source_id, property_method_to_ids.get((parts[1], parts[2]), []))
                     if hits:
                         return hits, 'qualified'
 
             return [], 'unresolved'
 
-        def _resolve_call(meta: Dict, callee_name: str, caller_filepath: Optional[str] = None) -> Tuple[List[str], str]:
+        def _resolve_call(meta: Dict, callee_name: str, caller_filepath: Optional[str] = None,
+                          source_id: str = '') -> Tuple[List[str], str]:
             """Resolve a call-edge target using the metadata hints."""
             class_hint_id = meta.get('class_hint_id')
             class_hint = meta.get('class_hint')
@@ -1395,24 +1413,24 @@ class RepoASTParser:
             elif class_hint:
                 # Edge without a class ID (e.g. an operator dispatch edge):
                 # the older lookup by class name.
-                hits = class_method_to_ids.get((class_hint, callee_name), [])
+                hits = _visible_from(source_id, class_method_to_ids.get((class_hint, callee_name), []))
                 if hits:
                     return hits, 'qualified'
 
             local_hint = meta.get('local_type_hint')
             if local_hint:
-                hits = class_method_to_ids.get((local_hint, callee_name), [])
+                hits = _visible_from(source_id, class_method_to_ids.get((local_hint, callee_name), []))
                 if hits:
                     return hits, 'qualified'
 
             qualified = meta.get('import_resolved')
             if qualified:
-                hits = qualified_to_ids.get(qualified, [])
+                hits = _visible_from(source_id, qualified_to_ids.get(qualified, []))
                 if hits:
                     return hits, 'qualified'
                 parts = qualified.rsplit('.', 2)
                 if len(parts) == 3:
-                    hits = class_method_to_ids.get((parts[1], parts[2]), [])
+                    hits = _visible_from(source_id, class_method_to_ids.get((parts[1], parts[2]), []))
                     if hits:
                         return hits, 'qualified'
                 # The precise lookups missed. That is not proof the target is
@@ -1428,7 +1446,7 @@ class RepoASTParser:
             # Bare Foo(...) is a constructor call when Foo is a class, so
             # check class names too, not just functions/methods
             # (kg_construction#120).
-            hits = label_to_ids.get(callee_name, []) + class_label_to_ids.get(callee_name, [])
+            hits = _visible_from(source_id, label_to_ids.get(callee_name, []) + class_label_to_ids.get(callee_name, []))
 
             # A bare call (no receiver at all, e.g. `request(...)` calling
             # a module-level function, as opposed to `x.request()`) that
@@ -1502,7 +1520,7 @@ class RepoASTParser:
             if edge['relation'] == 'calls' and meta.get('unresolved'):
                 callee_name = edge['target']
                 caller_filepath = nodes_by_id.get(edge['source'], {}).get('metadata', {}).get('filepath')
-                matches, confidence = _resolve_call(meta, callee_name, caller_filepath)
+                matches, confidence = _resolve_call(meta, callee_name, caller_filepath, edge['source'])
                 if not matches:
                     continue
                 for target_id in matches:
@@ -1515,7 +1533,7 @@ class RepoASTParser:
 
             elif edge['relation'] == 'accesses' and meta.get('unresolved'):
                 attr_name = edge['target']
-                matches, confidence = _resolve_access(meta, attr_name)
+                matches, confidence = _resolve_access(meta, attr_name, edge['source'])
                 if not matches:
                     continue
                 for target_id in matches:
@@ -1547,7 +1565,7 @@ class RepoASTParser:
                 # external exceptions have nothing to match and are
                 # dropped, same "drop rather than guess" rule as calls.
                 exc_name = edge['target']
-                matches = class_label_to_ids.get(exc_name, [])
+                matches = _visible_from(edge['source'], class_label_to_ids.get(exc_name, []))
                 if not matches:
                     continue
                 confidence = 'exact' if len(matches) == 1 else 'ambiguous'
@@ -1565,7 +1583,7 @@ class RepoASTParser:
                 # a class and function of the same name can both exist
                 # (kg_construction#135 review).
                 dec_name = edge['target']
-                matches = class_label_to_ids.get(dec_name, []) + label_to_ids.get(dec_name, [])
+                matches = _visible_from(edge['source'], class_label_to_ids.get(dec_name, []) + label_to_ids.get(dec_name, []))
                 if not matches:
                     continue
                 # A bare decorator name resolves via the decorated
@@ -1608,7 +1626,7 @@ class RepoASTParser:
                         )))
 
             elif edge['relation'] == 'uses' and meta.get('unresolved'):
-                matches = class_label_to_ids.get(edge['target'], [])
+                matches = _visible_from(edge['source'], class_label_to_ids.get(edge['target'], []))
                 if not matches:
                     continue
                 # The uppercase-first-letter heuristic that produced this
@@ -1619,7 +1637,7 @@ class RepoASTParser:
                 # in the repo, the "instantiation" is only a guess even when
                 # a single class name matches, so confidence is downgraded
                 # to 'ambiguous' rather than reported as 'exact'.
-                name_collides_with_callable = edge['target'] in label_to_ids
+                name_collides_with_callable = bool(_visible_from(edge['source'], label_to_ids.get(edge['target'], [])))
                 if len(matches) > 1:
                     confidence = 'ambiguous'
                 elif name_collides_with_callable:
