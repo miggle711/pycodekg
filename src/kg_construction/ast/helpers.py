@@ -204,11 +204,20 @@ def call_scope_chains(
     it, from `func_node` down to the innermost one. A call in `func_node`'s
     own body maps to [func_node]; one in a closure `inner` defined in it maps
     to [func_node, inner]. Walks the same way as iter_calls_by_scope."""
+    return scope_chains(func_node, (ast.Call,))
+
+
+def scope_chains(
+    func_node: Union[ast.FunctionDef, ast.AsyncFunctionDef],
+    kinds: Tuple[type, ...],
+) -> Dict[int, List[ast.AST]]:
+    """For every node of one of `kinds` in a function, keyed by id(node): the
+    functions around it, as in call_scope_chains."""
     chains: Dict[int, List[ast.AST]] = {}
     stack: List[Tuple[ast.AST, Tuple[ast.AST, ...]]] = [(func_node, (func_node,))]
     while stack:
         node, chain = stack.pop()
-        if isinstance(node, ast.Call):
+        if isinstance(node, kinds):
             chains[id(node)] = list(chain)
         if node is not func_node and isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             kids = [(expr, chain) for expr in _outer_scope_exprs(node)]
@@ -1188,30 +1197,34 @@ def _get_attribute_accesses(
 
 def _get_used_imports(
     func_node: Union[ast.FunctionDef, ast.AsyncFunctionDef],
-    import_map: Dict[str, str],
+    scopes: "ImportScopes",
 ) -> List[str]:
     """Find which imported names are actually referenced inside a function.
 
-    Walks the function body looking for Name nodes whose id appears in the
-    file-level import_map. Returns the fully-qualified import paths for
-    those names, which tells the test generator exactly what to mock.
-    Nested functions are included on purpose: an import used only inside a
-    closure still has to be mocked to test the outer function.
+    Each Name is resolved through the import that has run by the time it is
+    reached (see ImportScopes), the same way calls are, so a name bound by
+    two imports in turn yields both: `client.run(); import b as client;
+    client.run()` uses the outer `client` and then b (#200). Returns the
+    fully-qualified import paths, which tells the test generator exactly
+    what to mock. Nested functions are included on purpose: an import used
+    only inside a closure still has to be mocked to test the outer function.
 
     Args:
         func_node: The function AST node.
-        import_map: {local_name: qualified_name} from _collect_file_level_info.
+        scopes: ImportScopes over the imports the function sees from outside.
 
     Returns:
         List of fully-qualified import strings used in this function,
         e.g. ['requests.auth.HTTPBasicAuth', 'os.path'].
     """
     used: List[str] = []
+    chains = scope_chains(func_node, (ast.Name,))
     for child in ast.walk(func_node):
-        if isinstance(child, ast.Name) and child.id in import_map:
-            qualified = import_map[child.id]
-            if qualified not in used:
-                used.append(qualified)
+        if not isinstance(child, ast.Name):
+            continue
+        qualified = scopes.lookup(child.id, child, chains.get(id(child), [func_node]))
+        if qualified and qualified not in used:
+            used.append(qualified)
     return used
 
 
