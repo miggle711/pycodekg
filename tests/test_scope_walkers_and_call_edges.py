@@ -20,6 +20,7 @@ from kg_construction.ast.helpers import (
     _get_attribute_accesses,
     _get_class_attributes,
     _get_instantiated_classes_in_class,
+    iter_calls_by_scope,
 )
 from kg_construction.kg.builder import RepoASTParser
 from kg_construction.kg.query import KGQueryEngine
@@ -209,6 +210,24 @@ class TestWriteFormsAreRecorded:
                         self.hidden = 1
         """)).body[0]
         assert _get_class_attributes(cls) == ["n", "a", "b", "total"]
+
+
+class TestNestedDefOuterScopeExpressions:
+    """A nested def's decorators, defaults and annotations run in the outer
+    function, so a `self.x` read there is the outer function's, as its calls
+    are for iter_calls_by_scope. Its body is not."""
+
+    @pytest.mark.parametrize("nested, reads", [
+        ("def g(a=self.y.get()): ...", ["y"]),
+        ("@self.deco\n    def g(): ...", ["deco"]),
+        ("def g(a: self.T = None) -> self.R: ...", ["T", "R"]),
+        ("def g():\n        return self.hidden", []),
+    ], ids=["default", "decorator", "annotations", "body"])
+    def test_reads_in_a_nested_defs_outer_scope_expressions(self, nested, reads):
+        func = _func("def f(self):\n    " + nested + "\n")
+        assert sorted(_get_attribute_accesses(func)[0]) == sorted(reads)
+        assert sorted(c.func.attr for c in iter_calls_by_scope(func)[0]) == (
+            ["get"] if "get()" in nested else [])
 
 
 _COMPOUND_WRAPPERS = {

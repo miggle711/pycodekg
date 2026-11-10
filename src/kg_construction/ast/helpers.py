@@ -1044,11 +1044,15 @@ def _get_base_names(node: ast.ClassDef) -> List[str]:
 
 
 def _walk_own_scope(node: ast.AST):
-    """Yield `node` and its descendants, without entering nested function
-    definitions: a nested function's statements belong to its own scope."""
+    """Yield `node` and its descendants, without entering the body of a nested
+    function definition: its statements belong to its own scope. Its
+    decorators, default values and annotations run in this scope, so they are
+    walked (the same boundary as iter_calls_by_scope)."""
     yield node
     for child in ast.iter_child_nodes(node):
         if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            for expr in _outer_scope_exprs(child):
+                yield from _walk_own_scope(expr)
             continue
         yield from _walk_own_scope(child)
 
