@@ -163,7 +163,10 @@ MAX_FILE_LINES = 20000
 #    import of its method name (`from vec import cross`), so it stops being
 #    linked to that imported function. A call on an import-bound receiver
 #    (`json.loads`) is unchanged.
-SCHEMA_VERSION = 10
+# 11: depends_on resolves each name through the import that has run where it
+#    is used, so a function that rebinds an imported name (`import a as c` at
+#    module level, then `import b as c` inside it) depends on both.
+SCHEMA_VERSION = 11
 
 
 def _same_commit(a: Optional[str], b: Optional[str]) -> bool:
