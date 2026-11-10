@@ -906,3 +906,29 @@ class TestReconstructNormalizesPatchText:
     def test_new_file_with_bom_parses(self):
         patch = "--- /dev/null\n+++ b/m.py\n@@ -0,0 +1,2 @@\n+\ufeffdef a():\n+    return 1\n"
         assert reconstruct_post_patch_source("", patch, 'm.py') == "def a():\n    return 1\n"
+
+
+class TestMarkerLikeLinesInsideAHunk:
+    """A removed line whose content starts with `--` appears in the diff as
+    `---...`, and an added line starting with `++` as `+++...`. Inside a hunk
+    they are content, not file headers; the hunk header's line counts say
+    which lines belong to it (#186)."""
+
+    PRE = 'def f():\n    s = """\n-- old\n"""\n    return s\n\n\ndef g():\n    return 2\n'
+    PATCH = """--- a/m.py
++++ b/m.py
+@@ -1,5 +1,5 @@
+ def f():
+     s = \"\"\"
+--- old
++++new
+ \"\"\"
+     return s
+"""
+
+    def test_changed_function_is_found(self):
+        assert PatchParser.extract_changed_functions(self.PATCH, 'm.py', self.PRE) == {'f'}
+
+    def test_post_patch_source_is_reconstructed(self):
+        assert reconstruct_post_patch_source(self.PRE, self.PATCH, 'm.py') == self.PRE.replace('-- old', '++new')
+
