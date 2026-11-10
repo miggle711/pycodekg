@@ -159,7 +159,12 @@ MAX_FILE_LINES = 20000
 #    name uses its own type (or none), so the outer function's closure edge no
 #    longer points at the wrong class, and a type assigned inside the closure
 #    now reaches the outer function's copy of the edge.
-SCHEMA_VERSION = 9
+# 10: an attribute call x.name() is no longer resolved through an import of
+#    `name` (v.cross(w) is not the imported function cross), and when x is
+#    not a module its name match considers methods only. A call through an
+#    import of a module-level name no longer also links to methods of that
+#    name in the same module.
+SCHEMA_VERSION = 10
 
 
 def _same_commit(a: Optional[str], b: Optional[str]) -> bool:
@@ -609,9 +614,22 @@ def _parse_file(args: Tuple[str, str, str]) -> Optional[Dict]:
                 if bound is not None:
                     # e.g. json.loads where 'json' was imported
                     import_resolved = f"{bound}.{callee}"
-                else:
+                elif receiver is None:
                     # Bare-name call: foo() where foo was imported
                     import_resolved = scopes.lookup(callee, call, chain)
+                # An attribute call x.name() is resolved through x only. An
+                # import of `name` itself says nothing about it: v.cross(w) is
+                # not the imported function cross (#195).
+
+            # x.name() where x is not a module (or a dotted path starting with
+            # one) can only call a method, so pass 2 leaves out module-level
+            # functions and classes of the same name.
+            receiver_is_object = False
+            if receiver is not None and not is_super_call:
+                head = receiver.split('.', 1)[0]
+                head_is_local = (head in expression_names.get(id(call), ())
+                                 or local_scopes.lookup(head, outer_funcs + chain)[0])
+                receiver_is_object = head_is_local or scopes.lookup(head, call, chain) is None
 
             hints_key = (func_id, callee, receiver, import_resolved, local_type_hint)
             if hints_key in seen_call_hints:
@@ -627,6 +645,7 @@ def _parse_file(args: Tuple[str, str, str]) -> Optional[Dict]:
                 'local_type_hint': local_type_hint,
                 'import_resolved': import_resolved,
                 'is_super_call': is_super_call,
+                'receiver_is_object': receiver_is_object,
             }
             if in_closure:
                 call_meta['via_closure'] = True
@@ -1240,10 +1259,15 @@ class RepoASTParser:
                     fp = node.get('metadata', {}).get('filepath')
                     if fp and ntype in ('function', 'method', 'class', 'test_function'):
                         mod = fp.removesuffix('.py').replace('/', '.')
-                        qualified_to_ids[f"{mod}.{label}"].append(node['id'])
                         parent = node.get('metadata', {}).get('class')
                         if parent:
+                            # A method is only reachable as mod.Class.name;
+                            # registering it as mod.name too linked an imported
+                            # function `name` to every same named method in
+                            # that module (#195).
                             qualified_to_ids[f"{mod}.{parent}.{label}"].append(node['id'])
+                        else:
+                            qualified_to_ids[f"{mod}.{label}"].append(node['id'])
 
         nodes_by_id: Dict[str, Dict] = {n['id']: n for n in all_nodes}
         all_edges: List[Dict] = [edge for result in results for edge in result['edges']]
@@ -1419,10 +1443,16 @@ class RepoASTParser:
                 if qualified.split('.', 1)[0] not in repo_module_names:
                     return [], 'unresolved'
 
-            # Bare Foo(...) is a constructor call when Foo is a class, so
-            # check class names too, not just functions/methods
-            # (kg_construction#120).
-            hits = label_to_ids.get(callee_name, []) + class_label_to_ids.get(callee_name, [])
+            if meta.get('receiver_is_object'):
+                # x.name() on an object reaches a method, never a module-level
+                # function or class that happens to share the name (#195).
+                hits = [hid for hid in label_to_ids.get(callee_name, [])
+                        if nodes_by_id.get(hid, {}).get('metadata', {}).get('class')]
+            else:
+                # Bare Foo(...) is a constructor call when Foo is a class, so
+                # check class names too, not just functions/methods
+                # (kg_construction#120).
+                hits = label_to_ids.get(callee_name, []) + class_label_to_ids.get(callee_name, [])
 
             # A bare call (no receiver at all, e.g. `request(...)` calling
             # a module-level function, as opposed to `x.request()`) that

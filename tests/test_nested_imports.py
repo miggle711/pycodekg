@@ -80,7 +80,7 @@ class TestImportsOutsideTheModuleBody:
                       for e in kg["edges"] if e["relation"] == "calls"}
         assert confidence["f"] == "qualified"
         assert confidence["inner"] == "qualified"
-        assert confidence["g"] != "qualified"
+        assert confidence.get("g") != "qualified"
 
     @pytest.mark.parametrize("header", [
         "import a as client\nif TYPE_CHECKING:\n    import b as client\n",

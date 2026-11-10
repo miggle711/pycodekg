@@ -137,20 +137,22 @@ MODELS_PY = "def save(): ...\n"
 
 
 @pytest.mark.parametrize("body, caller, expected", [
-    # The closure's own node sees the function around it, not only itself.
+    # The closure's own node sees the function around it, not only itself:
+    # m is outer's local, not the module, so models.save is not a candidate
+    # and only the method matches, by name (#195).
     ("""
         import models as m
         def outer():
             def m(): ...
             def cb():
                 m.save()
-    """, "cb", []),
+    """, "cb", [("Model", "name_only", False)]),
     ("""
         import models as m
         def outer(m):
             def cb():
                 m.save()
-    """, "cb", []),
+    """, "cb", [("Model", "name_only", False)]),
     ("""
         import models as m
         def outer():
