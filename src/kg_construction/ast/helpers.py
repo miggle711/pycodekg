@@ -24,7 +24,7 @@ Organised into sections (in file order):
 import ast
 import hashlib
 from pathlib import Path
-from typing import List, Dict, FrozenSet, Set, Optional, Tuple, Union
+from typing import List, Dict, FrozenSet, NamedTuple, Set, Optional, Tuple, Union
 
 
 # ---------------------------------------------------------------------------
@@ -82,6 +82,8 @@ _DEF_TYPES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
 # hold statement bodies. Expressions are skipped on purpose, they can't
 # contain a def, and descending into them would risk RecursionError on
 # very deep expressions (e.g. a long chain of `a + b + c + ...`).
+_TRY_TYPES = (ast.Try,) + ((ast.TryStar,) if hasattr(ast, 'TryStar') else ())
+
 _SCOPE_TRANSPARENT = (ast.stmt, ast.ExceptHandler) + (
     (ast.match_case,) if hasattr(ast, 'match_case') else ()
 )
@@ -358,6 +360,12 @@ class LocalTypeScopes:
                 if types is None:
                     types = self._types[id(func)] = _collect_local_types(func)
                 if receiver in bound:
+                    if receiver not in types and receiver in self._imports_of(func):
+                        # Both imported and assigned in this function
+                        # (`try: import m` / `except ImportError: m = None`):
+                        # the import is what a call normally goes through, so
+                        # leave it to ImportScopes.
+                        return False, None
                     return True, types.get(receiver)
                 if receiver in types:
                     # `global x` / `nonlocal x` then `x = SomeClass()`: not a
@@ -1228,16 +1236,17 @@ def _get_used_imports(
         if not isinstance(child, ast.Name):
             continue
         chain = chains.get(id(child), [func_node])
-        qualified = scopes.lookup(child.id, child, chain)
-        if qualified is None:
+        found = scopes.lookup_all(child.id, child, chain)
+        if not found:
             for scope in reversed(chain):
                 if id(scope) not in type_only:
                     type_only[id(scope)] = _split_scope_imports(scope)[1]
-                qualified = type_only[id(scope)].get(child.id)
-                if qualified is not None:
+                if child.id in type_only[id(scope)]:
+                    found = [type_only[id(scope)][child.id]]
                     break
-        if qualified and qualified not in used:
-            used.append(qualified)
+        for qualified in found:
+            if qualified not in used:
+                used.append(qualified)
     return used
 
 
@@ -1469,29 +1478,94 @@ def _type_only_branch(test: ast.AST) -> Optional[str]:
     return None
 
 
-def _iter_scope_imports_flagged(node: ast.AST, type_only: bool = False):
-    """Yield (import statement, type_only) for the imports in `node`'s own
-    scope, in source order. type_only is True for an import in the body of
-    `if TYPE_CHECKING:` (or the `else` of `if not TYPE_CHECKING:`): it never
-    runs, so it must not replace a name the code really binds (the other
-    branch does run and is not type only)."""
+class _ScopeImport(NamedTuple):
+    """An import statement in a scope, with what decides which of its names
+    the code can be using.
+
+    type_only: in the body of `if TYPE_CHECKING:` (or the `else` of `if not
+        TYPE_CHECKING:`): it never runs, so it must not replace a name the
+        code really binds.
+    branch: (if statement, where that statement ends) when the import is in a
+        branch of an `if`/`elif`/`else` with more than one branch: after the
+        statement, a name bound in several of its branches can hold any of
+        those imports.
+    shadowed: names the `try` body around this `except` handler imports.
+        The handler's import of one of them is the fallback for when the
+        body's failed; the body's is the one that normally runs.
+    """
+    stmt: ast.AST
+    type_only: bool
+    branch: Optional[Tuple[int, Tuple[int, int]]]
+    shadowed: FrozenSet[str]
+
+    def bindings(self) -> List[Tuple[str, str]]:
+        """(local name, qualified name) pairs, without the shadowed names."""
+        return [(local, qualified) for local, qualified in _import_bindings(self.stmt)
+                if local not in self.shadowed]
+
+
+_NO_NAMES: FrozenSet[str] = frozenset()
+
+
+def _iter_scope_imports_flagged(node: ast.AST, type_only: bool = False,
+                                branch=None, shadowed: FrozenSet[str] = _NO_NAMES):
+    """Yield a _ScopeImport for each import in `node`'s own scope, in source
+    order."""
     for child in ast.iter_child_nodes(node):
-        yield from _flagged_scope_imports(child, type_only)
+        yield from _flagged_scope_imports(child, type_only, branch, shadowed)
 
 
-def _flagged_scope_imports(child: ast.AST, type_only: bool):
+def _flagged_scope_imports(child: ast.AST, type_only: bool, branch, shadowed: FrozenSet[str]):
     if isinstance(child, (ast.Import, ast.ImportFrom)):
-        yield child, type_only
+        yield _ScopeImport(child, type_only, branch, shadowed)
     elif isinstance(child, _DEF_TYPES):
         return
     elif isinstance(child, ast.If) and _type_only_branch(child.test):
-        branch = _type_only_branch(child.test)
+        which = _type_only_branch(child.test)
         for stmt in child.body:
-            yield from _flagged_scope_imports(stmt, type_only or branch == 'body')
+            yield from _flagged_scope_imports(stmt, type_only or which == 'body', branch, shadowed)
         for stmt in child.orelse:
-            yield from _flagged_scope_imports(stmt, type_only or branch == 'orelse')
+            yield from _flagged_scope_imports(stmt, type_only or which == 'orelse', branch, shadowed)
+    elif isinstance(child, ast.If):
+        yield from _flagged_if_imports(child, type_only, branch, shadowed)
+    elif isinstance(child, _TRY_TYPES):
+        body_names = frozenset(
+            local
+            for stmt in child.body
+            for found in _flagged_scope_imports(stmt, type_only, branch, shadowed)
+            if not found.type_only
+            for local, _ in found.bindings()
+        )
+        for stmt in child.body:
+            yield from _flagged_scope_imports(stmt, type_only, branch, shadowed)
+        for handler in child.handlers:
+            yield from _iter_scope_imports_flagged(handler, type_only, branch, shadowed | body_names)
+        for stmt in child.orelse + child.finalbody:
+            yield from _flagged_scope_imports(stmt, type_only, branch, shadowed)
     elif isinstance(child, _SCOPE_TRANSPARENT):
-        yield from _iter_scope_imports_flagged(child, type_only)
+        yield from _iter_scope_imports_flagged(child, type_only, branch, shadowed)
+
+
+def _flagged_if_imports(node: ast.If, type_only: bool, branch, shadowed: FrozenSet[str],
+                        chain_branch=None):
+    """The imports in an `if` statement. An `elif` is an `if` nested as the
+    only statement of its parent's `else`, so the whole chain shares one
+    branch tag, ending where the outermost `if` ends."""
+    if not node.orelse:
+        # A single branch: no alternative to the binding before it.
+        for stmt in node.body:
+            yield from _flagged_scope_imports(stmt, type_only, branch, shadowed)
+        return
+    tag = chain_branch or (id(node), (node.end_lineno, node.end_col_offset))
+    for stmt in node.body:
+        yield from _flagged_scope_imports(stmt, type_only, tag, shadowed)
+    is_elif = (len(node.orelse) == 1 and isinstance(node.orelse[0], ast.If)
+               and not _type_only_branch(node.orelse[0].test))
+    if is_elif:
+        yield from _flagged_if_imports(node.orelse[0], type_only, branch, shadowed, chain_branch=tag)
+    else:
+        for stmt in node.orelse:
+            yield from _flagged_scope_imports(stmt, type_only, tag, shadowed)
 
 
 def iter_scope_imports(node: ast.AST):
@@ -1502,8 +1576,8 @@ def iter_scope_imports(node: ast.AST):
     `with`, loops, `match`), which don't introduce a scope, but not into a
     nested function or class: an import there is only visible inside it.
     """
-    for stmt, _ in _iter_scope_imports_flagged(node):
-        yield stmt
+    for found in _iter_scope_imports_flagged(node):
+        yield found.stmt
 
 
 def _import_bindings(stmt: Union[ast.Import, ast.ImportFrom]) -> List[Tuple[str, str]]:
@@ -1518,11 +1592,13 @@ def _import_bindings(stmt: Union[ast.Import, ast.ImportFrom]) -> List[Tuple[str,
 
 def _split_scope_imports(node: ast.AST) -> Tuple[Dict[str, str], Dict[str, str]]:
     """(runtime, type only) {local name: qualified name} for the imports in
-    `node`'s own scope. A later import of a name replaces an earlier one."""
+    `node`'s own scope. A later import of a name replaces an earlier one,
+    except that an `except` handler's import never replaces the `try` body's
+    import of the same name."""
     runtime: Dict[str, str] = {}
     type_only: Dict[str, str] = {}
-    for stmt, is_type_only in _iter_scope_imports_flagged(node):
-        (type_only if is_type_only else runtime).update(_import_bindings(stmt))
+    for found in _iter_scope_imports_flagged(node):
+        (type_only if found.type_only else runtime).update(found.bindings())
     return runtime, type_only
 
 
@@ -1545,20 +1621,61 @@ def scope_import_map_over(outer: Dict[str, str], node: ast.AST) -> Dict[str, str
     return {**type_only, **outer, **runtime}
 
 
-def scope_import_bindings(node: ast.AST) -> Dict[str, List[Tuple[Tuple[int, int], str]]]:
-    """{local name: [((line, col), qualified name), ...]} in source order for
-    the runtime imports in `node`'s own scope. Type only imports are left out:
-    they never run, so a call can not be going through them."""
-    bindings: Dict[str, List[Tuple[Tuple[int, int], str]]] = {}
-    for stmt, is_type_only in _iter_scope_imports_flagged(node):
-        if is_type_only:
+ImportBinding = Tuple[Tuple[int, int], str, Optional[Tuple[int, Tuple[int, int]]]]
+
+
+def scope_import_bindings(node: ast.AST) -> Dict[str, List[ImportBinding]]:
+    """{local name: [((line, col), qualified name, branch), ...]} in source
+    order for the runtime imports in `node`'s own scope (see _ScopeImport for
+    branch). Type only imports are left out: they never run, so a call can
+    not be going through them. So is an `except` handler's import of a name
+    its `try` body imports."""
+    bindings: Dict[str, List[ImportBinding]] = {}
+    for found in _iter_scope_imports_flagged(node):
+        if found.type_only:
             continue
-        position = (stmt.lineno, stmt.col_offset)
-        for local, qualified in _import_bindings(stmt):
-            bindings.setdefault(local, []).append((position, qualified))
+        position = (found.stmt.lineno, found.stmt.col_offset)
+        for local, qualified in found.bindings():
+            bindings.setdefault(local, []).append((position, qualified, found.branch))
     for hits in bindings.values():
         hits.sort(key=lambda hit: hit[0])
     return bindings
+
+
+def _branch_alternatives(hits: List[ImportBinding]) -> List[str]:
+    """The qualified names the last binding in `hits` stands for: just its
+    own, or, when it is in a branch of an `if`/`else`, every import of the
+    name in that statement's branches, in source order."""
+    last = hits[-1]
+    if last[2] is None:
+        return [last[1]]
+    names: List[str] = []
+    for _, qualified, branch in hits:
+        if branch == last[2] and qualified not in names:
+            names.append(qualified)
+    return names
+
+
+def scope_import_alternatives(node: ast.AST) -> Dict[str, List[str]]:
+    """{local name: [qualified name, ...]} for the names in `node`'s own scope
+    whose last import is in an `if`/`else` that imports the name in more than
+    one branch: after it, the name can be any of them. Other names are left
+    out (the import map has their one binding)."""
+    alternatives: Dict[str, List[str]] = {}
+    for local, hits in scope_import_bindings(node).items():
+        names = _branch_alternatives(hits)
+        if len(names) > 1:
+            alternatives[local] = names
+    return alternatives
+
+
+def scope_import_alternatives_over(outer: Dict[str, List[str]], node: ast.AST) -> Dict[str, List[str]]:
+    """`outer` plus `node`'s own alternatives, as scope_import_map_over does
+    for the import map: a name `node` imports at runtime replaces `outer`'s."""
+    rebound = set(scope_import_bindings(node))
+    merged = {name: names for name, names in outer.items() if name not in rebound}
+    merged.update(scope_import_alternatives(node))
+    return merged
 
 
 class ImportScopes:
@@ -1570,18 +1687,31 @@ class ImportScopes:
     `enclosing` is what the function sees from outside itself (the module's
     imports, and those of the functions around it), where the last binding
     wins because that code has run by the time the function is called.
+    `enclosing_alternatives` lists, for a name of `enclosing` bound in several
+    branches of an `if`/`else`, every module it can be (see
+    scope_import_alternatives).
     """
 
-    def __init__(self, enclosing: Dict[str, str]):
+    def __init__(self, enclosing: Dict[str, str],
+                 enclosing_alternatives: Optional[Dict[str, List[str]]] = None):
         self.enclosing = enclosing
-        self._bindings: Dict[int, Dict[str, List[Tuple[Tuple[int, int], str]]]] = {}
+        self.enclosing_alternatives = enclosing_alternatives or {}
+        self._bindings: Dict[int, Dict[str, List[ImportBinding]]] = {}
 
     def lookup(self, name: str, node: ast.AST, chain: List[ast.AST]) -> Optional[str]:
         """The qualified name `name` refers to at `node`, or None if it is not
         an imported name. `chain` is the functions around `node`, outermost
         first (see call_scope_chains). The innermost one is searched first and
         only up to the line of `node`; for each function around it the last
-        import wins, since a closure runs after its enclosing function has."""
+        import wins, since a closure runs after its enclosing function has.
+        When the name can be several modules (see lookup_all), the last one."""
+        found = self.lookup_all(name, node, chain)
+        return found[-1] if found else None
+
+    def lookup_all(self, name: str, node: ast.AST, chain: List[ast.AST]) -> List[str]:
+        """Every qualified name `name` can refer to at `node`, in source order:
+        one, or, after an `if`/`else` that imports it in several branches,
+        one per branch. Empty if it is not an imported name."""
         position = (node.lineno, node.col_offset)
         for depth, scope in enumerate(reversed(chain)):
             if id(scope) not in self._bindings:
@@ -1590,12 +1720,17 @@ class ImportScopes:
             if not hits:
                 continue
             if depth == 0:
-                earlier = [qualified for hit_position, qualified in hits if hit_position < position]
-                if earlier:
-                    return earlier[-1]
-            else:
-                return hits[-1][1]
-        return self.enclosing.get(name)
+                hits = [hit for hit in hits if hit[0] < position]
+                if not hits:
+                    continue
+                branch = hits[-1][2]
+                if branch is not None and position < branch[1]:
+                    # Inside the if/else itself: only this branch's import ran.
+                    return [hits[-1][1]]
+            return _branch_alternatives(hits)
+        if name in self.enclosing:
+            return list(self.enclosing_alternatives.get(name) or [self.enclosing[name]])
+        return []
 
 
 def _collect_file_level_info(tree: ast.Module) -> Tuple[Dict[str, str], List[str], Dict[str, str]]:

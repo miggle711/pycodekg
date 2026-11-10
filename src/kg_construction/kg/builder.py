@@ -77,6 +77,8 @@ from kg_construction.ast.helpers import (
     call_scope_chains,
     call_expression_scope_names,
     scope_import_map_over,
+    scope_import_alternatives,
+    scope_import_alternatives_over,
     LocalTypeScopes,
     assign_qualnames,
     iter_calls_by_scope,
@@ -166,7 +168,12 @@ MAX_FILE_LINES = 20000
 # 11: depends_on resolves each name through the import that has run where it
 #    is used, so a function that rebinds an imported name (`import a as c` at
 #    module level, then `import b as c` inside it) depends on both.
-SCHEMA_VERSION = 11
+# 12: an `except` handler's import no longer rebinds a name its `try` body
+#    imports, so calls go to the try body's module. A call through a name an
+#    `if`/`elif`/`else` imports in several branches gets a calls edge (and a
+#    depends_on edge) per branch. A name both imported and assigned in one
+#    function (`except ImportError: m = None`) goes through its import.
+SCHEMA_VERSION = 12
 
 
 def _same_commit(a: Optional[str], b: Optional[str]) -> bool:
@@ -468,6 +475,10 @@ def _parse_file(args: Tuple[str, str, str]) -> Optional[Dict]:
     # imports, plus those of the functions around it. Its own imports apply
     # from the line they are on (see ImportScopes).
     enclosing_imports = import_map
+    # The same for names an if/else imports in several branches: every module
+    # each can be (see scope_import_alternatives).
+    import_alternatives = scope_import_alternatives(tree)
+    enclosing_alternatives = import_alternatives
     # The functions being emitted, outermost first (the innermost is the one
     # whose edges are being built).
     enclosing_funcs: List[ast.AST] = []
@@ -564,7 +575,7 @@ def _parse_file(args: Tuple[str, str, str]) -> Optional[Dict]:
                          same function body twice for the same data.
         """
         own_calls, closure_calls = iter_calls_by_scope(func_node)
-        scopes = ImportScopes(enclosing_imports)
+        scopes = ImportScopes(enclosing_imports, enclosing_alternatives)
         chains = call_scope_chains(func_node)
         expression_names = call_expression_scope_names(func_node)
         local_scopes = LocalTypeScopes(func_node, local_types)
@@ -591,7 +602,9 @@ def _parse_file(args: Tuple[str, str, str]) -> Optional[Dict]:
             class_hint: Optional[str] = None
             class_hint_id: Optional[str] = None
             local_type_hint: Optional[str] = None
-            import_resolved: Optional[str] = None
+            # Usually one, but a name an if/else imports in several branches
+            # can be any of them: one edge per module (see ImportScopes).
+            import_options: List[Optional[str]] = [None]
             is_super_call = receiver == 'super()'
             chain = chains[id(call)]
             receiver_is_local, local_type = (
@@ -612,36 +625,38 @@ def _parse_file(args: Tuple[str, str, str]) -> Optional[Dict]:
             else:
                 # A receiver that is a local of some function around the call
                 # is not the module of the same name, even with no known type.
-                bound = scopes.lookup(receiver, call, chain) if receiver and not receiver_is_local else None
-                if bound is not None:
+                bound_all = (scopes.lookup_all(receiver, call, chain)
+                             if receiver and not receiver_is_local else [])
+                if bound_all:
                     # e.g. json.loads where 'json' was imported
-                    import_resolved = f"{bound}.{callee}"
+                    import_options = [f"{bound}.{callee}" for bound in bound_all]
                 elif receiver is None:
                     # Bare-name call: foo() where foo was imported. Not for
                     # an attribute call: v.foo() is a method call whatever v
                     # is, not a call of the imported function foo.
-                    import_resolved = scopes.lookup(callee, call, chain)
+                    import_options = scopes.lookup_all(callee, call, chain) or [None]
 
-            hints_key = (func_id, callee, receiver, import_resolved, local_type_hint)
-            if hints_key in seen_call_hints:
-                continue
-            seen_call_hints.add(hints_key)
-            seen_call_targets.add((func_id, callee, receiver))
+            for import_resolved in import_options:
+                hints_key = (func_id, callee, receiver, import_resolved, local_type_hint)
+                if hints_key in seen_call_hints:
+                    continue
+                seen_call_hints.add(hints_key)
+                seen_call_targets.add((func_id, callee, receiver))
 
-            call_meta = {
-                'unresolved': True,
-                'receiver': receiver,
-                'class_hint': class_hint,
-                'class_hint_id': class_hint_id,
-                'local_type_hint': local_type_hint,
-                'import_resolved': import_resolved,
-                'is_super_call': is_super_call,
-            }
-            if in_closure:
-                call_meta['via_closure'] = True
-            edges.append(asdict(KGEdge(
-                source=func_id, target=callee, relation='calls', metadata=call_meta
-            )))
+                call_meta = {
+                    'unresolved': True,
+                    'receiver': receiver,
+                    'class_hint': class_hint,
+                    'class_hint_id': class_hint_id,
+                    'local_type_hint': local_type_hint,
+                    'import_resolved': import_resolved,
+                    'is_super_call': is_super_call,
+                }
+                if in_closure:
+                    call_meta['via_closure'] = True
+                edges.append(asdict(KGEdge(
+                    source=func_id, target=callee, relation='calls', metadata=call_meta
+                )))
 
     def _emit_access_edges(func_id: str, func_node: Union[ast.FunctionDef, ast.AsyncFunctionDef],
                            local_types: Dict[str, str], class_name: Optional[str] = None):
@@ -759,7 +774,7 @@ def _parse_file(args: Tuple[str, str, str]) -> Optional[Dict]:
                         compatibility with callers).
         """
         # depends_on: imports actually used in this function body
-        for qualified in _get_used_imports(func_node, ImportScopes(enclosing_imports)):
+        for qualified in _get_used_imports(func_node, ImportScopes(enclosing_imports, enclosing_alternatives)):
             imp_id = _make_id(f"import_{repo}_{qualified}")
             edges.append(asdict(KGEdge(source=func_id, target=imp_id, relation='depends_on')))
 
@@ -965,16 +980,20 @@ def _parse_file(args: Tuple[str, str, str]) -> Optional[Dict]:
         and classes nested in it, so import_map is swapped for the duration
         and restored after. Everything nested inside reads the swapped map,
         which is how a closure sees its enclosing function's imports."""
-        nonlocal import_map, enclosing_imports
+        nonlocal import_map, enclosing_imports, import_alternatives, enclosing_alternatives
         outer_imports, outer_enclosing = import_map, enclosing_imports
+        outer_alternatives, outer_enclosing_alternatives = import_alternatives, enclosing_alternatives
         enclosing_imports = outer_imports
+        enclosing_alternatives = outer_alternatives
         import_map = scope_import_map_over(outer_imports, func_node)
+        import_alternatives = scope_import_alternatives_over(outer_alternatives, func_node)
         enclosing_funcs.append(func_node)
         try:
             _emit_function_body(func_node, *args, **kwargs)
         finally:
             enclosing_funcs.pop()
             import_map, enclosing_imports = outer_imports, outer_enclosing
+            import_alternatives, enclosing_alternatives = outer_alternatives, outer_enclosing_alternatives
 
     # Emit class, method, and top-level function nodes (including ones
     # nested under module-level if/try/with blocks)
