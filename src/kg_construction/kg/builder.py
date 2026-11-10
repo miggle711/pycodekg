@@ -48,6 +48,8 @@ from typing import List, Dict, Set, Optional, Tuple, Union
 # the split. These are imported as names (not *) so linters resolve them.
 from kg_construction.ast.helpers import (
     _make_id,
+    _import_bindings,
+    iter_scope_imports,
     _is_test_file,
     split_source_lines,
     _safe_unparse,
@@ -461,6 +463,36 @@ def _parse_file(args: Tuple[str, str, str]) -> Optional[Dict]:
     file_id = _make_id(f"file_{repo}_{rel_path}")
     file_type = 'test_file' if _is_test_file(rel_path) else 'file'
     import_map, exports, constants = _collect_file_level_info(tree)
+    # {local name: module path} for the module's absolute imports. A relative
+    # import is always into this repo, so it gives no hint and removes any
+    # earlier absolute binding of the same name. Used to tell pass 2 where a
+    # base class, raised exception, decorator or instantiated class comes
+    # from (see _import_hint).
+    absolute_imports: Dict[str, str] = {}
+    for stmt in iter_scope_imports(tree):
+        for local, qualified in _import_bindings(stmt):
+            if isinstance(stmt, ast.ImportFrom) and stmt.level:
+                absolute_imports.pop(local, None)
+            else:
+                absolute_imports[local] = qualified
+
+    def _import_hint(name: str) -> Optional[str]:
+        """The module path `name` comes from when its first part was imported
+        absolutely (`from collections import Counter` makes `Counter`
+        'collections.Counter'; `import argparse` makes `argparse.Action`
+        'argparse.Action'), else None."""
+        match = re.match(r'[A-Za-z_]\w*', name)
+        if not match or match.group(0) not in absolute_imports:
+            return None
+        rest = name[match.end():].split('[', 1)[0]
+        return absolute_imports[match.group(0)] + rest
+
+    def _unresolved_meta(name: str) -> Dict:
+        meta: Dict = {'unresolved': True}
+        hint = _import_hint(name)
+        if hint is not None:
+            meta['import_resolved'] = hint
+        return meta
     # What the function being emitted sees from outside itself: the module's
     # imports, plus those of the functions around it. Its own imports apply
     # from the line they are on (see ImportScopes).
@@ -848,13 +880,13 @@ def _parse_file(args: Tuple[str, str, str]) -> Optional[Dict]:
         for base in bases:
             edges.append(asdict(KGEdge(
                 source=class_id, target=base, relation='inherits',
-                metadata={'unresolved': True}
+                metadata=_unresolved_meta(base)
             )))
 
         # uses: classes instantiated within any method of this class
         for inst_cls in _get_instantiated_classes_in_class(class_node):
             edges.append(asdict(KGEdge(source=class_id, target=inst_cls, relation='uses',
-                                       metadata={'unresolved': True})))
+                                       metadata=_unresolved_meta(inst_cls))))
 
         for child in iter_scope_defs(class_node):
             if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -935,12 +967,12 @@ def _parse_file(args: Tuple[str, str, str]) -> Optional[Dict]:
         for exc_name in exc_names['raises'] + exc_names['catches']:
             edges.append(asdict(KGEdge(
                 source=func_id, target=exc_name, relation='raises',
-                metadata={'unresolved': True}
+                metadata=_unresolved_meta(exc_name)
             )))
         for dec_name in _get_bare_decorator_names(func_node):
             edges.append(asdict(KGEdge(
                 source=func_id, target=dec_name, relation='decorated_by',
-                metadata={'unresolved': True}
+                metadata=_unresolved_meta(dec_name)
             )))
 
         _record_factory_sites(func_node, enclosing_class_id=enclosing_class_id)
@@ -1278,6 +1310,15 @@ class RepoASTParser:
                 parts = node['metadata'].get('path', '').split('/')
                 repo_module_names.update(parts[:-1])
                 repo_module_names.add(parts[-1].removesuffix('.py'))
+        # The names an absolute import of this repo can start with: the first
+        # part of each path, or the one under src/.
+        repo_top_names: Set[str] = set()
+        for node in all_nodes:
+            if node['type'] in ('file', 'test_file'):
+                parts = node['metadata'].get('path', '').split('/')
+                if parts[0] == 'src' and len(parts) > 1:
+                    parts = parts[1:]
+                repo_top_names.add(parts[0].removesuffix('.py'))
 
         # Derived from class_method_to_ids (no extra AST walk needed): the
         # same index, filtered to @property/@cached_property-decorated
@@ -1303,6 +1344,7 @@ class RepoASTParser:
             'class_method_to_ids': class_method_to_ids,
             'class_methods_by_id': class_methods_by_id,
             'repo_module_names': repo_module_names,
+            'repo_top_names': repo_top_names,
             'property_method_to_ids': property_method_to_ids,
             'qualified_to_ids': qualified_to_ids,
             'nodes_by_id': nodes_by_id,
@@ -1323,6 +1365,21 @@ class RepoASTParser:
         class_method_to_ids = indices['class_method_to_ids']
         class_methods_by_id = indices['class_methods_by_id']
         repo_module_names = indices['repo_module_names']
+        repo_top_names = indices['repo_top_names']
+
+        def _imported_from_outside(meta: Dict) -> bool:
+            """Whether an edge's name was imported from a module outside the
+            repo (#211). A standard library module counts as outside unless it
+            is one of the repo's own top level packages: repo_module_names
+            holds every nested directory and module name (#212), so a stdlib
+            name like collections can be in it by coincidence."""
+            qualified = meta.get('import_resolved')
+            if not qualified:
+                return False
+            top = qualified.split('.', 1)[0]
+            if top in repo_top_names:
+                return False
+            return top not in repo_module_names or top in sys.stdlib_module_names
         property_method_to_ids = indices['property_method_to_ids']
         qualified_to_ids = indices['qualified_to_ids']
         nodes_by_id = indices['nodes_by_id']
@@ -1342,7 +1399,8 @@ class RepoASTParser:
         # one pass, in file order).
         base_ids_by_class: Dict[str, List[str]] = defaultdict(list)
         for raw in all_edges:
-            if raw['relation'] == 'inherits' and raw.get('metadata', {}).get('unresolved'):
+            if (raw['relation'] == 'inherits' and raw.get('metadata', {}).get('unresolved')
+                    and not _imported_from_outside(raw['metadata'])):
                 for parent_id in _base_matches(raw['source'], raw['target']):
                     if parent_id not in base_ids_by_class[raw['source']]:
                         base_ids_by_class[raw['source']].append(parent_id)
@@ -1528,6 +1586,8 @@ class RepoASTParser:
                         )))
 
             elif edge['relation'] == 'inherits' and meta.get('unresolved'):
+                if _imported_from_outside(meta):
+                    continue
                 matches = _base_matches(edge['source'], edge['target'])
                 if not matches:
                     continue
@@ -1542,6 +1602,8 @@ class RepoASTParser:
                         )))
 
             elif edge['relation'] == 'raises' and meta.get('unresolved'):
+                if _imported_from_outside(meta):
+                    continue
                 # Only resolves when the raised/caught name is a real
                 # in-repo class (kg_construction#112) -- builtins and
                 # external exceptions have nothing to match and are
@@ -1561,6 +1623,8 @@ class RepoASTParser:
                         )))
 
             elif edge['relation'] == 'decorated_by' and meta.get('unresolved'):
+                if _imported_from_outside(meta):
+                    continue
                 # Check both indices unconditionally, not short-circuited,
                 # a class and function of the same name can both exist
                 # (kg_construction#135 review).
@@ -1608,6 +1672,8 @@ class RepoASTParser:
                         )))
 
             elif edge['relation'] == 'uses' and meta.get('unresolved'):
+                if _imported_from_outside(meta):
+                    continue
                 matches = class_label_to_ids.get(edge['target'], [])
                 if not matches:
                     continue
