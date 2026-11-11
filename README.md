@@ -46,7 +46,7 @@ kg = builder.build('psf/requests', 'a0df2cbb')
 builder.save('psf/requests', kg)
 
 # Load and query
-with open('kg_output/kg_psf_requests.json') as f:
+with open('kg_output/kg_psf_requests_a0df2cbb.json') as f:  # save() names it kg_{repo}_{commit[:8]}.json
     kg = json.load(f)
 
 engine = KGQueryEngine(kg)
