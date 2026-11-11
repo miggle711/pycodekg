@@ -22,7 +22,10 @@ The repositories come from the bare clones in --cache-dir (default
 repo_cache/, names like psf__requests). A short name such as `requests`
 matches the clone whose directory ends in `__requests`. Their HEAD is
 exported once and used for both builds, so the only difference between the
-two KGs is the code under test. Django takes a few minutes per build.
+two KGs is the code under test. Django takes a few minutes per build. The
+commit of each repository is printed on a `repos:` line under the refs, so a
+table can be compared with one from another cache (two caches at different
+commits give different numbers).
 
 Edges are compared by (relation, source id, target id), and nodes by id. Node
 IDs are deterministic hashes of the qualified name, so a difference is a real
@@ -50,6 +53,14 @@ DEFAULT_REPOS = ["requests", "pytest", "django"]
 
 def _run(cmd, **kwargs):
     return subprocess.run(cmd, check=True, **kwargs)
+
+
+def _clone_commit(clone: Path) -> str:
+    """The short commit a bare clone's HEAD points at: the source tree both
+    builds use, so a table can be compared with one from another cache."""
+    out = _run(["git", "--git-dir", str(clone), "rev-parse", "--short=10", "HEAD"],
+               capture_output=True, text=True)
+    return out.stdout.strip()
 
 
 def _resolve(ref: str) -> str:
@@ -156,6 +167,8 @@ def main():
 
     refs = {"before": args.before, "after": args.after}
     print(f"before: {args.before} ({_resolve(args.before)})   after: {args.after} ({_resolve(args.after)})")
+    clones = {short: _find_clone(args.cache_dir, short) for short in args.repos}
+    print("repos: " + ", ".join(f"{short} @ {_clone_commit(clone)}" for short, clone in clones.items()))
     with tempfile.TemporaryDirectory(prefix="kg_diff_") as tmp:
         tmp = Path(tmp)
         srcs = {}
@@ -165,7 +178,7 @@ def main():
 
         rows, type_rows, details, any_diff = [], [], [], False
         for short in args.repos:
-            clone = _find_clone(args.cache_dir, short)
+            clone = clones[short]
             source = tmp / f"source_{short}"
             _export(["--git-dir", str(clone)], "HEAD", source)
             print(f"building {short} ...", flush=True)

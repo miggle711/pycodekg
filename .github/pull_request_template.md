@@ -15,7 +15,7 @@ Fixes #
 
 ## Validation on real code
 
-<!-- Only if this changes KG contents: paste the table from scripts/kg_diff.py and say what the removed edges are. Otherwise write "not applicable". -->
+<!-- Only if this changes KG contents: paste the output of scripts/kg_diff.py (with its `before:` and `repos:` lines) and say what the removed edges are. Otherwise write "not applicable". -->
 
 ## Schema version
 
