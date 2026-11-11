@@ -101,3 +101,4 @@ def test_a_class_re_exported_by_the_imported_module_is_reached(tmp_path):
              "pkg/dfm.py": "from ._impl import DFM\n",
              "pkg/user.py": "from .dfm import DFM\ndef f(d):\n    return DFM.supports(d)\n"}
     assert _calls(tmp_path, files, "f") == [("pkg/_impl.py", "DFM.supports", "qualified")]
+

@@ -77,6 +77,7 @@ from kg_construction.ast.helpers import (
     _collect_file_level_info,
     ImportScopes,
     call_scope_chains,
+    nested_class_of_calls,
     call_expression_scope_names,
     scope_import_map_over,
     scope_import_alternatives,
@@ -180,6 +181,9 @@ MAX_FILE_LINES = 20000
 #    decorated_by edge is dropped when its name was imported from outside the
 #    repo. A method is only found as module.Class.name, so a bare call or a
 #    call on a module no longer reaches a method of that name.
+# 14: in the methods of a class defined inside a function, self, cls and
+#    super() are resolved against that class, also for the outer function's
+#    via_closure copy of those calls, instead of the outer class.
 # 15: a call through an import is resolved through the module it names: a
 #    relative import keeps its dots ('.a.b') and is resolved from the
 #    importing file, an absolute one through the repo's files (src/ layouts),
@@ -623,6 +627,9 @@ def _parse_file(args: Tuple[str, str, str]) -> Optional[Dict]:
                          same function body twice for the same data.
         """
         own_calls, closure_calls = iter_calls_by_scope(func_node)
+        # Calls in the methods of a class defined inside this function: their
+        # self/cls/super() mean that class (#177).
+        nested_classes = nested_class_of_calls(func_node)
         scopes = ImportScopes(enclosing_imports, enclosing_alternatives)
         chains = call_scope_chains(func_node)
         expression_names = call_expression_scope_names(func_node)
@@ -668,8 +675,15 @@ def _parse_file(args: Tuple[str, str, str]) -> Optional[Dict]:
                 # `if m is None: import a as m`): resolve through it.
                 receiver_is_local = False
 
+            nested_cls = nested_classes.get(id(call))
+            nested_cls_id = (_make_id(f"class_{repo}_{rel_path}_{qualnames[id(nested_cls)]}")
+                             if nested_cls is not None else None)
             if is_super_call:
                 pass  # resolved in pass 2 via the caller's own inherits chain
+            elif receiver in ('self', 'cls') and nested_cls is not None:
+                # In a nested class's method, not the outer class's self.
+                class_hint = nested_cls.name
+                class_hint_id = nested_cls_id
             elif receiver == 'self' and class_name is not None:
                 class_hint = class_name
                 # The exact class node, so pass 2 does not have to guess
@@ -706,7 +720,10 @@ def _parse_file(args: Tuple[str, str, str]) -> Optional[Dict]:
                             receiver_path = True
 
             for import_resolved in import_options:
-                hints_key = (func_id, callee, receiver, import_resolved, local_type_hint)
+                # The nested class is part of the key: self.helper() in the
+                # function and in a nested class's method are different calls.
+                hints_key = (func_id, callee, receiver, import_resolved, local_type_hint,
+                             nested_cls_id)
                 if hints_key in seen_call_hints:
                     continue
                 seen_call_hints.add(hints_key)
@@ -721,6 +738,9 @@ def _parse_file(args: Tuple[str, str, str]) -> Optional[Dict]:
                     'import_resolved': import_resolved,
                     'is_super_call': is_super_call,
                 }
+                if is_super_call and nested_cls_id is not None:
+                    # super() walks the nested class's bases, not the caller's.
+                    call_meta['super_class_id'] = nested_cls_id
                 if receiver_path:
                     call_meta['import_via_receiver_path'] = True
                 if in_closure:
@@ -2155,6 +2175,9 @@ class RepoASTParser:
                 if nodes_by_id.get(cid, {}).get('metadata', {}).get('filepath') == caller_filepath
             ]
             caller_class_ids = same_file_candidates or candidates
+            if edge.get('metadata', {}).get('super_class_id'):
+                # A super() call in a nested class's method (#177).
+                caller_class_ids = [edge['metadata']['super_class_id']]
 
             method_name = edge['target']
             for caller_class_id in caller_class_ids:
