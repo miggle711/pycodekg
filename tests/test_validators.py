@@ -47,6 +47,16 @@ class TestKGValidator:
         assert is_valid is True
         assert '✅' in report or 'passed' in report.lower()
 
+    @pytest.mark.parametrize("edge", [
+        {'source': 'n1', 'target': 'missing', 'relation': 'depends_on'},
+        {'source': 'missing', 'target': 'n2', 'relation': 'calls'},
+    ], ids=["missing_target", "missing_source"])
+    def test_an_edge_to_a_missing_node_is_an_error(self, valid_kg, edge):
+        valid_kg['edges'].append(edge)
+        is_valid, report = KGValidator(valid_kg).validate()
+        assert is_valid is False
+        assert "Dangling edges (1; " in report and edge['relation'] in report and "missing" in report
+
     def test_validate_kg_with_orphans(self, kg_with_orphans):
         """Detect orphaned nodes."""
         validator = KGValidator(kg_with_orphans)
