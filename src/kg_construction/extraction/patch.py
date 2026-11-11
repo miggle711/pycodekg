@@ -99,6 +99,58 @@ def _innermost_range(ranges: List[_FunctionRange], line: int) -> Optional[_Funct
     return min(containing, key=lambda r: r.end_line - r.start_line)
 
 
+_HUNK_HEADER = re.compile(r'^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))?')
+
+
+def _iter_patch_lines(lines: List[str]):
+    """Yield (file, kind, line) for a unified diff's lines.
+
+    file is the `+++ b/<path>` of the file the line belongs to (None before
+    the first one, or for a header without `b/`). kind is '@@' for a hunk
+    header, and '-', '+' or ' ' for a line inside a hunk. File headers and
+    other lines outside a hunk are not yielded.
+
+    A hunk header's line counts (`@@ -a,b +c,d @@`, a count of 1 when left
+    out) say how many lines belong to the hunk. Inside it, every line is
+    content whatever it starts with: a removed line whose own text starts
+    with `--` is `---...` there, and an added one starting with `++` is
+    `+++...` (#186). A context line that lost its leading space (an empty
+    line) is context, and `\\ No newline at end of file` is skipped. A line
+    that can not be in a hunk at all (`@@`, `diff --git`) ends it early, so a
+    hand-written patch whose counts are too high still parses.
+    """
+    current_file = None
+    old_left = new_left = 0
+    for line in lines:
+        if (old_left > 0 or new_left > 0) and line[:1] not in ('', ' ', '-', '+', '\\'):
+            # Every hunk line starts with one of those, so anything else
+            # (another `@@`, `diff --git`) means the counts were too high,
+            # as in a hand-written patch: the hunk has ended.
+            old_left = new_left = 0
+        if old_left > 0 or new_left > 0:
+            if line.startswith('\\'):
+                continue
+            kind = line[:1]
+            if kind == '-':
+                old_left -= 1
+            elif kind == '+':
+                new_left -= 1
+            else:
+                kind = ' '
+                old_left -= 1
+                new_left -= 1
+            yield current_file, kind, line
+        elif line.startswith('+++'):
+            match = re.match(r'^\+\+\+ b/(.+)$', line)
+            current_file = match.group(1) if match else None
+        elif line.startswith('@@'):
+            match = _HUNK_HEADER.match(line)
+            if match:
+                old_left = int(match.group(2)) if match.group(2) is not None else 1
+                new_left = int(match.group(4)) if match.group(4) is not None else 1
+            yield current_file, '@@', line
+
+
 def _changed_pre_patch_lines(patch: str, code_file: str) -> Tuple[Set[int], Set[int]]:
     """Return (removed_lines, insertion_anchor_lines): pre-patch line
     numbers, in code_file, that a changed line should be attributed
@@ -133,19 +185,13 @@ def _changed_pre_patch_lines(patch: str, code_file: str) -> Tuple[Set[int], Set[
     """
     removed_lines: Set[int] = set()
     insertion_anchor_lines: Set[int] = set()
-    current_file = None
     old_lineno = None
 
-    for line in patch.split('\n'):
-        if line.startswith('+++'):
-            match = re.match(r'^\+\+\+ b/(.+)$', line)
-            current_file = match.group(1) if match else None
-            continue
-
+    for current_file, kind, line in _iter_patch_lines(patch.split('\n')):
         if current_file != code_file:
             continue
 
-        if line.startswith('@@'):
+        if kind == '@@':
             match = re.match(r'^@@ -(\d+)', line)
             old_lineno = int(match.group(1)) if match else None
             continue
@@ -153,14 +199,14 @@ def _changed_pre_patch_lines(patch: str, code_file: str) -> Tuple[Set[int], Set[
         if old_lineno is None:
             continue
 
-        if line.startswith('-') and not line.startswith('---'):
+        if kind == '-':
             removed_lines.add(old_lineno)
             old_lineno += 1
-        elif line.startswith('+') and not line.startswith('+++'):
+        elif kind == '+':
             insertion_anchor_lines.add(old_lineno)
             if old_lineno > 1:
                 insertion_anchor_lines.add(old_lineno - 1)
-        elif line.startswith(' '):
+        else:
             old_lineno += 1
 
     return removed_lines, insertion_anchor_lines
@@ -195,7 +241,6 @@ def reconstruct_post_patch_source(pre_patch_source: str, patch: str, code_file: 
     pre_lines = pre_patch_source.split('\n')
     out_lines: List[str] = []
     pre_idx = 0  # 0-indexed cursor into pre_lines
-    current_file = None
     saw_any_hunk = False
 
     # A trailing '' is a real artifact of splitting a newline-terminated
@@ -204,24 +249,13 @@ def reconstruct_post_patch_source(pre_patch_source: str, patch: str, code_file: 
     lines = patch.split('\n')
     if patch.endswith('\n'):
         lines = lines[:-1]
-    i = 0
-    while i < len(lines):
-        line = lines[i]
-
-        if line.startswith('+++'):
-            match = re.match(r'^\+\+\+ b/(.+)$', line)
-            current_file = match.group(1) if match else None
-            i += 1
-            continue
-
+    for current_file, kind, line in _iter_patch_lines(lines):
         if current_file != code_file:
-            i += 1
             continue
 
-        if line.startswith('@@'):
+        if kind == '@@':
             match = re.match(r'^@@ -(\d+)', line)
             if not match:
-                i += 1
                 continue
             saw_any_hunk = True
             hunk_start = int(match.group(1)) - 1  # 0-indexed
@@ -235,34 +269,25 @@ def reconstruct_post_patch_source(pre_patch_source: str, patch: str, code_file: 
             # start) and the start of this one, unchanged.
             out_lines.extend(pre_lines[pre_idx:hunk_start])
             pre_idx = hunk_start
-            i += 1
             continue
 
         if not saw_any_hunk:
-            i += 1
             continue
 
-        if line.startswith('-') and not line.startswith('---'):
+        if kind == '-':
             # Must match pre_patch_source at this position (kg_construction#128).
             if pre_idx >= len(pre_lines) or pre_lines[pre_idx] != line[1:]:
                 return None
             pre_idx += 1  # removed: present in pre, absent from post
-        elif line.startswith('+') and not line.startswith('+++'):
+        elif kind == '+':
             out_lines.append(line[1:])  # added: present in post only
-        elif line.startswith(' '):
+        else:
+            # Context. A blank line with no marker at all (some diffs omit
+            # the leading space on a genuinely empty context line) is ''.
             if pre_idx >= len(pre_lines) or pre_lines[pre_idx] != line[1:]:
                 return None
             out_lines.append(pre_lines[pre_idx])
             pre_idx += 1
-        # A blank line with no marker at all (some diffs omit the leading
-        # space on a genuinely empty context line) behaves like context.
-        elif line == '':
-            if pre_idx >= len(pre_lines) or pre_lines[pre_idx] != '':
-                return None
-            out_lines.append(pre_lines[pre_idx])
-            pre_idx += 1
-
-        i += 1
 
     if not saw_any_hunk:
         return None
@@ -290,19 +315,13 @@ def _changed_post_patch_lines(patch: str, code_file: str) -> Set[int]:
     exact shape of bug kg_construction#71 fixed).
     """
     changed_lines: Set[int] = set()
-    current_file = None
     new_lineno = None
 
-    for line in patch.split('\n'):
-        if line.startswith('+++'):
-            match = re.match(r'^\+\+\+ b/(.+)$', line)
-            current_file = match.group(1) if match else None
-            continue
-
+    for current_file, kind, line in _iter_patch_lines(patch.split('\n')):
         if current_file != code_file:
             continue
 
-        if line.startswith('@@'):
+        if kind == '@@':
             match = re.match(r'^@@ -\d+(?:,\d+)? \+(\d+)', line)
             new_lineno = int(match.group(1)) if match else None
             continue
@@ -310,12 +329,12 @@ def _changed_post_patch_lines(patch: str, code_file: str) -> Set[int]:
         if new_lineno is None:
             continue
 
-        if line.startswith('+') and not line.startswith('+++'):
+        if kind == '+':
             changed_lines.add(new_lineno)
             new_lineno += 1
-        elif line.startswith('-') and not line.startswith('---'):
+        elif kind == '-':
             changed_lines.add(new_lineno)
-        elif line.startswith(' '):
+        else:
             new_lineno += 1
 
     return changed_lines
