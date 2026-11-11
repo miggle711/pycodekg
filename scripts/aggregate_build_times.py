@@ -18,6 +18,13 @@ the numbers together, no new instrumentation required.
 Usage:
     python scripts/aggregate_build_times.py --kg-dir kg_output --out build_times.csv
 
+Extraction (clone if needed, then git archive) is reported in its own
+columns, build_time_extraction_s and extraction_cached, and summarised
+separately for cold builds (no cached clone) and warm ones (pycodekg#40).
+build_time_total_s stays parsing + resolution, so it is comparable with
+KGs built before extraction was timed. KGs from build_from_dir() or from
+before then have blank extraction columns.
+
 Files built before this instrumentation existed have no
 build_time_parsing_s/build_time_resolution_s keys in their metadata at
 all -- skipped, counted, and reported separately, not silently averaged
@@ -30,6 +37,12 @@ import glob
 import json
 import os
 import sys
+
+
+def _blank_if_none(value):
+    """Blank rather than None or 0 for a field a KG predates, so it is not
+    misread as a real zero."""
+    return "" if value is None else value
 
 
 def main():
@@ -73,6 +86,8 @@ def main():
                 "build_time_parsing_s": parsing_s,
                 "build_time_resolution_s": resolution_s,
                 "build_time_total_s": round(total_s, 3),
+                "build_time_extraction_s": _blank_if_none(metadata.get("build_time_extraction_s")),
+                "extraction_cached": _blank_if_none(metadata.get("extraction_cached")),
                 # Real code-size normalization (RQ4): raw seconds alone
                 # can't distinguish "this repo is slow because it's huge"
                 # from "this repo is slow because something's inefficient".
@@ -142,6 +157,20 @@ def main():
     _print_normalized_summary(
         "build_time_total_s_per_1k_edges", "per 1k edges", "s/1k edges", "edge_count", "the per-edge"
     )
+    for cached, label in ((False, "cold (cloned)"), (True, "warm (cached)")):
+        vals = [r["build_time_extraction_s"] for r in rows
+                if r["extraction_cached"] is cached and r["build_time_extraction_s"] != ""]
+        if vals:
+            print(
+                f"  extraction, {label}: n={len(vals)}  mean {sum(vals) / len(vals):.3f}s  "
+                f"min {min(vals):.3f}s  max {max(vals):.3f}s"
+            )
+    no_extraction = sum(1 for r in rows if r["build_time_extraction_s"] == "")
+    if no_extraction:
+        print(
+            f"    {no_extraction} KG(s) have no extraction timing (built from a "
+            f"directory, or before it was recorded)."
+        )
     if skipped:
         print(
             f"  {len(skipped)} file(s) skipped (built before this "
