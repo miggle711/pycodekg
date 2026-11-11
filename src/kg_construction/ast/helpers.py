@@ -209,6 +209,31 @@ def call_scope_chains(
     return scope_chains(func_node, (ast.Call,))
 
 
+def nested_class_of_calls(
+    func_node: Union[ast.FunctionDef, ast.AsyncFunctionDef],
+) -> Dict[int, ast.ClassDef]:
+    """For every Call in the body of a method of a class defined inside
+    `func_node` (or in a closure of such a method), keyed by id(call): that
+    class, the innermost one if they nest. In those calls `self`, `cls` and
+    super() mean that class, not the class `func_node` belongs to (#177).
+    A class's decorators and bases, and what its body runs directly, are
+    evaluated in the enclosing scope, so they are not mapped."""
+    found: Dict[int, ast.ClassDef] = {}
+    stack: List[Tuple[ast.AST, Optional[ast.ClassDef], bool]] = [(func_node, None, False)]
+    while stack:
+        node, cls, in_method = stack.pop()
+        if isinstance(node, ast.Call) and cls is not None and in_method:
+            found[id(node)] = cls
+        if node is not func_node and isinstance(node, ast.ClassDef):
+            kids = [(stmt, node, False) for stmt in node.body]
+        elif node is not func_node and isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            kids = [(stmt, cls, cls is not None) for stmt in node.body]
+        else:
+            kids = [(child, cls, in_method) for child in ast.iter_child_nodes(node)]
+        stack.extend(kids)
+    return found
+
+
 def scope_chains(
     func_node: Union[ast.FunctionDef, ast.AsyncFunctionDef],
     kinds: Tuple[type, ...],
