@@ -1626,9 +1626,17 @@ def _merge_states(a: Optional[_FlowState], b: Optional[_FlowState]) -> Optional[
 
 
 def _stored_names(node: ast.AST) -> List[str]:
-    """Names a target expression (or a walrus inside an expression) binds."""
+    """Names a target expression (or a walrus inside an expression) binds in
+    the enclosing scope. A comprehension's loop variables are its own scope in
+    Python 3, so they are left out; a walrus inside a comprehension still
+    binds in the enclosing scope, so it is kept."""
+    in_comprehension: Set[int] = {
+        id(n) for comp in ast.walk(node) if isinstance(comp, ast.comprehension)
+        for n in ast.walk(comp.target)
+    }
     return [n.id for n in ast.walk(node)
-            if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store)]
+            if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store)
+            and id(n) not in in_comprehension]
 
 
 class ScopeFlow:

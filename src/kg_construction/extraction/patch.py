@@ -117,7 +117,10 @@ def _iter_patch_lines(lines: List[str]):
     `+++...` (#186). A context line that lost its leading space (an empty
     line) is context, and `\\ No newline at end of file` is skipped. A line
     that can not be in a hunk at all (`@@`, `diff --git`) ends it early, so a
-    hand-written patch whose counts are too high still parses.
+    hand-written patch whose counts are too high still parses. Counts that are
+    too low are not detected: the lines past them are read as outside the hunk
+    and dropped (`@@ -1,1 +1,1 @@` followed by three changed lines keeps only
+    the first). Git always writes exact counts.
     """
     current_file = None
     old_left = new_left = 0
