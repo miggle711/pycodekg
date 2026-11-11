@@ -180,7 +180,10 @@ MAX_FILE_LINES = 20000
 #    decorated_by edge is dropped when its name was imported from outside the
 #    repo. A method is only found as module.Class.name, so a bare call or a
 #    call on a module no longer reaches a method of that name.
-SCHEMA_VERSION = 13
+# 14: a call of `X.as_view()` in a function also gets calls edges to the
+#    view's get, post, put, patch, delete and head methods (narrowed to the
+#    ones the function builds a request for), tagged via='as_view'.
+SCHEMA_VERSION = 14
 
 
 def _same_commit(a: Optional[str], b: Optional[str]) -> bool:
