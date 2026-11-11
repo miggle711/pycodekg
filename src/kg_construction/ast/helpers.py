@@ -1550,8 +1550,11 @@ def _import_bindings(stmt: Union[ast.Import, ast.ImportFrom]) -> List[Tuple[str,
     if isinstance(stmt, ast.Import):
         # `import os.path` → local name is 'os', full name is 'os.path'
         return [(alias.asname or alias.name.split('.')[0], alias.name) for alias in stmt.names]
-    mod = stmt.module or ''
-    return [(alias.asname or alias.name, f"{mod}.{alias.name}" if mod else alias.name)
+    # A relative import keeps its dots (`from .a import b` is '.a.b'): which
+    # package it means depends on the importing file, which pass 2 knows.
+    mod = '.' * (stmt.level or 0) + (stmt.module or '')
+    return [(alias.asname or alias.name,
+             f"{mod}.{alias.name}" if stmt.module else f"{mod}{alias.name}")
             for alias in stmt.names]
 
 
