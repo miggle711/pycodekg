@@ -102,3 +102,33 @@ def test_a_class_re_exported_by_the_imported_module_is_reached(tmp_path):
              "pkg/user.py": "from .dfm import DFM\ndef f(d):\n    return DFM.supports(d)\n"}
     assert _calls(tmp_path, files, "f") == [("pkg/_impl.py", "DFM.supports", "qualified")]
 
+
+def test_every_edge_connects_two_nodes(tmp_path):
+    # A relative import's depends_on edge once targeted a node id built
+    # without the dots, which did not exist (#224 review).
+    files = {"pkg/__init__.py": "", "pkg/sub/__init__.py": "",
+             "pkg/utils.py": "def helper(): ...\n",
+             "pkg/sub/mod.py": "def g(): ...\n",
+             "pkg/a.py": textwrap.dedent("""\
+                 import os.path
+                 import pkg.utils as u
+                 from . import utils
+                 from .utils import helper
+                 from .sub.mod import g
+                 from .. import outside
+                 from pkg.sub import mod
+                 def f():
+                     return helper(), utils.helper(), g(), mod.g(), u.helper(), os.path.join(), outside
+             """)}
+    for name, text in files.items():
+        path = tmp_path / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text)
+    kg = RepoASTParser(max_workers=1).parse_repo("test/repo", tmp_path)
+    ids = {n["id"] for n in kg["nodes"]}
+    dangling = [(e["relation"], e["source"], e["target"]) for e in kg["edges"]
+                if e["source"] not in ids or e["target"] not in ids]
+    assert dangling == []
+    depends = {n["label"] for n in kg["nodes"] for e in kg["edges"]
+               if e["relation"] == "depends_on" and e["target"] == n["id"]}
+    assert {".utils", ".utils.helper", ".sub.mod.g", "pkg.sub.mod"} <= depends

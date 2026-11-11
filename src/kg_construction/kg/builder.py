@@ -190,7 +190,7 @@ MAX_FILE_LINES = 20000
 #    and an absolute import whose top level name is no repo package is
 #    outside the repo even when a nested module shares the name (#212). A
 #    call on a dotted module path resolves its first name through the
-#    imports (#206). Relative imports' node labels now keep their dots.
+#    imports (#206). A relative import's node label and id keep their dots.
 SCHEMA_VERSION = 15
 
 
@@ -572,8 +572,10 @@ def _parse_file(args: Tuple[str, str, str]) -> Optional[Dict]:
                     import_statements[mod_id].append(statement)
         else:
             mod_name = node.module or ''
-            for alias in node.names:
-                full_name = f"{mod_name}.{alias.name}" if mod_name else alias.name
+            # The label comes from _import_bindings, which depends_on edges
+            # use too, so a relative import's node keeps its dots
+            # ('.utils.helper') and the edges to it find it.
+            for alias, (_, full_name) in zip(node.names, _import_bindings(node)):
                 imp_id = _make_id(f"import_{repo}_{full_name}")
                 if imp_id not in imports_emitted:
                     imports_emitted.add(imp_id)
