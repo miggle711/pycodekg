@@ -54,6 +54,15 @@ def test_as_view_reaches_the_views_handlers(tmp_path, views, name, expected):
     assert _handlers(tmp_path, files) == expected
 
 
+def test_the_request_method_the_caller_builds_picks_the_handler(tmp_path):
+    files = {
+        "base.py": BASE,
+        "views.py": "from base import View\nclass A(View):\n    def get(self, request): ...\n    def post(self, request): ...\n",
+        "test_views.py": "from views import A\ndef test_it(rf):\n    request = rf.post('/x/')\n    A.as_view()(request)\n",
+    }
+    assert _handlers(tmp_path, files) == [("A.post", "qualified")]
+
+
 def test_same_named_views_are_told_apart_by_the_import(tmp_path):
     files = {
         "base.py": BASE,

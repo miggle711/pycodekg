@@ -617,6 +617,13 @@ def _parse_file(args: Tuple[str, str, str]) -> Optional[Dict]:
                          same function body twice for the same data.
         """
         own_calls, closure_calls = iter_calls_by_scope(func_node)
+        # HTTP methods this function itself makes calls named after (`rf.put(...)`
+        # builds the request a test sends to a view): they say which of a view's
+        # handlers an `as_view()` call here is meant to reach.
+        called_http_methods = sorted({
+            _extract_callee_name(c) for c in own_calls + closure_calls
+            if _extract_callee_name(c) in _VIEW_HANDLERS and _extract_call_receiver(c)
+        })
         scopes = ImportScopes(enclosing_imports, enclosing_alternatives)
         chains = call_scope_chains(func_node)
         expression_names = call_expression_scope_names(func_node)
@@ -706,6 +713,8 @@ def _parse_file(args: Tuple[str, str, str]) -> Optional[Dict]:
                     # `View.as_view()(request)` reaches the view's get/post/...
                     # in pass 2 (see _resolve_view_handlers).
                     call_meta['dispatch_class'] = receiver
+                    if called_http_methods:
+                        call_meta['dispatch_methods'] = called_http_methods
                 edges.append(asdict(KGEdge(
                     source=func_id, target=callee, relation='calls', metadata=call_meta
                 )))
@@ -1604,9 +1613,10 @@ class RepoASTParser:
             X must be one class in the repo (an import of it, or the caller's
             own file, decides between same named classes; otherwise the call
             is left alone). A handler X does not define is looked up on its
-            in-repo parents. One handler is certain enough to be `qualified`;
-            with several, which one runs depends on the request, so each is
-            `name_only`.
+            in-repo parents. If the caller also calls `put(...)`, `post(...)`
+            and so on, only those handlers count. One handler is certain
+            enough to be `qualified`; with several, which one runs depends on
+            the request, so each is `name_only`.
             """
             class_name = meta['dispatch_class'].rsplit('.', 1)[-1]
             candidates = _visible_from(source_id, class_label_to_ids.get(class_name, []))
@@ -1621,18 +1631,23 @@ class RepoASTParser:
             if len(candidates) != 1:
                 return [], 'unresolved'
             class_id = candidates[0]
-            handlers: List[str] = []
+            found: Dict[str, str] = {}
             for name in _VIEW_HANDLERS:
                 own = class_methods_by_id.get((class_id, name), [])
                 if own:
-                    handlers.append(own[0])
+                    found[name] = own[0]
                     continue
                 for parent_id in base_ids_by_class.get(class_id, []):
                     inherited = self._find_nearest_ancestor_method(
                         parent_id, name, base_ids_by_class, class_methods_by_id)
                     if inherited is not None:
-                        handlers.append(inherited)
+                        found[name] = inherited
                         break
+            # The caller builds a request with one of the HTTP methods: that
+            # is the handler it exercises, if the view has it.
+            wanted = meta.get('dispatch_methods') or []
+            narrowed = {name: hid for name, hid in found.items() if name in wanted}
+            handlers = list((narrowed or found).values())
             return handlers, 'qualified' if len(handlers) == 1 else 'name_only'
 
         resolved_edges: List[Dict] = []
