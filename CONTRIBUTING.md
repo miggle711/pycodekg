@@ -29,6 +29,15 @@ for s in 0 1 42; do PYTHONHASHSEED=$s pytest tests/ -q; done
 - Write one test per real behaviour and parametrize variants of the same behaviour. Skip tests that only restate the code.
 - A regression test must fail without the fix. Check this by stashing the source change and running the test.
 
+## Issues
+
+Pick a template when you open an issue.
+
+* **KG quality bug:** a wrong or missing edge, or the wrong thing in a prompt. Give a small repro with the output you actually got, and the effect on real code if you know it.
+* **Task or RFC:** a piece of work or a design question. Give the problem, the options and the tradeoffs, and your open questions.
+
+Add one label for a KG quality bug: `wrong edges` (the KG says something false), `missing edges` (it lacks something true) or `prompt content` (what reaches the LLM prompts). Say in the issue whether the fix would change KG contents, since that needs a `scripts/kg_diff.py` table and a `SCHEMA_VERSION` bump.
+
 ## Pull requests
 
 Link the issue in the first line. Use `Fixes #N` when the PR completes the issue, and `Part of #N` when it does not, so merging does not close an issue that still has work left.
