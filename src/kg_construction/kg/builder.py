@@ -247,6 +247,11 @@ class KGEdge:
 
 _CALL_CONFIDENCE_RANK = {'qualified': 3, 'exact': 2, 'name_only': 1, 'ambiguous': 0}
 
+# The methods a class based view dispatches an HTTP request to. `X.as_view()`
+# returns a function that builds an X and calls one of these. `options` is
+# left out: the base View defines it for every view.
+_VIEW_HANDLERS = ('get', 'post', 'put', 'patch', 'delete', 'head')
+
 
 def _add_call_edge(
     call_edges: Dict[Tuple[str, str], Dict],
@@ -697,6 +702,10 @@ def _parse_file(args: Tuple[str, str, str]) -> Optional[Dict]:
                 }
                 if in_closure:
                     call_meta['via_closure'] = True
+                if callee == 'as_view' and receiver and not is_super_call:
+                    # `View.as_view()(request)` reaches the view's get/post/...
+                    # in pass 2 (see _resolve_view_handlers).
+                    call_meta['dispatch_class'] = receiver
                 edges.append(asdict(KGEdge(
                     source=func_id, target=callee, relation='calls', metadata=call_meta
                 )))
@@ -1589,6 +1598,43 @@ class RepoASTParser:
                 return hits, 'exact'
             return hits, 'name_only'
 
+        def _resolve_view_handlers(meta: Dict, source_id: str, caller_filepath: Optional[str]) -> Tuple[List[str], str]:
+            """The get/post/... methods a `X.as_view()` call can dispatch to.
+
+            X must be one class in the repo (an import of it, or the caller's
+            own file, decides between same named classes; otherwise the call
+            is left alone). A handler X does not define is looked up on its
+            in-repo parents. One handler is certain enough to be `qualified`;
+            with several, which one runs depends on the request, so each is
+            `name_only`.
+            """
+            class_name = meta['dispatch_class'].rsplit('.', 1)[-1]
+            candidates = _visible_from(source_id, class_label_to_ids.get(class_name, []))
+            if len(candidates) > 1:
+                imported = meta.get('import_resolved')
+                if imported and imported.endswith('.as_view'):
+                    candidates = [c for c in qualified_to_ids.get(imported[:-len('.as_view')], [])
+                                  if c in candidates] or candidates
+            if len(candidates) > 1:
+                candidates = [c for c in candidates
+                              if nodes_by_id.get(c, {}).get('metadata', {}).get('filepath') == caller_filepath]
+            if len(candidates) != 1:
+                return [], 'unresolved'
+            class_id = candidates[0]
+            handlers: List[str] = []
+            for name in _VIEW_HANDLERS:
+                own = class_methods_by_id.get((class_id, name), [])
+                if own:
+                    handlers.append(own[0])
+                    continue
+                for parent_id in base_ids_by_class.get(class_id, []):
+                    inherited = self._find_nearest_ancestor_method(
+                        parent_id, name, base_ids_by_class, class_methods_by_id)
+                    if inherited is not None:
+                        handlers.append(inherited)
+                        break
+            return handlers, 'qualified' if len(handlers) == 1 else 'name_only'
+
         resolved_edges: List[Dict] = []
         seen_edges: Set[Tuple] = set()
         # The resolved calls edge for each (source, target), so a later call
@@ -1616,6 +1662,15 @@ class RepoASTParser:
             if edge['relation'] == 'calls' and meta.get('unresolved'):
                 callee_name = edge['target']
                 caller_filepath = nodes_by_id.get(edge['source'], {}).get('metadata', {}).get('filepath')
+                if meta.get('dispatch_class'):
+                    handlers, handler_confidence = _resolve_view_handlers(meta, edge['source'], caller_filepath)
+                    for handler_id in handlers:
+                        handler_meta = {'confidence': handler_confidence, 'import_resolved': None,
+                                        'via': 'as_view'}
+                        if meta.get('via_closure'):
+                            handler_meta['via_closure'] = True
+                        _add_call_edge(call_edges, resolved_edges, seen_edges,
+                                       edge['source'], handler_id, handler_meta)
                 matches, confidence = _resolve_call(meta, callee_name, caller_filepath, edge['source'])
                 if not matches:
                     continue
