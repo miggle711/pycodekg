@@ -46,13 +46,13 @@ The description should show the change on real input, not describe it:
 
 If a PR changes which nodes, edges or metadata a KG contains, do two more things.
 
-1. **Validate on real code.** Run `scripts/kg_diff.py` and paste the table into the description:
+1. **Validate on real code.** Run `scripts/kg_diff.py` and paste its output into the description, including the `before:` and `repos:` lines under it:
 
    ```
    python scripts/kg_diff.py --before origin/main --after HEAD --repos requests pytest django
    ```
 
-   It builds a KG from the same repositories with the code at each ref and reports how many edges were removed and added per relation, which nodes changed type, and a labelled sample. Look at the removed edges: each should be a false link going away or an edge being retargeted, and the description should say which.
+   It builds a KG from the same repositories with the code at each ref and reports how many edges were removed and added per relation, which nodes changed type, and a labelled sample. The `repos:` line names the commit of each repository that was measured. Two caches at different commits give different numbers, so if your table and a reviewer's disagree, compare those commits first. Look at the removed edges: each should be a false link going away or an edge being retargeted, and the description should say which.
 2. **Bump `SCHEMA_VERSION`** in `src/kg_construction/kg/builder.py` and add a line to the comment block above it describing the change. A cached KG with an older version is rejected by `load()`. If a KG rebuild is already queued behind other PRs, say so in the description instead of bumping again.
 
 A change that only affects the shape of the KG (new fields, node types or relations) needs the bump too.

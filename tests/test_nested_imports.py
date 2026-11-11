@@ -82,6 +82,40 @@ class TestImportsOutsideTheModuleBody:
         assert confidence["inner"] == "qualified"
         assert confidence["g"] != "qualified"
 
+    def test_every_import_binding_a_function_uses_is_a_dependency(self, tmp_path):
+        kg = _build(tmp_path, {
+            "a.py": "def run(): ...\n",
+            "b.py": "def run(): ...\n",
+            "m.py": """
+                import a as client
+
+                def f():
+                    client.run()
+                    import b as client
+                    client.run()
+            """,
+        })
+        # The first call goes through the module's import of a, the second
+        # through f's own import of b, so f depends on both (#200).
+        assert _run_targets(kg) == [("f", "a.py"), ("f", "b.py")]
+        assert _labels(kg, "depends_on") == [("f", "a"), ("f", "b")]
+
+    def test_a_functions_own_type_checking_import_is_a_dependency(self, tmp_path):
+        kg = _build(tmp_path, {
+            "models.py": "class Model: ...\n",
+            "m.py": """
+                from typing import TYPE_CHECKING
+
+                def f(x) -> "Model":
+                    if TYPE_CHECKING:
+                        from models import Model
+                    y: Model = x
+                    return y
+            """,
+        })
+        # Not a runtime binding, but f still depends on models.Model.
+        assert ("f", "models.Model") in _labels(kg, "depends_on")
+
     @pytest.mark.parametrize("header", [
         "import a as client\nif TYPE_CHECKING:\n    import b as client\n",
         "if TYPE_CHECKING:\n    import b as client\nimport a as client\n",
