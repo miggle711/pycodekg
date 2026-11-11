@@ -175,7 +175,12 @@ MAX_FILE_LINES = 20000
 #    `if`/`elif`/`else` imports in several branches gets a calls edge (and a
 #    depends_on edge) per branch. A name both imported and assigned in one
 #    function (`except ImportError: m = None`) goes through its import.
-SCHEMA_VERSION = 12
+# 13: three resolution rules were tightened. Code outside the tests is never
+#    linked to a definition in a test file. An inherits, uses, raises or
+#    decorated_by edge is dropped when its name was imported from outside the
+#    repo. A method is only found as module.Class.name, so a bare call or a
+#    call on a module no longer reaches a method of that name.
+SCHEMA_VERSION = 13
 
 
 def _same_commit(a: Optional[str], b: Optional[str]) -> bool:
