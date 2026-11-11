@@ -18,6 +18,7 @@ pkg-run build . --name my-project
 # Query it
 pkg-run query kg_output/kg_psf_requests_a0df2cbb.json --callers send
 pkg-run query kg_output/kg_psf_requests_a0df2cbb.json --callees send
+pkg-run query kg_output/kg_psf_requests_a0df2cbb.json --callers send --min-confidence exact
 pkg-run query kg_output/kg_psf_requests_a0df2cbb.json --file sessions.py
 pkg-run query kg_output/kg_psf_requests_a0df2cbb.json --tests send
 pkg-run query kg_output/kg_psf_requests_a0df2cbb.json --class Session
@@ -171,6 +172,8 @@ For `calls`:
 
 For `inherits`, `uses`, `raises` and `decorated_by`, the label is `exact` when one definition matches and `ambiguous` when several do.
 
+To leave the weaker calls out, pass `min_confidence` (`'name_only'`, `'exact'` or `'qualified'`) to `find_callers`, `find_callees` and `find_test_functions_for`, or `--min-confidence` to `pkg-run query`. `LLMSerializer(min_call_confidence=...)` does the same for the callers and callees in a prompt. By default nothing is filtered.
+
 A few rules that explain results you might not expect:
 * Imports are followed in order. A call goes through the import that has run by that point in the function, so a rebound name counts as each import in turn.
 * In `try: import a as c` / `except ImportError: import b as c`, calls go to `a`, the `try` body. If a name is imported in each branch of an `if`/`else`, calls and `depends_on` edges go to every branch.
@@ -229,6 +232,7 @@ engine.get_class_methods(class_id)          # list of method nodes
 # Call graph
 engine.find_callers(func_id)                # functions that call this one
 engine.find_callees(func_id)                # functions this one calls
+engine.find_callers(func_id, min_confidence='exact')  # leave out name_only guesses
 engine.find_test_functions_for(func_id)     # test functions covering this function
 
 # Search
