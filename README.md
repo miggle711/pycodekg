@@ -82,6 +82,27 @@ print(report)
 
 `llm/llm_serializer.py` turns an extracted subgraph into the JSON that goes into a prompt. It leaves test code out of the callers, callees and related classes, so a prompt for writing tests does not show the model the tests that already exist.
 
+`scripts/build_kg_prompts.py` renders the serializer's seed and context sections
+into a `kg_prompts.json` file. Each instance entry has this shape:
+
+```json
+{
+  "context": "<KG-derived source and structural context>",
+  "target_functions": ["calculate"],
+  "target_classes": [null]
+}
+```
+
+The file maps dataset instance IDs to those entries. `context` contains the
+seed blocks and available callers, callees, sibling methods and related
+classes. Testgeneval's `inference/configs/shared_task.py` supplies the system
+message, target-specific task text and output format for both arms. Pycodekg
+does not add those instructions to the context block.
+
+Use the companion shared-instructions version of testgeneval (#103) with this
+format. Its reader rejects older entries containing a full `prompt` instead
+of `context`; regenerate those files with `scripts/build_kg_prompts.py`.
+
 ## Optional: pyright-backed type inference
 
 The uppercase-heuristic that detects `uses` edges (`x = SomeClass()`) can't see class
