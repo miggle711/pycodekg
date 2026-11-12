@@ -803,20 +803,36 @@ def _stmt_start(stmt: ast.stmt) -> int:
     return min([d.lineno for d in getattr(stmt, 'decorator_list', [])] + [stmt.lineno])
 
 
+def _body_on_header_line(stmt: ast.stmt, source_lines: List[str]) -> bool:
+    """True when a def or class has its body on the header's last line.
+
+    `def f(): ...`, and the typed-overload form whose signature wraps and
+    closes with `) -> T: ...`. Only simple statements can follow the colon,
+    so such a body is one logical line and the statement is kept whole.
+    """
+    first = stmt.body[0]
+    if getattr(first, 'decorator_list', None):
+        return False  # a decorated statement starts its own line
+    line = source_lines[first.lineno - 1].encode('utf-8')
+    return bool(line[:first.col_offset].strip())
+
+
 def _outline_lines(stmts: List[ast.stmt], source_lines: List[str]) -> List[str]:
     out: List[str] = []
     for stmt in stmts:
         start = _stmt_start(stmt)
-        body = getattr(stmt, 'body', None)
         is_def = isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef))
         is_class = isinstance(stmt, ast.ClassDef)
         if (is_def and stmt.name not in _OUTLINE_FULL_METHODS or is_class) \
-                and body and body[0].lineno > stmt.lineno:
+                and not _body_on_header_line(stmt, source_lines):
             # Header lines only (decorators and the def/class line,
-            # wrapped parameters included).
-            out.extend(line.rstrip('\n') for line in source_lines[start - 1:body[0].lineno - 1])
+            # wrapped parameters included). The header ends where the first
+            # body statement starts, and that statement's own decorators
+            # are part of it, not of the header.
+            body_start = _stmt_start(stmt.body[0])
+            out.extend(line.rstrip('\n') for line in source_lines[start - 1:body_start - 1])
             if is_class:
-                out.extend(_outline_lines(body, source_lines))
+                out.extend(_outline_lines(stmt.body, source_lines))
             else:
                 header = source_lines[stmt.lineno - 1]
                 indent = header[:len(header) - len(header.lstrip())]
@@ -843,10 +859,10 @@ def _get_class_outline(
     if not source_lines or not class_node.body:
         return "", ""
     start = _stmt_start(class_node)
-    first_body = class_node.body[0].lineno
-    if first_body == class_node.lineno:  # class A: pass
+    if _body_on_header_line(class_node, source_lines):  # class A: pass
         text = "".join(source_lines[start - 1:class_node.end_lineno]).rstrip()
         return text, text
+    first_body = _stmt_start(class_node.body[0])
     header_lines = [line.rstrip('\n') for line in source_lines[start - 1:first_body - 1]]
     body_lines = _outline_lines(class_node.body, source_lines)
     if len(body_lines) > max_lines:
