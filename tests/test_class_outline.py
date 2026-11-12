@@ -88,6 +88,93 @@ def test_one_line_class_is_kept_as_is():
     assert _outline("class A: pass\n") == ("class A: pass", "class A: pass")
 
 
+def test_signature_that_closes_on_the_body_line_is_kept_whole():
+    # The typed @overload form: the body shares the signature's last line.
+    # Cutting before the body dropped that line and left the "(" open.
+    source = (
+        "class A:\n"
+        "    @overload\n"
+        "    def f(\n"
+        "        self,\n"
+        "        data: int,\n"
+        "    ) -> int: ...\n"
+        "    def g(self):\n"
+        "        return 1\n"
+    )
+    _, outline = _outline(source)
+    assert outline == (
+        "class A:\n"
+        "    @overload\n"
+        "    def f(\n"
+        "        self,\n"
+        "        data: int,\n"
+        "    ) -> int: ...\n"
+        "    def g(self):\n"
+        "        ..."
+    )
+    ast.parse(outline)
+
+
+def test_body_on_the_signature_line_is_kept_to_its_last_line():
+    source = (
+        "class A:\n"
+        "    def f(\n"
+        "        self,\n"
+        "    ): return dict(\n"
+        "        a=1,\n"
+        "    )\n"
+    )
+    _, outline = _outline(source)
+    assert outline == source.rstrip()
+    ast.parse(outline)
+
+
+def test_decorator_of_a_nested_function_is_not_part_of_the_header():
+    source = (
+        "class A:\n"
+        "    def f(self):\n"
+        "        @decorator\n"
+        "        def inner():\n"
+        "            pass\n"
+        "        return inner\n"
+    )
+    _, outline = _outline(source)
+    assert outline == "class A:\n    def f(self):\n        ..."
+    ast.parse(outline)
+
+
+def test_decorator_of_the_first_member_is_not_repeated():
+    # The class header used to run up to the first member's `def` line, so
+    # that member's decorator appeared in the header and again in the body.
+    source = (
+        "class A:\n"
+        "    @property\n"
+        "    def x(self):\n"
+        "        return 1\n"
+        "    class Meta:\n"
+        "        @staticmethod\n"
+        "        def m():\n"
+        "            return 1\n"
+    )
+    header, outline = _outline(source)
+    assert header == "class A:"
+    assert outline == (
+        "class A:\n"
+        "    @property\n"
+        "    def x(self):\n"
+        "        ...\n"
+        "    class Meta:\n"
+        "        @staticmethod\n"
+        "        def m():\n"
+        "            ..."
+    )
+
+
+def test_class_whose_header_closes_on_the_body_line_is_kept_as_is():
+    source = "class A(\n    Base,\n): pass\n"
+    assert _outline(source) == (source.rstrip(), source.rstrip())
+
+
 def test_long_outline_is_cut_with_a_note():
     source = "class Big:\n" + "".join(f"    a{i} = {i}\n" for i in range(10))
     _, outline = _outline(source, max_lines=3)

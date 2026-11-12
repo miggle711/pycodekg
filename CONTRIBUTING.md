@@ -66,6 +66,16 @@ If a PR changes which nodes, edges or metadata a KG contains, do two more things
 
 A change that only affects the shape of the KG (new fields, node types or relations) needs the bump too.
 
+### Scripts behind a claim
+
+Every number, table or "I checked that" in a PR description or review comment must be reproducible. Include the script that produced it.
+
+* Put the script in the PR: in the description inside a collapsed `<details>` block, or under `scripts/` if others will reuse it. A path on your own machine does not count.
+* Say how to run it and what it needs (repo commits, the dataset, a cache). Use placeholders in paths, not your own.
+* If the claim comes from a tool already in the repo, such as `scripts/kg_diff.py` or the test suite, name the exact command instead.
+* Report the inputs next to the result, as `kg_diff.py` does with its `repos:` line, so two people's numbers can be compared.
+* A script used in a review comment follows the same rule: attach it to the comment.
+
 ### Stacked PRs
 
 When a PR depends on another that is still open:

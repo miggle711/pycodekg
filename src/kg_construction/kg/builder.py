@@ -2557,15 +2557,23 @@ class RepoKGBuilder:
             commit: Commit SHA to build the KG from.
 
         Returns:
-            KG dict ready for saving or querying.
+            KG dict ready for saving or querying. Its metadata also records
+            build_time_extraction_s (clone if needed, then git archive) and
+            extraction_cached (whether the bare clone was already there), so
+            a cold build can be told apart from a warm one (pycodekg#40).
         """
+        extraction_cached = self.repo_manager.is_cached(repo)
         with tempfile.TemporaryDirectory() as tmp:
             dest = Path(tmp) / 'src'
             print(f"Extracting {repo}@{commit[:8]}...")
+            extraction_start = time.perf_counter()
             self.repo_manager.extract_at_commit(repo, commit, dest)
+            extraction_time_s = time.perf_counter() - extraction_start
             print("Parsing source...")
             kg = self.ast_parser.parse_repo(repo, dest)
 
+        kg['metadata']['build_time_extraction_s'] = round(extraction_time_s, 3)
+        kg['metadata']['extraction_cached'] = extraction_cached
         kg['metadata']['base_commit'] = commit
         kg['metadata']['schema_version'] = SCHEMA_VERSION
         return kg
