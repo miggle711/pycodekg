@@ -74,6 +74,32 @@ MAX_CONTEXT_ITEMS_PER_CATEGORY = 10
 MAX_CONSTANT_VALUE_CHARS = 200
 
 
+def referenced_module_globals(source: str, filename: str = "<seed>") -> Set[str]:
+    """Global references in a seed source, including nested scopes.
+
+    Shared with the no-KG prevalence analysis so its selection rule cannot
+    drift from the serializer's. Comments, strings, attributes and shadowed
+    locals do not count. Defaults/decorators/annotations count, as they do
+    when the serializer examines the complete seed source.
+    """
+    try:
+        table = symtable.symtable(textwrap.dedent(source), filename, "exec")
+    except IndentationError:
+        # A method's multiline string can contain an unindented line, so
+        # dedent cannot remove the method's outer indentation. A neutral
+        # compound statement accepts its original indentation without
+        # changing Python's function/class name-binding rules.
+        table = symtable.symtable("if True:\n" + source, filename, "exec")
+    referenced: Set[str] = set()
+    pending = [table]
+    while pending:
+        scope = pending.pop()
+        referenced.update(s.get_name() for s in scope.get_symbols()
+                          if s.is_global() and s.is_referenced())
+        pending.extend(scope.get_children())
+    return referenced
+
+
 class LLMSerializer:
     """Converts TestContext (flat subgraph) to LLM-friendly hierarchical JSON."""
 
@@ -183,17 +209,9 @@ class LLMSerializer:
             if not constants:
                 continue
             try:
-                table = symtable.symtable(textwrap.dedent(meta.get("source_code") or ""),
-                                          path or "<seed>", "exec")
+                referenced = referenced_module_globals(meta.get("source_code") or "", path)
             except (SyntaxError, ValueError):
                 continue
-            referenced = set()
-            pending = [table]
-            while pending:
-                scope = pending.pop()
-                referenced.update(s.get_name() for s in scope.get_symbols()
-                                  if s.is_global() and s.is_referenced())
-                pending.extend(scope.get_children())
             for name in sorted(referenced & constants.keys()):
                 value = constants[name]
                 if len(value) > MAX_CONSTANT_VALUE_CHARS:

@@ -89,3 +89,10 @@ def test_annotated_seed_keeps_source_and_docstring_without_dead_type_hints(tmp_p
 def test_global_reference_inside_closure_is_included(tmp_path):
     result = _serialize(tmp_path, "LIMIT = 10\ndef f():\n    def inner():\n        return LIMIT\n    return inner\n")
     assert result["context"]["module_constants"][0]["source_code"] == "LIMIT = 10"
+
+
+def test_method_with_unindented_multiline_string_still_resolves_globals():
+    from kg_construction.llm.llm_serializer import referenced_module_globals
+
+    source = '    def f(self):\n        """Example.\nno indentation\n        """\n        return LIMIT\n'
+    assert referenced_module_globals(source) == {"LIMIT"}
