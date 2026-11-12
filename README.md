@@ -88,6 +88,27 @@ Higher depths can expand the retrieved subgraph but do not add prompt content.
 Compare depths 1 and 2 for a prompt-depth ablation; `scripts/build_kg_prompts.py`
 logs one warning per invocation when `--depth` exceeds 2.
 
+`scripts/build_kg_prompts.py` renders the serializer's seed and context sections
+into a `kg_prompts.json` file. Each instance entry has this shape:
+
+```json
+{
+  "context": "<KG-derived source and structural context>",
+  "target_functions": ["calculate"],
+  "target_classes": [null]
+}
+```
+
+The file maps dataset instance IDs to those entries. `context` contains the
+seed blocks and available callers, callees, sibling methods and related
+classes. Testgeneval's `inference/configs/shared_task.py` supplies the system
+message, target-specific task text and output format for both arms. Pycodekg
+does not add those instructions to the context block.
+
+Use the companion shared-instructions version of testgeneval (#103) with this
+format. Its reader rejects older entries containing a full `prompt` instead
+of `context`; regenerate those files with `scripts/build_kg_prompts.py`.
+
 ## Optional: pyright-backed type inference
 
 The uppercase-heuristic that detects `uses` edges (`x = SomeClass()`) can't see class
