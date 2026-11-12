@@ -5,7 +5,7 @@ import json
 import logging
 from pathlib import Path
 import sys
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 
 import pytest
 
@@ -17,12 +17,12 @@ _SPEC.loader.exec_module(builder)
 
 @pytest.mark.parametrize("depth", [None, 1, 2, 3, 4], ids=["default", "one", "two", "three", "four"])
 def test_cli_warns_once_for_the_run_and_preserves_requested_depth(depth, tmp_path, monkeypatch, caplog):
-    import datasets
-
     rows = [{"id": f"example__repo-1-{n}", "repo": "example/repo", "base_commit": "12345678",
              "patch": "patch", "code_file": "module.py", "test_file": "tests/test_module.py"}
             for n in range(2)]
-    monkeypatch.setattr(datasets, "load_from_disk", lambda path: {"test": rows})
+    datasets = ModuleType("datasets")
+    datasets.load_from_disk = lambda path: {"test": rows}
+    monkeypatch.setitem(sys.modules, "datasets", datasets)
     (tmp_path / "kg_example_repo_12345678.json").write_text(json.dumps({"nodes": [], "edges": []}))
     seen_depths = []
 
