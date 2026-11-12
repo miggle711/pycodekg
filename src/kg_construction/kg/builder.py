@@ -184,7 +184,18 @@ MAX_FILE_LINES = 20000
 # 14: in the methods of a class defined inside a function, self, cls and
 #    super() are resolved against that class, also for the outer function's
 #    via_closure copy of those calls, instead of the outer class.
-SCHEMA_VERSION = 14
+# 15: a call through an import is resolved through the module it names: a
+#    relative import keeps its dots ('.a.b') and is resolved from the
+#    importing file, an absolute one through the repo's files (src/ layouts),
+#    and an absolute import whose top level name is no repo package is
+#    outside the repo even when a nested module shares the name (#212). A
+#    call on a dotted module path resolves its first name through the
+#    imports (#206). A relative import's node label and id keep their dots.
+SCHEMA_VERSION = 15
+
+
+# A plain dotted name: `utils` or `a.b.c`, with no calls or subscripts.
+_DOTTED_NAME = re.compile(r'[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*')
 
 
 def _same_commit(a: Optional[str], b: Optional[str]) -> bool:
@@ -561,8 +572,10 @@ def _parse_file(args: Tuple[str, str, str]) -> Optional[Dict]:
                     import_statements[mod_id].append(statement)
         else:
             mod_name = node.module or ''
-            for alias in node.names:
-                full_name = f"{mod_name}.{alias.name}" if mod_name else alias.name
+            # The label comes from _import_bindings, which depends_on edges
+            # use too, so a relative import's node keeps its dots
+            # ('.utils.helper') and the edges to it find it.
+            for alias, (_, full_name) in zip(node.names, _import_bindings(node)):
                 imp_id = _make_id(f"import_{repo}_{full_name}")
                 if imp_id not in imports_emitted:
                     imports_emitted.add(imp_id)
@@ -650,6 +663,7 @@ def _parse_file(args: Tuple[str, str, str]) -> Optional[Dict]:
             # can be any of them: one edge per module (see ImportScopes).
             import_options: List[Optional[str]] = [None]
             is_super_call = receiver == 'super()'
+            receiver_path = False
             chain = chains[id(call)]
             receiver_is_local, local_type = (
                 local_scopes.lookup(receiver, outer_funcs + chain) if receiver else (False, None))
@@ -692,6 +706,20 @@ def _parse_file(args: Tuple[str, str, str]) -> Optional[Dict]:
                     # an attribute call: v.foo() is a method call whatever v
                     # is, not a call of the imported function foo.
                     import_options = scopes.lookup_all(callee, call, chain) or [None]
+                else:
+                    # A dotted module path (`requests.utils.rewind_body()`
+                    # after `import requests`): the import binds only its
+                    # first name, so resolve that (#206). Pass 2 checks the
+                    # rest against the module files; when it names an object
+                    # rather than a module, the call stays a name match.
+                    head, _, rest = receiver.partition('.')
+                    if (rest and _DOTTED_NAME.fullmatch(rest)
+                            and head not in expression_names.get(id(call), ())
+                            and not local_scopes.lookup(head, outer_funcs + chain)[0]):
+                        head_bound = scopes.lookup_all(head, call, chain)
+                        if head_bound:
+                            import_options = [f"{b}.{rest}.{callee}" for b in head_bound]
+                            receiver_path = True
 
             for import_resolved in import_options:
                 # The nested class is part of the key: self.helper() in the
@@ -715,6 +743,8 @@ def _parse_file(args: Tuple[str, str, str]) -> Optional[Dict]:
                 if is_super_call and nested_cls_id is not None:
                     # super() walks the nested class's bases, not the caller's.
                     call_meta['super_class_id'] = nested_cls_id
+                if receiver_path:
+                    call_meta['import_via_receiver_path'] = True
                 if in_closure:
                     call_meta['via_closure'] = True
                 edges.append(asdict(KGEdge(
@@ -1425,6 +1455,50 @@ class RepoASTParser:
         repo_module_names = indices['repo_module_names']
         repo_top_names = indices['repo_top_names']
 
+        # Resolving an import's module path to a repo file, the same way
+        # module_depends_on does (src/ layouts, packages, relative imports),
+        # and the definitions in each file by qualified name.
+        module_index = _ModuleIndex({
+            n['metadata'].get('path', '') for n in all_nodes if n['type'] in ('file', 'test_file')
+        })
+        defs_by_file: Dict[Tuple[str, str], List[str]] = defaultdict(list)
+        for n in all_nodes:
+            if n['type'] in ('function', 'method', 'test_function', 'class'):
+                meta_n = n.get('metadata', {})
+                if meta_n.get('filepath') and meta_n.get('qualname'):
+                    # A redefinition ('f#2': an @overload stub before the real
+                    # def, a property setter, if/else alternatives) is the
+                    # same name to an importer, so all of them are indexed.
+                    qualname = re.sub(r'#\d+', '', meta_n['qualname'])
+                    defs_by_file[(meta_n['filepath'], qualname)].append(n['id'])
+
+        def _import_target(qualified: str, caller_filepath: Optional[str]) -> Tuple[Optional[str], List[str]]:
+            """(repo file, rest) for an import path: the file of the longest
+            module prefix of `qualified`, and the names after it (a function,
+            a class, or Class.method). (None, []) if no prefix is a repo
+            module. A relative path ('.a.b', '..c') is resolved from the
+            caller's own package (#212)."""
+            stripped = qualified.lstrip('.')
+            level = len(qualified) - len(stripped)
+            parts = stripped.split('.') if stripped else []
+            if level:
+                if not caller_filepath or level > module_index.package_depth(caller_filepath):
+                    return None, []
+                base = caller_filepath.split('/')[:-1]
+                base = base[:len(base) - (level - 1)]
+                for k in range(len(parts) - 1, -1, -1):
+                    found = module_index.find_relative(base, parts[:k] if k else ['__init__'])
+                    if found:
+                        return found, parts[k:]
+                return None, []
+            for k in range(len(parts) - 1, 0, -1):
+                found, ambiguous = module_index.find(parts[:k])
+                if ambiguous:
+                    return None, []
+                if found:
+                    return found, parts[k:]
+            return None, []
+
         def _imported_from_outside(meta: Dict) -> bool:
             """Whether an edge's name was imported from a module outside the
             repo (#211). A standard library module counts as outside unless it
@@ -1432,8 +1506,8 @@ class RepoASTParser:
             holds every nested directory and module name (#212), so a stdlib
             name like collections can be in it by coincidence."""
             qualified = meta.get('import_resolved')
-            if not qualified:
-                return False
+            if not qualified or qualified.startswith('.'):
+                return False  # a relative import is always into the repo
             top = qualified.split('.', 1)[0]
             if top in repo_top_names:
                 return False
@@ -1541,22 +1615,36 @@ class RepoASTParser:
 
             qualified = meta.get('import_resolved')
             if qualified:
-                hits = _visible_from(source_id, qualified_to_ids.get(qualified, []))
-                if hits:
-                    return hits, 'qualified'
-                parts = qualified.rsplit('.', 2)
+                # The module the import names, found among the repo's files
+                # (src/ layouts, packages and relative imports included), and
+                # the definition in it.
+                target_file, rest = _import_target(qualified, caller_filepath)
+                if target_file is not None and rest:
+                    hits = _visible_from(source_id, defs_by_file.get((target_file, '.'.join(rest)), []))
+                    if hits:
+                        return hits, 'qualified'
+                if not qualified.startswith('.'):
+                    hits = _visible_from(source_id, qualified_to_ids.get(qualified, []))
+                    if hits:
+                        return hits, 'qualified'
+                # The module does not define the name itself: it re-exports a
+                # class from elsewhere (sympy's dfm.py does `from ._dfm import
+                # DFM`), so `from .dfm import DFM; DFM.m()` is matched on the
+                # class and method names, for relative imports too.
+                parts = qualified.lstrip('.').rsplit('.', 2)
                 if len(parts) == 3:
                     hits = _visible_from(source_id, class_method_to_ids.get((parts[1], parts[2]), []))
                     if hits:
                         return hits, 'qualified'
-                # The precise lookups missed. That is not proof the target is
-                # outside the repo (relative imports lose their package,
-                # src/ layouts and __init__ re-exports do not match path
-                # derived names), but an import whose top level name is not
-                # any directory or module in this repo cannot be a call into
-                # it. Drop it rather than let the bare name fallback below
-                # link `json.loads` to an unrelated repo method named loads.
-                if qualified.split('.', 1)[0] not in repo_module_names:
+                # An absolute import that names no repo module and does not
+                # start with one of the repo's top level packages is outside
+                # the repo (json, pprint, os.path), even if a nested module
+                # shares the name (#212). Drop it rather than let the name
+                # match below link it to an unrelated repo definition. A
+                # module that is in the repo but does not define the name
+                # (an __init__ re-export) falls through to the name match.
+                if (target_file is None and not qualified.startswith('.')
+                        and qualified.split('.', 1)[0] not in repo_top_names):
                     return [], 'unresolved'
 
             # Bare Foo(...) is a constructor call when Foo is a class, so
@@ -1605,7 +1693,8 @@ class RepoASTParser:
             # receiver whose type is unknown (`d.loads()`, `self.session.get()`)
             # is only a guess that the name is unique, so it gets its own
             # lower tier.
-            if meta.get('receiver') is None or meta.get('import_resolved'):
+            anchored = meta.get('import_resolved') and not meta.get('import_via_receiver_path')
+            if meta.get('receiver') is None or anchored:
                 return hits, 'exact'
             return hits, 'name_only'
 

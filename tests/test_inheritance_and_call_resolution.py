@@ -179,10 +179,11 @@ class TestExternalAndUntypedCalls:
             "pkg/utils.py": "def helper():\n    pass\n",
             "pkg/a.py": "from .utils import helper\ndef f():\n    helper()\n",
         })
-        # The import path loses its package ('utils.helper'), so the precise
-        # lookup misses and the bare name fallback links it. It must not be
-        # treated as external just because the precise lookup missed.
-        assert _edges(kg, "calls") == [("f@pkg/a.py", "helper@pkg/utils.py", "exact")]
+        # The relative import keeps its dots ('.utils.helper') and is
+        # resolved from pkg/a.py's own package, so the call is qualified
+        # (#212). Before, the path lost its package and only the bare name
+        # fallback linked it, as exact.
+        assert _edges(kg, "calls") == [("f@pkg/a.py", "helper@pkg/utils.py", "qualified")]
 
     def test_untyped_receiver_unique_name_is_name_only_not_exact(self, tmp_path):
         kg = _build(tmp_path, {"m.py": """
