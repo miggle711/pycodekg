@@ -1928,6 +1928,18 @@ class RepoASTParser:
                 if len(same_file_hits) == 1:
                     return same_file_hits, 'exact'
 
+            # An attribute call (`v.cross(w)`) on a receiver nothing has typed
+            # or imported is a call on an object, so a plain module level
+            # function of that name is not a candidate: those are reached by
+            # a bare name or through an imported module, and both have hints
+            # above. When a method or class shares the name, keep only those,
+            # so the call is not dropped as ambiguous (#202).
+            if len(hits) > 1 and meta.get('receiver') is not None and not qualified:
+                on_objects = [hid for hid in hits
+                              if nodes_by_id.get(hid, {}).get('type') in ('method', 'class')]
+                if on_objects:
+                    hits = on_objects
+
             if len(hits) != 1:
                 # 0 hits: genuinely nothing in this repo has that name
                 # (very likely an external library/stdlib call, e.g.
