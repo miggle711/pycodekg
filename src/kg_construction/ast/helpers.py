@@ -787,6 +787,76 @@ def _get_signature_and_source_text(
     return signature, source_code
 
 
+# Most body lines a class outline keeps; the rest becomes a "# ... N more
+# lines not shown" comment. Measured at the current heads: the cap cuts 35 of
+# Django's 11,140 classes (0.3%, median outline 5 lines) and 70 of SymPy's
+# 2,395 (2.9%, median 23). Django's Model (2,030 lines) outlines to 321 lines
+# and SymPy's Basic (2,199) to 285, so both are cut.
+CLASS_OUTLINE_MAX_LINES = 200
+
+# Methods an outline keeps in full: they say how the class is built.
+_OUTLINE_FULL_METHODS = {'__init__', '__new__', '__post_init__'}
+
+
+def _stmt_start(stmt: ast.stmt) -> int:
+    """First line of a statement, counting its decorators."""
+    return min([d.lineno for d in getattr(stmt, 'decorator_list', [])] + [stmt.lineno])
+
+
+def _outline_lines(stmts: List[ast.stmt], source_lines: List[str]) -> List[str]:
+    out: List[str] = []
+    for stmt in stmts:
+        start = _stmt_start(stmt)
+        body = getattr(stmt, 'body', None)
+        is_def = isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef))
+        is_class = isinstance(stmt, ast.ClassDef)
+        if (is_def and stmt.name not in _OUTLINE_FULL_METHODS or is_class) \
+                and body and body[0].lineno > stmt.lineno:
+            # Header lines only (decorators and the def/class line,
+            # wrapped parameters included).
+            out.extend(line.rstrip('\n') for line in source_lines[start - 1:body[0].lineno - 1])
+            if is_class:
+                out.extend(_outline_lines(body, source_lines))
+            else:
+                header = source_lines[stmt.lineno - 1]
+                indent = header[:len(header) - len(header.lstrip())]
+                out.append(indent + '    ...')
+        else:
+            out.extend(line.rstrip('\n') for line in source_lines[start - 1:stmt.end_lineno])
+    return out
+
+
+def _get_class_outline(
+    class_node: ast.ClassDef,
+    source_lines: Optional[List[str]],
+    max_lines: int = CLASS_OUTLINE_MAX_LINES,
+) -> Tuple[str, str]:
+    """(header, outline) of a class, for the prompt (pycodekg#142).
+
+    The outline is the class as written, minus method bodies: decorators and
+    the class line, the docstring, class-level statements (attributes,
+    nested classes, Meta), __init__/__new__/__post_init__ in full, and every
+    other method as its signature followed by `...`. A class's full source
+    can be thousands of lines; this keeps what a test writer needs to build
+    and use the class. Both are "" without source_lines.
+    """
+    if not source_lines or not class_node.body:
+        return "", ""
+    start = _stmt_start(class_node)
+    first_body = class_node.body[0].lineno
+    if first_body == class_node.lineno:  # class A: pass
+        text = "".join(source_lines[start - 1:class_node.end_lineno]).rstrip()
+        return text, text
+    header_lines = [line.rstrip('\n') for line in source_lines[start - 1:first_body - 1]]
+    body_lines = _outline_lines(class_node.body, source_lines)
+    if len(body_lines) > max_lines:
+        first = source_lines[first_body - 1]
+        indent = first[:len(first) - len(first.lstrip())]
+        hidden = len(body_lines) - max_lines
+        body_lines = body_lines[:max_lines] + [f"{indent}# ... {hidden} more lines not shown"]
+    return "\n".join(header_lines).rstrip(), "\n".join(header_lines + body_lines).rstrip()
+
+
 def _get_exceptions(node: Union[ast.FunctionDef, ast.AsyncFunctionDef]) -> Dict:
     """Extract exception types raised and caught within a function body.
 
