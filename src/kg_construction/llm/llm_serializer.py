@@ -15,6 +15,8 @@ This structure is designed to:
 """
 
 import json
+import symtable
+import textwrap
 from typing import Dict, List, Optional, Set
 from dataclasses import dataclass
 
@@ -69,6 +71,7 @@ class LLMInput:
 # even when it fits (kg_construction#141). 10 real examples of usage is
 # enough signal; #11 onward adds no new information.
 MAX_CONTEXT_ITEMS_PER_CATEGORY = 10
+MAX_CONSTANT_VALUE_CHARS = 200
 
 
 class LLMSerializer:
@@ -82,7 +85,8 @@ class LLMSerializer:
 
         Args:
             test_context: Flat subgraph dict with seeds, context_nodes, edges, test_nodes.
-                         (e.g., output from TestContext.save())
+                         Optional file_nodes supplies seed-file metadata outside
+                         the BFS subgraph (e.g. at depth zero).
 
         Returns:
             Hierarchical dict with 'seed', 'context', 'instructions' sections.
@@ -103,6 +107,9 @@ class LLMSerializer:
         # Build Context section from context_nodes and edges
         context_section = self._build_context_section(
             seeds, context_nodes, edges, node_by_id
+        )
+        context_section["module_constants"] = self._module_constants(
+            seeds, list(node_by_id.values()) + test_context.get("file_nodes", [])
         )
 
         # Build Instructions section with coverage targets and conventions
@@ -156,8 +163,45 @@ class LLMSerializer:
             "docstring": metadata.get("docstring", ""),
             "exceptions": metadata.get("raises", []),
             "source_code": metadata.get("source_code", ""),
-            "type_hints": metadata.get("type_hints", {}),
         }
+
+    def _module_constants(self, seeds: List[Dict], nodes: List[Dict]) -> List[Dict]:
+        """Referenced module globals, limited to each seed's own file.
+
+        Symbol tables exclude comments, strings, attribute names and locals
+        shadowing a module constant. File metadata can be supplied separately
+        from BFS context so depth zero still has the seed's module constants.
+        Values are the builder's source expressions, never evaluated here.
+        """
+        files = {n.get("metadata", {}).get("path"): n.get("metadata", {})
+                 for n in nodes if n.get("type") in ("file", "test_file")}
+        selected: Dict[str, Dict[str, str]] = {}
+        for seed in seeds:
+            meta = seed.get("metadata", {})
+            path = meta.get("filepath") or meta.get("path")
+            constants = files.get(path, {}).get("constants", {})
+            if not constants:
+                continue
+            try:
+                table = symtable.symtable(textwrap.dedent(meta.get("source_code") or ""),
+                                          path or "<seed>", "exec")
+            except (SyntaxError, ValueError):
+                continue
+            referenced = set()
+            pending = [table]
+            while pending:
+                scope = pending.pop()
+                referenced.update(s.get_name() for s in scope.get_symbols()
+                                  if s.is_global() and s.is_referenced())
+                pending.extend(scope.get_children())
+            for name in sorted(referenced & constants.keys()):
+                value = constants[name]
+                if len(value) > MAX_CONSTANT_VALUE_CHARS:
+                    value = value[:MAX_CONSTANT_VALUE_CHARS] + " ... # value truncated"
+                selected.setdefault(path, {})[name] = f"{name} = {value}"
+        return [{"module": _filepath_to_module(path), "filepath": path,
+                 "source_code": "\n".join(lines[name] for name in sorted(lines))}
+                for path, lines in sorted(selected.items())]
 
     def _build_context_section(
         self,
@@ -185,7 +229,7 @@ class LLMSerializer:
               flat single-function extraction (the baseline arm) can
               never provide, since it has no notion of "what else does
               this class define" (see issue #50 in kg-test-generation).
-            - patterns: Control flow, type hints, error handling patterns
+            - patterns: Control flow and error handling patterns
 
         existing_tests is deliberately not included: instruct's full-setting
         prompt shows no existing test content, and full-only generation is
@@ -379,10 +423,9 @@ class LLMSerializer:
         }
 
     def _extract_patterns(self, seeds: List[Dict], context_nodes: List[Dict]) -> Dict:
-        """Extract patterns from seed and context nodes (control flow, type hints, etc)."""
+        """Extract control-flow and error-handling patterns."""
         patterns = {
             "control_flow": [],
-            "type_hints": {},
             "error_handling": [],
         }
 
@@ -392,10 +435,6 @@ class LLMSerializer:
             # Control flow branches
             if "branch_count" in metadata:
                 patterns["control_flow"].append(f"Branches: {metadata['branch_count']}")
-
-            # Type hints
-            if "type_hints" in metadata:
-                patterns["type_hints"].update(metadata["type_hints"])
 
             # Error handling
             if "exceptions" in metadata and metadata["exceptions"]:

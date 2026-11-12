@@ -104,10 +104,17 @@ def _build_seed_block(seed: dict) -> str:
     )
 
 
+def _constants_section(items: list) -> str:
+    if not items:
+        return ""
+    parts = ["Module constants:"]
+    for item in items:
+        parts.append(f"{item['module']}:\n```python\n{item['source_code']}\n```")
+    return "\n".join(parts) + "\n"
+
+
 def _build_context(serialized: dict) -> str:
-    """The KG context block: one block per seed, then callers, callees,
-    sibling methods and related classes. No task wording: testgeneval adds
-    the instructions both arms share."""
+    """The KG context block, with no task wording or system message."""
     # serialized["seed"] is a list -- a patch can change more than one
     # function/class in the same file (6/66 real django instances do),
     # so every seed gets its own block, not just the first.
@@ -117,6 +124,7 @@ def _build_context(serialized: dict) -> str:
     seed_blocks = "\n".join(_build_seed_block(seed) for seed in seeds)
 
     sections = "\n".join(filter(None, [
+        _constants_section(context.get("module_constants", [])),
         _snippet_section("Callers", context.get("callers", [])),
         _snippet_section("Callees", context.get("callees", [])),
         _snippet_section("Sibling methods", context.get("sibling_methods", [])),
@@ -211,6 +219,13 @@ def main():
                 "context_nodes": context.context_nodes,
                 "edges": context.edges,
                 "test_nodes": context.test_nodes,
+                # Fetch independently of BFS depth (a method's file is two
+                # containment hops away, and depth zero has no file context).
+                "file_nodes": [node
+                               for path in sorted({s.get("metadata", {}).get("filepath")
+                                                   or s.get("metadata", {}).get("path")
+                                                   for s in context.seeds} - {None})
+                               for node in engine.find_file_by_path(path, exact=True)],
             }
             serialized = LLMSerializer(repo=row["repo"]).serialize(context_dict)
             if not serialized.get("seed"):
