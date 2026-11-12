@@ -14,7 +14,7 @@ Example:
     from kg_query import KGQueryEngine
     import json
 
-    with open('kg_output/kg_psf_requests.json') as f:
+    with open('kg_output/kg_psf_requests_a0df2cbb.json') as f:
         kg = json.load(f)
 
     engine = KGQueryEngine(kg)
