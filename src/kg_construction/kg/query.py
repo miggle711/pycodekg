@@ -14,7 +14,7 @@ Example:
     from kg_query import KGQueryEngine
     import json
 
-    with open('kg_output/kg_psf_requests.json') as f:
+    with open('kg_output/kg_psf_requests_a0df2cbb.json') as f:
         kg = json.load(f)
 
     engine = KGQueryEngine(kg)
@@ -25,6 +25,33 @@ Example:
 
 from collections import defaultdict
 from typing import List, Dict, Optional
+
+# Confidence labels of a resolved calls edge, weakest first. `ambiguous` is
+# only used by the class level relations, so it never appears on a call, but
+# it is kept here so every label the builder writes has a place in the order.
+CALL_CONFIDENCE_ORDER = ('ambiguous', 'name_only', 'exact', 'qualified')
+
+
+def call_confidence_at_least(edge: Dict, minimum: Optional[str]) -> bool:
+    """Whether an edge is at least as confident as `minimum`.
+
+    `minimum` of None accepts every edge. An edge with no confidence label
+    (a KG built before labels existed) counts as the weakest, so it is
+    left out as soon as a minimum is given.
+
+    Raises:
+        ValueError: if `minimum` is not one of CALL_CONFIDENCE_ORDER.
+    """
+    if minimum is None:
+        return True
+    if minimum not in CALL_CONFIDENCE_ORDER:
+        raise ValueError(
+            f"unknown confidence {minimum!r}, expected one of {', '.join(CALL_CONFIDENCE_ORDER)}"
+        )
+    label = edge.get('metadata', {}).get('confidence')
+    if label not in CALL_CONFIDENCE_ORDER:
+        return False
+    return CALL_CONFIDENCE_ORDER.index(label) >= CALL_CONFIDENCE_ORDER.index(minimum)
 
 
 class KGQueryEngine:
@@ -134,18 +161,23 @@ class KGQueryEngine:
     # Call graph queries
     # ------------------------------------------------------------------
 
-    def find_callers(self, func_id: str, include_closure: bool = True) -> List[Dict]:
+    def find_callers(self, func_id: str, include_closure: bool = True,
+                     min_confidence: Optional[str] = None) -> List[Dict]:
         """Return all functions/methods that call a given function.
 
         Only returns nodes that exist in the KG (external callers are excluded).
-        Confidence of the underlying call edge is not filtered — both 'exact'
-        and 'ambiguous' matches are included.
+        By default every call edge counts, whatever its confidence.
 
         Args:
             func_id: Node ID of the target function.
             include_closure: If False, leave out callers that reach this
                              function only through a closure they define
                              (edges tagged via_closure).
+            min_confidence: If set ('name_only', 'exact' or 'qualified'),
+                            leave out callers whose call edge is less
+                            confident than this. 'exact' drops the
+                            name_only guesses, and 'qualified' keeps only
+                            calls pinned down by a type or an import.
 
         Returns:
             List of function/method/test_function nodes that call this function.
@@ -155,9 +187,11 @@ class KGQueryEngine:
             for e in self.edges_by_target.get(func_id, [])
             if e['relation'] == 'calls' and e['source'] in self.nodes_by_id
             and (include_closure or not e.get('metadata', {}).get('via_closure'))
+            and call_confidence_at_least(e, min_confidence)
         ]
 
-    def find_callees(self, func_id: str, include_closure: bool = True) -> List[Dict]:
+    def find_callees(self, func_id: str, include_closure: bool = True,
+                     min_confidence: Optional[str] = None) -> List[Dict]:
         """Return all functions/methods called by a given function.
 
         Args:
@@ -165,6 +199,8 @@ class KGQueryEngine:
             include_closure: If False, leave out callees this function
                              reaches only through a closure it defines
                              (edges tagged via_closure).
+            min_confidence: If set, leave out callees whose call edge is less
+                            confident than this (see find_callers).
 
         Returns:
             List of function/method/test_function nodes called by this function.
@@ -174,9 +210,10 @@ class KGQueryEngine:
             for e in self.edges_by_source.get(func_id, [])
             if e['relation'] == 'calls' and e['target'] in self.nodes_by_id
             and (include_closure or not e.get('metadata', {}).get('via_closure'))
+            and call_confidence_at_least(e, min_confidence)
         ]
 
-    def find_test_functions_for(self, func_id: str) -> List[Dict]:
+    def find_test_functions_for(self, func_id: str, min_confidence: Optional[str] = None) -> List[Dict]:
         """Return test functions that call a given function.
 
         Filters find_callers to only test_function nodes. Useful for finding
@@ -184,12 +221,13 @@ class KGQueryEngine:
 
         Args:
             func_id: Node ID of the function under test.
+            min_confidence: See find_callers.
 
         Returns:
             List of test_function nodes that call this function.
         """
         return [
-            caller for caller in self.find_callers(func_id)
+            caller for caller in self.find_callers(func_id, min_confidence=min_confidence)
             if caller['type'] == 'test_function'
         ]
 

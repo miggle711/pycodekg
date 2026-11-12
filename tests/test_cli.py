@@ -56,6 +56,12 @@ class TestBuildParser:
         assert args.callers == "send"
         assert args.json is True
 
+    def test_query_subcommand_min_confidence_flag(self):
+        parser = build_parser()
+        args = parser.parse_args(["query", "kg.json", "--callers", "send", "--min-confidence", "exact"])
+        assert args.min_confidence == "exact"
+        assert parser.parse_args(["query", "kg.json", "--callers", "send"]).min_confidence is None
+
     def test_query_subcommand_class_flag_uses_cls_dest(self):
         parser = build_parser()
         args = parser.parse_args(["query", "kg.json", "--class", "Session"])
