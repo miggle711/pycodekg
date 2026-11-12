@@ -54,3 +54,14 @@ def test_two_methods_of_the_name_stay_dropped(tmp_path):
         "use.py": "def f(v, w):\n    return v.cross(w)\n",
     })
     assert calls == []
+
+
+def test_a_self_call_that_is_not_on_the_class_is_not_guessed(tmp_path):
+    # visit comes from a parent outside the repo, so Vector.cross-style
+    # name matching elsewhere would be wrong.
+    calls = _calls_from(tmp_path, {
+        "vec.py": VECTOR,
+        "util.py": "def cross(a, b): ...\n",
+        "use.py": "class Walker(Base):\n    def f(self, w):\n        return self.cross(w)\n",
+    })
+    assert calls == []

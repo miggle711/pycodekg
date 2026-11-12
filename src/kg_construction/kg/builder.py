@@ -1934,7 +1934,11 @@ class RepoASTParser:
             # a bare name or through an imported module, and both have hints
             # above. When a method or class shares the name, keep only those,
             # so the call is not dropped as ambiguous (#202).
-            if len(hits) > 1 and meta.get('receiver') is not None and not qualified:
+            # Not for self/cls calls: their class is known, so a method that is
+            # not on it or its parents comes from outside the repo, and a
+            # same-named method elsewhere is the wrong one.
+            if (len(hits) > 1 and meta.get('receiver') is not None and not qualified
+                    and not class_hint_id and not class_hint):
                 on_objects = [hid for hid in hits
                               if nodes_by_id.get(hid, {}).get('type') in ('method', 'class')]
                 if on_objects:
