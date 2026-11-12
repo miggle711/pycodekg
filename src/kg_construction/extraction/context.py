@@ -60,6 +60,11 @@ class TestContext:
             stored, pre-patch value). Empty in the normal case -- non-empty
             means a real run should look into why, not just that this one
             instance's seed source is stale.
+        pinned_seed_ids: IDs of seeds whose own `def` line is one the patch
+            changed, so the seed is that definition and not a guess among
+            same-named ones. Two same-named seeds that are both pinned (two
+            closures named `dec` in different functions, both changed) are
+            two real changes, not an ambiguity (pycodekg#106).
         retrieval_time_s: Wall-clock seconds TestContextExtractor.extract()
             took for this one instance (RQ4 instrumentation, docs/
             EXPERIMENT_PLAN.md's RQ4 instrumentation section -- per-instance
@@ -97,6 +102,7 @@ class TestContext:
     repo: str
     base_commit: str
     stale_seed_labels: List[str] = field(default_factory=list)
+    pinned_seed_ids: List[str] = field(default_factory=list)
     retrieval_time_s: Optional[float] = None
     localization_outcome: Optional[str] = None
     node_count: Optional[int] = None
@@ -118,6 +124,7 @@ class TestContext:
             'edges': self.edges,
             'test_nodes': self.test_nodes,
             'stale_seed_labels': self.stale_seed_labels,
+            'pinned_seed_ids': self.pinned_seed_ids,
             'stats': {
                 'num_seeds': len(self.seeds),
                 'num_context_nodes': len(self.context_nodes),
@@ -153,6 +160,7 @@ class TestContext:
             repo=data['repo'],
             base_commit=data['base_commit'],
             stale_seed_labels=data.get('stale_seed_labels', []),
+            pinned_seed_ids=data.get('pinned_seed_ids', []),
             retrieval_time_s=data.get('retrieval_time_s'),
             localization_outcome=data.get('localization_outcome'),
             node_count=data.get('node_count'),
@@ -346,6 +354,7 @@ class TestContextExtractor:
         # (str, Optional[str]) tuple would raise TypeError comparing
         # None to str, so sort on a key that substitutes "" for None.
         seed_ids: List[str] = []
+        pinned_seed_ids: Set[str] = set()
         resolved_entity_count = 0
         for (name, enclosing_class), def_lines in sorted(
                 changed.items(), key=lambda item: (item[0][0], item[0][1] or "")):
@@ -402,6 +411,8 @@ class TestContextExtractor:
                 resolved_entity_count += 1
             for func in matches:
                 seed_ids.append(func['id'])
+                if def_lines and func['metadata'].get('lineno') in def_lines:
+                    pinned_seed_ids.add(func['id'])
 
         total_changed_entities = len(changed)
         if total_changed_entities == 0 or resolved_entity_count == 0:
@@ -513,6 +524,7 @@ class TestContextExtractor:
             repo=instance['repo'],
             base_commit=instance['base_commit'],
             stale_seed_labels=stale_seed_labels,
+            pinned_seed_ids=[n['id'] for n in seed_nodes if n['id'] in pinned_seed_ids],
             localization_outcome=localization_outcome,
             node_count=len(seed_nodes) + len(context_nodes),
             edge_count=len(subgraph_edges),
