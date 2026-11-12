@@ -18,6 +18,7 @@ pkg-run build . --name my-project
 # Query it
 pkg-run query kg_output/kg_psf_requests_a0df2cbb.json --callers send
 pkg-run query kg_output/kg_psf_requests_a0df2cbb.json --callees send
+pkg-run query kg_output/kg_psf_requests_a0df2cbb.json --callers send --min-confidence exact
 pkg-run query kg_output/kg_psf_requests_a0df2cbb.json --file sessions.py
 pkg-run query kg_output/kg_psf_requests_a0df2cbb.json --tests send
 pkg-run query kg_output/kg_psf_requests_a0df2cbb.json --class Session
@@ -46,7 +47,7 @@ kg = builder.build('psf/requests', 'a0df2cbb')
 builder.save('psf/requests', kg)
 
 # Load and query
-with open('kg_output/kg_psf_requests.json') as f:
+with open('kg_output/kg_psf_requests_a0df2cbb.json') as f:  # save() names it kg_{repo}_{commit[:8]}.json
     kg = json.load(f)
 
 engine = KGQueryEngine(kg)
@@ -80,6 +81,27 @@ print(report)
 ## Context for LLM prompts
 
 `llm/llm_serializer.py` turns an extracted subgraph into the JSON that goes into a prompt. It leaves test code out of the callers, callees and related classes, so a prompt for writing tests does not show the model the tests that already exist.
+
+`scripts/build_kg_prompts.py` renders the serializer's seed and context sections
+into a `kg_prompts.json` file. Each instance entry has this shape:
+
+```json
+{
+  "context": "<KG-derived source and structural context>",
+  "target_functions": ["calculate"],
+  "target_classes": [null]
+}
+```
+
+The file maps dataset instance IDs to those entries. `context` contains the
+seed blocks and available callers, callees, sibling methods and related
+classes. Testgeneval's `inference/configs/shared_task.py` supplies the system
+message, target-specific task text and output format for both arms. Pycodekg
+does not add those instructions to the context block.
+
+Use the companion shared-instructions version of testgeneval (#103) with this
+format. Its reader rejects older entries containing a full `prompt` instead
+of `context`; regenerate those files with `scripts/build_kg_prompts.py`.
 
 ## Optional: pyright-backed type inference
 
@@ -171,6 +193,8 @@ For `calls`:
 
 For `inherits`, `uses`, `raises` and `decorated_by`, the label is `exact` when one definition matches and `ambiguous` when several do.
 
+To leave the weaker calls out, pass `min_confidence` (`'name_only'`, `'exact'` or `'qualified'`) to `find_callers`, `find_callees` and `find_test_functions_for`, or `--min-confidence` to `pkg-run query`. `LLMSerializer(min_call_confidence=...)` does the same for the callers and callees in a prompt. By default nothing is filtered.
+
 A few rules that explain results you might not expect:
 * Imports are followed in order. A call goes through the import that has run by that point in the function, so a rebound name counts as each import in turn.
 * In `try: import a as c` / `except ImportError: import b as c`, calls go to `a`, the `try` body. If a name is imported in each branch of an `if`/`else`, calls and `depends_on` edges go to every branch.
@@ -229,6 +253,7 @@ engine.get_class_methods(class_id)          # list of method nodes
 # Call graph
 engine.find_callers(func_id)                # functions that call this one
 engine.find_callees(func_id)                # functions this one calls
+engine.find_callers(func_id, min_confidence='exact')  # leave out name_only guesses
 engine.find_test_functions_for(func_id)     # test functions covering this function
 
 # Search

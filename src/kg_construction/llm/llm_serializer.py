@@ -21,6 +21,7 @@ from typing import Dict, List, Optional, Set
 from dataclasses import dataclass
 
 from kg_construction.ast.helpers import _is_test_file
+from kg_construction.kg.query import call_confidence_at_least
 
 
 def _is_test_code(node: Dict) -> bool:
@@ -103,8 +104,17 @@ def referenced_module_globals(source: str, filename: str = "<seed>") -> Set[str]
 class LLMSerializer:
     """Converts TestContext (flat subgraph) to LLM-friendly hierarchical JSON."""
 
-    def __init__(self, repo: str = ""):
+    def __init__(self, repo: str = "", min_call_confidence: Optional[str] = None):
+        """
+        Args:
+            repo: Repository name, used in the prompt.
+            min_call_confidence: If set ('name_only', 'exact' or 'qualified'),
+                callers and callees whose call edge is less confident than
+                this are left out of the context. None keeps every call, which
+                is the default.
+        """
         self.repo = repo
+        self.min_call_confidence = min_call_confidence
 
     def serialize(self, test_context: Dict) -> Dict:
         """Convert flat subgraph to hierarchical JSON for LLM.
@@ -289,7 +299,7 @@ class LLMSerializer:
             # show the model existing tests, some from the very file it is
             # asked to write (testgeneval#87).
             if tgt_id in seed_ids and relation == "calls":
-                if _is_test_code(src_node):
+                if _is_test_code(src_node) or not call_confidence_at_least(edge, self.min_call_confidence):
                     continue
                 if len(callers) < MAX_CONTEXT_ITEMS_PER_CATEGORY:
                     callers.append(self._node_to_snippet(src_node))
@@ -298,7 +308,7 @@ class LLMSerializer:
             # name match can link a production call to a fake or helper in a
             # test file, which would show the model that file's source.
             elif src_id in seed_ids and relation == "calls":
-                if _is_test_code(tgt_node):
+                if _is_test_code(tgt_node) or not call_confidence_at_least(edge, self.min_call_confidence):
                     continue
                 if len(callees) < MAX_CONTEXT_ITEMS_PER_CATEGORY:
                     callees.append(self._node_to_snippet(tgt_node))

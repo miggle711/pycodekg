@@ -321,3 +321,52 @@ class TestSeedSelectionAndRefreshWithDuplicates:
         assert len(keys) == 1
         assert "return e[1]" in keys[0]["metadata"]["source_code"]
         assert ctx.stale_seed_labels == []
+
+
+# django/template/library.py defines a nested `dec` in several decorator
+# factories (pycodekg#106, django__django-11334-15770).
+NESTED_DEC_SOURCE = (
+    "def simple_tag(func):\n"
+    "    def dec(*a):\n"
+    "        return 1\n"
+    "    return dec\n"
+    "\n"
+    "def inclusion_tag(func):\n"
+    "    def dec(*a):\n"
+    "        return 2\n"
+    "    return dec\n"
+    "\n"
+    "def filter_tag(func):\n"
+    "    return func\n"
+)
+
+
+class TestSameNamedClosuresInDifferentFunctions:
+    def _seeds_and_report(self, tmp_path, new):
+        ctx = _extract(tmp_path, NESTED_DEC_SOURCE, new)
+        _valid, report = TestContextValidator(ctx).validate()
+        decs = sorted(s["metadata"]["qualname"] for s in ctx.seeds if s["label"] == "dec")
+        return decs, report
+
+    def test_one_changed_closure_is_the_only_seed(self, tmp_path):
+        new = NESTED_DEC_SOURCE.replace("        return 2\n", "        return 3\n")
+        decs, report = self._seeds_and_report(tmp_path, new)
+        assert decs == ["inclusion_tag.dec"]
+        assert "Ambiguous seed names" not in report
+
+    def test_two_changed_closures_are_two_seeds_not_an_ambiguity(self, tmp_path):
+        new = (NESTED_DEC_SOURCE.replace("        return 1\n", "        return 4\n")
+               .replace("        return 2\n", "        return 3\n"))
+        decs, report = self._seeds_and_report(tmp_path, new)
+        assert decs == ["inclusion_tag.dec", "simple_tag.dec"]
+        assert "Ambiguous seed names" not in report
+
+    def test_a_new_closure_that_matches_old_ones_is_still_ambiguous(self, tmp_path):
+        # The new `dec` has no pre-patch line, so lookup falls back to every
+        # old `dec` in the file: neither is the changed one.
+        new = NESTED_DEC_SOURCE.replace(
+            "def filter_tag(func):\n    return func\n",
+            "def filter_tag(func):\n    def dec(*a):\n        return 5\n    return dec\n")
+        decs, report = self._seeds_and_report(tmp_path, new)
+        assert decs == ["inclusion_tag.dec", "simple_tag.dec"]
+        assert "Ambiguous seed names" in report

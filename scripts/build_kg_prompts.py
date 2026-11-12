@@ -1,7 +1,7 @@
 """
 build_kg_prompts.py
 
-Pre-computes KG-only test-generation prompts for a set of TestGenEval
+Pre-computes KG context blocks for a set of TestGenEval
 instances, targeting TestGenEval's `full` setting (generate a complete
 test file from scratch, no existing test content shown to either arm).
 
@@ -13,12 +13,10 @@ class), callers/callees/siblings, and related classes it inherits from
 or instantiates.
 
 Also writes each seed's function name (and enclosing class, if any) as a
-separate field per instance, meant to be merged into the `instruct` arm's
-dataset construction on the testgeneval side so both arms can be told to
-focus on the same changed function(s) -- without which the two arms
-answer different tasks (kg_only implicitly focuses on the seed(s);
-instruct's generic `full`-setting prompt does not name any function at
-all). See miggle711/pycodekg#125 and miggle711/testgeneval#6.
+separate field per instance. Testgeneval reads these same targets for both
+arms and adds the shared task text after each arm's context. The context
+here supplies code and structural information; testgeneval owns the system
+message, testing instructions and output-format requirements.
 
 Run from repo-kg-construction's own environment (not testgeneval's --
 pycodekg isn't installed there by design, to keep the two projects'

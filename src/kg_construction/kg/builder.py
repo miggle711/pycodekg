@@ -503,9 +503,8 @@ def _parse_file(args: Tuple[str, str, str]) -> Optional[Dict]:
     # Deduplicate call edges within this file at creation time to avoid
     # accumulating one edge per call-site for frequently called functions
     seen_call_targets: Set[Tuple[str, str, Optional[str]]] = set()
-    # The same call can go through a different import before and after a
-    # name is re-imported, so the import is part of what makes a call unique.
-    seen_call_hints: Set[Tuple[str, str, Optional[str], Optional[str], Optional[str]]] = set()
+    # Calls with identical resolution hints need only one pass-2 lookup.
+    seen_call_hints: Set[Tuple] = set()
 
     # Factory-call assignment sites recorded for optional pyright type
     # resolution (see kg/type_inference.py). Each site is
@@ -626,12 +625,11 @@ def _parse_file(args: Tuple[str, str, str]) -> Optional[Dict]:
     def _emit_call_edges(func_id: str, func_node: Union[ast.FunctionDef, ast.AsyncFunctionDef],
                          local_types: Dict[str, str], class_name: Optional[str] = None,
                          class_id: Optional[str] = None):
-        """Emit one 'calls' edge per unique (caller, callee_name, receiver).
+        """Emit one 'calls' edge per unique (caller, callee_name, hints).
 
-        The receiver is part of the key because the resolution hints derive
-        from it: `x.save()` (type unknown) and `m.save()` (m = Model()) are
-        different calls even though the callee name is the same, and a
-        resolvable one must not be hidden behind an unresolvable one.
+        Receiver names with identical hints resolve the same way in pass 2.
+        Keep distinct types, imports, class/super contexts and bare calls
+        separate, but do not repeat resolution for each untyped variable.
 
         Calls made inside a closure defined in this function are included
         too, tagged via_closure=True, unless the function makes the same
@@ -650,7 +648,7 @@ def _parse_file(args: Tuple[str, str, str]) -> Optional[Dict]:
                                or if the receiver was imported (e.g. 'json' for
                                json.loads → 'json.loads')
             receiver:          raw receiver expression for attribute calls
-                               (kept for debugging / future heuristics)
+                               (pass 2 distinguishes bare calls from methods)
             is_super_call:     True for super().method() -- resolved in pass 2
                                against the caller's own inherits chain
                                instead of the bare-name fallback, which used
@@ -756,14 +754,18 @@ def _parse_file(args: Tuple[str, str, str]) -> Optional[Dict]:
                             receiver_path = True
 
             for import_resolved in import_options:
-                # The nested class is part of the key: self.helper() in the
-                # function and in a nested class's method are different calls.
-                hints_key = (func_id, callee, receiver, import_resolved, local_type_hint,
-                             nested_cls_id)
+                # Operator dispatch still needs every explicit receiver,
+                # including those whose equivalent call edge is skipped.
+                seen_call_targets.add((func_id, callee, receiver))
+                # Mirror _resolve_call and the deferred super-call path.
+                # Own calls are visited first, so direct beats via_closure
+                # without making closure provenance part of this key.
+                hints_key = (func_id, callee, class_hint_id, class_hint,
+                             local_type_hint, import_resolved, receiver is None,
+                             is_super_call, nested_cls_id if is_super_call else None)
                 if hints_key in seen_call_hints:
                     continue
                 seen_call_hints.add(hints_key)
-                seen_call_targets.add((func_id, callee, receiver))
 
                 call_meta = {
                     'unresolved': True,
@@ -2557,15 +2559,23 @@ class RepoKGBuilder:
             commit: Commit SHA to build the KG from.
 
         Returns:
-            KG dict ready for saving or querying.
+            KG dict ready for saving or querying. Its metadata also records
+            build_time_extraction_s (clone if needed, then git archive) and
+            extraction_cached (whether the bare clone was already there), so
+            a cold build can be told apart from a warm one (pycodekg#40).
         """
+        extraction_cached = self.repo_manager.is_cached(repo)
         with tempfile.TemporaryDirectory() as tmp:
             dest = Path(tmp) / 'src'
             print(f"Extracting {repo}@{commit[:8]}...")
+            extraction_start = time.perf_counter()
             self.repo_manager.extract_at_commit(repo, commit, dest)
+            extraction_time_s = time.perf_counter() - extraction_start
             print("Parsing source...")
             kg = self.ast_parser.parse_repo(repo, dest)
 
+        kg['metadata']['build_time_extraction_s'] = round(extraction_time_s, 3)
+        kg['metadata']['extraction_cached'] = extraction_cached
         kg['metadata']['base_commit'] = commit
         kg['metadata']['schema_version'] = SCHEMA_VERSION
         return kg
