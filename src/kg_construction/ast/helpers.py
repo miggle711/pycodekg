@@ -1172,7 +1172,7 @@ def _get_instantiated_classes_in_class(class_node: ast.ClassDef) -> List[str]:
     seen: List[str] = []
     for child in iter_scope_defs(class_node):
         if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            for name in _get_instantiated_classes(child):
+            for name in _get_instantiated_classes(child, dotted=True):
                 if name not in seen:
                     seen.append(name)
     return seen
@@ -1271,6 +1271,7 @@ def _get_used_imports(
 
 def _get_instantiated_classes(
     func_node: Union[ast.FunctionDef, ast.AsyncFunctionDef],
+    dotted: bool = False,
 ) -> List[str]:
     """Find class names instantiated inside a function (e.g. Foo(...) calls).
 
@@ -1280,19 +1281,47 @@ def _get_instantiated_classes(
     functions are included on purpose: a class instantiated inside a closure
     is still a dependency of the outer function.
 
+    Args:
+        dotted: keep the path written before the class (`forms.Media()`
+            gives 'forms.Media' rather than 'Media'), so pass 2 can follow
+            the import it starts with to the one class it names, and knows
+            not to guess when it can not (`self.SessionStore()`, set at
+            runtime) (#169).
+
     Returns:
         List of class name strings instantiated in this function.
     """
     classes: List[str] = []
+    # A name the function assigns itself (`Wrapper = type(self.conn)`) holds
+    # whatever was assigned at runtime, not a class defined somewhere (#169).
+    assigned = ({n.id for n in ast.walk(func_node)
+                 if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store)}
+                if dotted else set())
     for child in ast.walk(func_node):
         if isinstance(child, ast.Call):
+            name = None
             if isinstance(child.func, ast.Name) and child.func.id[0].isupper():
-                if child.func.id not in classes:
-                    classes.append(child.func.id)
+                if child.func.id in assigned:
+                    continue
+                name = child.func.id
             elif isinstance(child.func, ast.Attribute) and child.func.attr[0].isupper():
-                if child.func.attr not in classes:
-                    classes.append(child.func.attr)
+                name = child.func.attr
+                if dotted:
+                    name = _dotted_name(child.func) or name
+            if name and name not in classes:
+                classes.append(name)
     return classes
+
+
+def _dotted_name(node: ast.AST) -> Optional[str]:
+    """'a.b.C' for a chain of plain names and attributes, else None."""
+    parts = []
+    while isinstance(node, ast.Attribute):
+        parts.append(node.attr)
+        node = node.value
+    if not isinstance(node, ast.Name):
+        return None
+    return '.'.join([node.id] + parts[::-1])
 
 
 def _get_factory_call_sites(
