@@ -105,7 +105,7 @@ classes. Testgeneval's `inference/configs/shared_task.py` supplies the system
 message, target-specific task text and output format for both arms. Pycodekg
 does not add those instructions to the context block.
 
-Use the companion shared-instructions version of testgeneval (#103) with this
+Use the companion shared-instructions version of testgeneval (miggle711/testgeneval#103) with this
 format. Its reader rejects older entries containing a full `prompt` instead
 of `context`; regenerate those files with `scripts/build_kg_prompts.py`.
 
