@@ -246,8 +246,14 @@ class TestContextValidator(ValidationBase):
             key = (seed['label'], seed.get('metadata', {}).get('class'))
             seen_ids_by_key[key].add(seed['id'])
 
+        # Seeds pinned by their own changed `def` line are each a definition
+        # the patch really changed, so same-named ones that are all pinned
+        # (two closures named `dec` in different functions, both edited) are
+        # several real changes, not a lookup that could not choose (#106).
+        pinned = set(self.context.pinned_seed_ids)
         ambiguous = [
-            label for (label, _cls), ids in seen_ids_by_key.items() if len(ids) > 1
+            label for (label, _cls), ids in seen_ids_by_key.items()
+            if len(ids) > 1 and not ids <= pinned
         ]
 
         if ambiguous:

@@ -29,6 +29,15 @@ for s in 0 1 42; do PYTHONHASHSEED=$s pytest tests/ -q; done
 - Write one test per real behaviour and parametrize variants of the same behaviour. Skip tests that only restate the code.
 - A regression test must fail without the fix. Check this by stashing the source change and running the test.
 
+## Issues
+
+Pick a template when you open an issue.
+
+* **KG quality bug:** a wrong or missing edge, or the wrong thing in a prompt. Give a small repro with the output you actually got, and the effect on real code if you know it.
+* **Task or RFC:** a piece of work or a design question. Give the problem, the options and the tradeoffs, and your open questions.
+
+Add one label for a KG quality bug: `wrong edges` (the KG says something false), `missing edges` (it lacks something true) or `prompt content` (what reaches the LLM prompts). Say in the issue whether the fix would change KG contents, since that needs a `scripts/kg_diff.py` table and a `SCHEMA_VERSION` bump.
+
 ## Pull requests
 
 Link the issue in the first line. Use `Fixes #N` when the PR completes the issue, and `Part of #N` when it does not, so merging does not close an issue that still has work left.
@@ -56,6 +65,16 @@ If a PR changes which nodes, edges or metadata a KG contains, do two more things
 2. **Bump `SCHEMA_VERSION`** in `src/kg_construction/kg/builder.py` and add a line to the comment block above it describing the change. A cached KG with an older version is rejected by `load()`. If a KG rebuild is already queued behind other PRs, say so in the description instead of bumping again.
 
 A change that only affects the shape of the KG (new fields, node types or relations) needs the bump too.
+
+### Scripts behind a claim
+
+Every number, table or "I checked that" in a PR description or review comment must be reproducible. Include the script that produced it.
+
+* Put the script in the PR: in the description inside a collapsed `<details>` block, or under `scripts/` if others will reuse it. A path on your own machine does not count.
+* Say how to run it and what it needs (repo commits, the dataset, a cache). Use placeholders in paths, not your own.
+* If the claim comes from a tool already in the repo, such as `scripts/kg_diff.py` or the test suite, name the exact command instead.
+* Report the inputs next to the result, as `kg_diff.py` does with its `repos:` line, so two people's numbers can be compared.
+* A script used in a review comment follows the same rule: attach it to the comment.
 
 ### Stacked PRs
 

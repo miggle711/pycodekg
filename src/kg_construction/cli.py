@@ -118,7 +118,7 @@ def _cmd_query(args: argparse.Namespace) -> int:
         node = _resolve_function(engine, args.callers)
         if node is None:
             return 1
-        results = engine.find_callers(node['id'])
+        results = engine.find_callers(node['id'], min_confidence=args.min_confidence)
         _print_or_json(
             results, args.json,
             lambda data: print(f"Callers of {args.callers}:\n" + "\n".join(
@@ -131,7 +131,7 @@ def _cmd_query(args: argparse.Namespace) -> int:
         node = _resolve_function(engine, args.callees)
         if node is None:
             return 1
-        results = engine.find_callees(node['id'])
+        results = engine.find_callees(node['id'], min_confidence=args.min_confidence)
         _print_or_json(
             results, args.json,
             lambda data: print(f"Callees of {args.callees}:\n" + "\n".join(
@@ -157,7 +157,7 @@ def _cmd_query(args: argparse.Namespace) -> int:
         node = _resolve_function(engine, args.tests)
         if node is None:
             return 1
-        results = engine.find_test_functions_for(node['id'])
+        results = engine.find_test_functions_for(node['id'], min_confidence=args.min_confidence)
         _print_or_json(
             results, args.json,
             lambda data: print(f"Existing tests for {args.tests}:\n" + "\n".join(
@@ -260,6 +260,10 @@ def build_parser() -> argparse.ArgumentParser:
     query_p.add_argument('--list-classes', action='store_true', help='List all classes in the KG')
     query_p.add_argument('--export', metavar='FUNC_NAME,...',
                           help='Export a subgraph (seed nodes + immediate neighbors) for comma-separated function names')
+    query_p.add_argument('--min-confidence', choices=['name_only', 'exact', 'qualified'], default=None,
+                         help='With --callers, --callees or --tests: leave out calls less confident than this '
+                              '(name_only guesses are dropped by exact, and only calls pinned down by a type '
+                              'or an import are kept by qualified)')
     query_p.add_argument('--json', action='store_true', help='Print raw JSON instead of a human-readable listing')
     query_p.set_defaults(func=_cmd_query)
 

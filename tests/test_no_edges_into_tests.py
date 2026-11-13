@@ -43,7 +43,7 @@ def _edges(tmp_path: Path, files, relation):
       "tests/test_signals.py": "class Handler(Exception): ...\n"}, "raises"),
 ], ids=["builtin_call", "library_base", "library_class_used", "library_raise"])
 def test_production_code_is_not_linked_into_test_files(tmp_path, files, relation):
-    assert [e for e in _edges(tmp_path, files, relation) if e[0] not in ("Handler", "Action", "Counter", "int")] == []
+    assert _edges(tmp_path, files, relation) == []
 
 
 def test_a_production_match_is_exact_despite_a_test_namesake(tmp_path):

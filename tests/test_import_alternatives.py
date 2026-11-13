@@ -115,8 +115,14 @@ def test_a_call_after_if_else_links_every_branch(tmp_path, source, expected):
     assert _run_targets(tmp_path, source) == expected
 
 
+def _build(tmp_path: Path, source: str):
+    for name, text in {**MODULES, "m.py": textwrap.dedent(source)}.items():
+        (tmp_path / name).write_text(text)
+    return RepoASTParser(max_workers=1).parse_repo("test/repo", tmp_path)
+
+
 def test_depends_on_covers_every_branch(tmp_path):
-    _run_targets(tmp_path, """
+    kg = _build(tmp_path, """
         import sys
         if sys.platform == "win32":
             import a as c
@@ -125,7 +131,6 @@ def test_depends_on_covers_every_branch(tmp_path):
         def f():
             c.run()
     """)
-    kg = RepoASTParser(max_workers=1).parse_repo("test/repo", tmp_path)
     nodes = {n["id"]: n["label"] for n in kg["nodes"]}
     assert sorted(nodes[e["target"]] for e in kg["edges"]
                   if e["relation"] == "depends_on" and nodes[e["source"]] == "f") == ["a", "b"]
@@ -207,6 +212,17 @@ def test_a_name_both_imported_and_assigned_keeps_its_import(tmp_path, source):
         "else_before_its_import", "returning_branch"])
 def test_bindings_follow_every_path_to_the_call(tmp_path, source, expected):
     assert _run_targets(tmp_path, source) == expected
+
+
+def test_a_comprehension_variable_does_not_hide_an_import(tmp_path):
+    # A comprehension's loop variable is its own scope in Python 3, so the
+    # function's m is still the import after it.
+    assert _run_targets(tmp_path, """
+        def f(items):
+            import a as m
+            names = [m for m in items]
+            m.run()
+    """) == [("f", "a.py")]
 
 
 @pytest.mark.parametrize("source", [

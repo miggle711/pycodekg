@@ -38,6 +38,11 @@ class RepoManager:
         """Return the local bare clone path for a repo (e.g. 'psf__requests')."""
         return self.cache_dir / repo.replace('/', '__')
 
+    def is_cached(self, repo: str) -> bool:
+        """Whether a bare clone of repo is already in cache_dir, so
+        extracting from it needs no network clone (pycodekg#40)."""
+        return self._cache_path(repo).exists()
+
     def ensure_clone(self, repo: str) -> Path:
         """Clone repo as a bare mirror if not already cached, then return its path.
 

@@ -112,7 +112,9 @@ class TestRaisesEdgeResolution:
         raises_edges = [e for e in kg["edges"] if e["relation"] == "raises"]
         assert raises_edges == []
 
-    def test_ambiguous_name_links_to_every_candidate(self, tmp_path):
+    def test_same_named_class_in_the_raising_file_is_the_one_raised(self, tmp_path):
+        # The name resolves through b.py's own module scope, so a.py's
+        # same-named class is not a candidate (#169).
         (tmp_path / "a.py").write_text(
             "class CustomError(Exception):\n"
             "    pass\n"
@@ -124,6 +126,21 @@ class TestRaisesEdgeResolution:
             "def f():\n"
             "    raise CustomError('ambiguous')\n"
         )
+        parser = RepoASTParser(max_workers=1)
+        kg = parser.parse_repo("test/repo", tmp_path)
+        nodes = {n["id"]: n for n in kg["nodes"]}
+
+        raises_edges = [e for e in kg["edges"] if e["relation"] == "raises"]
+        assert len(raises_edges) == 1
+        assert nodes[raises_edges[0]["target"]]["metadata"]["filepath"] == "b.py"
+        assert raises_edges[0]["metadata"]["confidence"] == "exact"
+
+    def test_name_from_nowhere_known_links_to_every_candidate(self, tmp_path):
+        # Neither defined nor imported in c.py (a star import from outside,
+        # a builtin injected at runtime): the name match still applies.
+        for name in ("a.py", "b.py"):
+            (tmp_path / name).write_text("class CustomError(Exception):\n    pass\n")
+        (tmp_path / "c.py").write_text("def f():\n    raise CustomError('ambiguous')\n")
         parser = RepoASTParser(max_workers=1)
         kg = parser.parse_repo("test/repo", tmp_path)
 

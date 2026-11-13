@@ -209,6 +209,31 @@ def call_scope_chains(
     return scope_chains(func_node, (ast.Call,))
 
 
+def nested_class_of_calls(
+    func_node: Union[ast.FunctionDef, ast.AsyncFunctionDef],
+) -> Dict[int, ast.ClassDef]:
+    """For every Call in the body of a method of a class defined inside
+    `func_node` (or in a closure of such a method), keyed by id(call): that
+    class, the innermost one if they nest. In those calls `self`, `cls` and
+    super() mean that class, not the class `func_node` belongs to (#177).
+    A class's decorators and bases, and what its body runs directly, are
+    evaluated in the enclosing scope, so they are not mapped."""
+    found: Dict[int, ast.ClassDef] = {}
+    stack: List[Tuple[ast.AST, Optional[ast.ClassDef], bool]] = [(func_node, None, False)]
+    while stack:
+        node, cls, in_method = stack.pop()
+        if isinstance(node, ast.Call) and cls is not None and in_method:
+            found[id(node)] = cls
+        if node is not func_node and isinstance(node, ast.ClassDef):
+            kids = [(stmt, node, False) for stmt in node.body]
+        elif node is not func_node and isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            kids = [(stmt, cls, cls is not None) for stmt in node.body]
+        else:
+            kids = [(child, cls, in_method) for child in ast.iter_child_nodes(node)]
+        stack.extend(kids)
+    return found
+
+
 def scope_chains(
     func_node: Union[ast.FunctionDef, ast.AsyncFunctionDef],
     kinds: Tuple[type, ...],
@@ -1147,7 +1172,7 @@ def _get_instantiated_classes_in_class(class_node: ast.ClassDef) -> List[str]:
     seen: List[str] = []
     for child in iter_scope_defs(class_node):
         if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            for name in _get_instantiated_classes(child):
+            for name in _get_instantiated_classes(child, dotted=True):
                 if name not in seen:
                     seen.append(name)
     return seen
@@ -1246,6 +1271,7 @@ def _get_used_imports(
 
 def _get_instantiated_classes(
     func_node: Union[ast.FunctionDef, ast.AsyncFunctionDef],
+    dotted: bool = False,
 ) -> List[str]:
     """Find class names instantiated inside a function (e.g. Foo(...) calls).
 
@@ -1255,19 +1281,47 @@ def _get_instantiated_classes(
     functions are included on purpose: a class instantiated inside a closure
     is still a dependency of the outer function.
 
+    Args:
+        dotted: keep the path written before the class (`forms.Media()`
+            gives 'forms.Media' rather than 'Media'), so pass 2 can follow
+            the import it starts with to the one class it names, and knows
+            not to guess when it can not (`self.SessionStore()`, set at
+            runtime) (#169).
+
     Returns:
         List of class name strings instantiated in this function.
     """
     classes: List[str] = []
+    # A name the function assigns itself (`Wrapper = type(self.conn)`) holds
+    # whatever was assigned at runtime, not a class defined somewhere (#169).
+    assigned = ({n.id for n in ast.walk(func_node)
+                 if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store)}
+                if dotted else set())
     for child in ast.walk(func_node):
         if isinstance(child, ast.Call):
+            name = None
             if isinstance(child.func, ast.Name) and child.func.id[0].isupper():
-                if child.func.id not in classes:
-                    classes.append(child.func.id)
+                if child.func.id in assigned:
+                    continue
+                name = child.func.id
             elif isinstance(child.func, ast.Attribute) and child.func.attr[0].isupper():
-                if child.func.attr not in classes:
-                    classes.append(child.func.attr)
+                name = child.func.attr
+                if dotted:
+                    name = _dotted_name(child.func) or name
+            if name and name not in classes:
+                classes.append(name)
     return classes
+
+
+def _dotted_name(node: ast.AST) -> Optional[str]:
+    """'a.b.C' for a chain of plain names and attributes, else None."""
+    parts = []
+    while isinstance(node, ast.Attribute):
+        parts.append(node.attr)
+        node = node.value
+    if not isinstance(node, ast.Name):
+        return None
+    return '.'.join([node.id] + parts[::-1])
 
 
 def _get_factory_call_sites(
@@ -1550,8 +1604,11 @@ def _import_bindings(stmt: Union[ast.Import, ast.ImportFrom]) -> List[Tuple[str,
     if isinstance(stmt, ast.Import):
         # `import os.path` → local name is 'os', full name is 'os.path'
         return [(alias.asname or alias.name.split('.')[0], alias.name) for alias in stmt.names]
-    mod = stmt.module or ''
-    return [(alias.asname or alias.name, f"{mod}.{alias.name}" if mod else alias.name)
+    # A relative import keeps its dots (`from .a import b` is '.a.b'): which
+    # package it means depends on the importing file, which pass 2 knows.
+    mod = '.' * (stmt.level or 0) + (stmt.module or '')
+    return [(alias.asname or alias.name,
+             f"{mod}.{alias.name}" if stmt.module else f"{mod}{alias.name}")
             for alias in stmt.names]
 
 
@@ -1626,9 +1683,17 @@ def _merge_states(a: Optional[_FlowState], b: Optional[_FlowState]) -> Optional[
 
 
 def _stored_names(node: ast.AST) -> List[str]:
-    """Names a target expression (or a walrus inside an expression) binds."""
+    """Names a target expression (or a walrus inside an expression) binds in
+    the enclosing scope. A comprehension's loop variables are its own scope in
+    Python 3, so they are left out; a walrus inside a comprehension still
+    binds in the enclosing scope, so it is kept."""
+    in_comprehension: Set[int] = {
+        id(n) for comp in ast.walk(node) if isinstance(comp, ast.comprehension)
+        for n in ast.walk(comp.target)
+    }
     return [n.id for n in ast.walk(node)
-            if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store)]
+            if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store)
+            and id(n) not in in_comprehension]
 
 
 class ScopeFlow:

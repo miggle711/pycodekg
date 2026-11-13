@@ -49,6 +49,7 @@ from typing import List, Dict, Set, Optional, Tuple, Union
 from kg_construction.ast.helpers import (
     _make_id,
     _import_bindings,
+    _walk_own_scope,
     iter_scope_imports,
     _is_test_file,
     split_source_lines,
@@ -77,6 +78,7 @@ from kg_construction.ast.helpers import (
     _collect_file_level_info,
     ImportScopes,
     call_scope_chains,
+    nested_class_of_calls,
     call_expression_scope_names,
     scope_import_map_over,
     scope_import_alternatives,
@@ -180,10 +182,33 @@ MAX_FILE_LINES = 20000
 #    decorated_by edge is dropped when its name was imported from outside the
 #    repo. A method is only found as module.Class.name, so a bare call or a
 #    call on a module no longer reaches a method of that name.
-# 14: a call of `X.as_view()` in a function also gets calls edges to the
+# 14: in the methods of a class defined inside a function, self, cls and
+#    super() are resolved against that class, also for the outer function's
+#    via_closure copy of those calls, instead of the outer class.
+# 15: a call through an import is resolved through the module it names: a
+#    relative import keeps its dots ('.a.b') and is resolved from the
+#    importing file, an absolute one through the repo's files (src/ layouts),
+#    and an absolute import whose top level name is no repo package is
+#    outside the repo even when a nested module shares the name (#212). A
+#    call on a dotted module path resolves its first name through the
+#    imports (#206). A relative import's node label and id keep their dots.
+# 16: same-named classes in different files are told apart (#169). A base
+#    class, raised exception, instantiated class or decorator is followed
+#    through the using file's scopes and imports (package re-exports and
+#    star imports included) to the one definition it names; a typed local,
+#    a property read and an operator use that class's own members and its
+#    parents'; a closure's self.m() uses the method's class. A dotted name
+#    or class that can not be followed and matches definitions in several
+#    files gets no edge. Import statements record `asname`.
+# 20: a call of `X.as_view()` in a function also gets calls edges to the
 #    view's get, post, put, patch, delete and head methods (narrowed to the
-#    ones the function builds a request for), tagged via='as_view'.
-SCHEMA_VERSION = 14
+#    ones the function builds a request for), tagged via='as_view'. Numbered
+#    after 17 (#241), 18 (#242) and 19 (#240).
+SCHEMA_VERSION = 20
+
+
+# A plain dotted name: `utils` or `a.b.c`, with no calls or subscripts.
+_DOTTED_NAME = re.compile(r'[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*')
 
 
 def _same_commit(a: Optional[str], b: Optional[str]) -> bool:
@@ -194,6 +219,23 @@ def _same_commit(a: Optional[str], b: Optional[str]) -> bool:
         return False
     shorter, longer = sorted((a, b), key=len)
     return len(shorter) >= 7 and longer.startswith(shorter)
+
+
+def _takes_self(func_node: ast.AST) -> bool:
+    """Whether a method's first parameter is `self`."""
+    args = func_node.args.posonlyargs + func_node.args.args
+    return bool(args) and args[0].arg == 'self'
+
+
+def _binds_self(func_node: ast.AST) -> bool:
+    """Whether a function has its own `self` (a parameter or an
+    assignment), rather than using the one of the method around it."""
+    a = func_node.args
+    params = a.posonlyargs + a.args + a.kwonlyargs + [x for x in (a.vararg, a.kwarg) if x]
+    if any(x.arg == 'self' for x in params):
+        return True
+    return any(isinstance(n, ast.Name) and n.id == 'self' and isinstance(n.ctx, ast.Store)
+               for n in _walk_own_scope(func_node))
 
 
 def _base_name(base: str) -> str:
@@ -254,6 +296,31 @@ _CALL_CONFIDENCE_RANK = {'qualified': 3, 'exact': 2, 'name_only': 1, 'ambiguous'
 # returns a function that builds an X and calls one of these. `options` is
 # left out: the base View defines it for every view.
 _VIEW_HANDLERS = ('get', 'post', 'put', 'patch', 'delete', 'head')
+
+# Receivers that build a request for a view: Django's request factory and test
+# client, under the names tests give them. A dict's `.get(...)` or a DataFrame's
+# `.head()` is not one, so a call named after an HTTP method counts only when
+# its receiver is one of these or its first argument is a URL (a path starting
+# with `/`, or a `reverse(...)`).
+_REQUEST_BUILDER_NAMES = {'rf', 'client', 'async_client', 'async_rf', 'api_client',
+                          'factory', 'request_factory', 'api_rf'}
+_REQUEST_BUILDER_CLASSES = ('RequestFactory', 'AsyncRequestFactory', 'Client',
+                            'AsyncClient', 'APIClient', 'APIRequestFactory')
+
+
+def _builds_view_request(call: ast.Call, receiver: Optional[str]) -> bool:
+    """Whether `call` (named after an HTTP method) builds a request to send to a view."""
+    if not receiver:
+        return False
+    last = receiver.rsplit('.', 1)[-1]
+    if last in _REQUEST_BUILDER_NAMES or last.rstrip('()') in _REQUEST_BUILDER_CLASSES:
+        return True
+    first = call.args[0] if call.args else None
+    if isinstance(first, ast.Constant) and isinstance(first.value, str):
+        return first.value.startswith('/')
+    if isinstance(first, ast.Call):
+        return _extract_callee_name(first) in ('reverse', 'reverse_lazy')
+    return False
 
 
 def _add_call_edge(
@@ -466,9 +533,8 @@ def _parse_file(args: Tuple[str, str, str]) -> Optional[Dict]:
     # Deduplicate call edges within this file at creation time to avoid
     # accumulating one edge per call-site for frequently called functions
     seen_call_targets: Set[Tuple[str, str, Optional[str]]] = set()
-    # The same call can go through a different import before and after a
-    # name is re-imported, so the import is part of what makes a call unique.
-    seen_call_hints: Set[Tuple[str, str, Optional[str], Optional[str], Optional[str]]] = set()
+    # Calls with identical resolution hints need only one pass-2 lookup.
+    seen_call_hints: Set[Tuple] = set()
 
     # Factory-call assignment sites recorded for optional pyright type
     # resolution (see kg/type_inference.py). Each site is
@@ -486,29 +552,27 @@ def _parse_file(args: Tuple[str, str, str]) -> Optional[Dict]:
     file_id = _make_id(f"file_{repo}_{rel_path}")
     file_type = 'test_file' if _is_test_file(rel_path) else 'file'
     import_map, exports, constants = _collect_file_level_info(tree)
-    # {local name: module path} for the module's absolute imports. A relative
-    # import is always into this repo, so it gives no hint and removes any
-    # earlier absolute binding of the same name. Used to tell pass 2 where a
-    # base class, raised exception, decorator or instantiated class comes
-    # from (see _import_hint).
-    absolute_imports: Dict[str, str] = {}
+    # {local name: module path} for the module's imports. A relative import
+    # keeps its dots ('.models.Base'); pass 2 resolves it from this file's
+    # package. Used to tell pass 2 where a base class, raised exception,
+    # decorator or instantiated class comes from (see _import_hint): from
+    # outside the repo, or from one particular repo file (#169).
+    import_paths: Dict[str, str] = {}
     for stmt in iter_scope_imports(tree):
         for local, qualified in _import_bindings(stmt):
-            if isinstance(stmt, ast.ImportFrom) and stmt.level:
-                absolute_imports.pop(local, None)
-            else:
-                absolute_imports[local] = qualified
+            import_paths[local] = qualified
 
     def _import_hint(name: str) -> Optional[str]:
         """The module path `name` comes from when its first part was imported
-        absolutely (`from collections import Counter` makes `Counter`
+        (`from collections import Counter` makes `Counter`
         'collections.Counter'; `import argparse` makes `argparse.Action`
-        'argparse.Action'), else None."""
+        'argparse.Action'; `from . import models` makes `models.Model`
+        '.models.Model'), else None."""
         match = re.match(r'[A-Za-z_]\w*', name)
-        if not match or match.group(0) not in absolute_imports:
+        if not match or match.group(0) not in import_paths:
             return None
         rest = name[match.end():].split('[', 1)[0]
-        return absolute_imports[match.group(0)] + rest
+        return import_paths[match.group(0)] + rest
 
     def _unresolved_meta(name: str) -> Dict:
         meta: Dict = {'unresolved': True}
@@ -561,12 +625,16 @@ def _parse_file(args: Tuple[str, str, str]) -> Optional[Dict]:
                     nodes.append(asdict(KGNode(id=mod_id, type='import', label=alias.name,
                                                metadata={'repo': repo})))
                 statement = {'module': None, 'name': alias.name, 'level': 0}
+                if alias.asname:
+                    statement['asname'] = alias.asname
                 if statement not in import_statements.setdefault(mod_id, []):
                     import_statements[mod_id].append(statement)
         else:
             mod_name = node.module or ''
-            for alias in node.names:
-                full_name = f"{mod_name}.{alias.name}" if mod_name else alias.name
+            # The label comes from _import_bindings, which depends_on edges
+            # use too, so a relative import's node keeps its dots
+            # ('.utils.helper') and the edges to it find it.
+            for alias, (_, full_name) in zip(node.names, _import_bindings(node)):
                 imp_id = _make_id(f"import_{repo}_{full_name}")
                 if imp_id not in imports_emitted:
                     imports_emitted.add(imp_id)
@@ -574,6 +642,10 @@ def _parse_file(args: Tuple[str, str, str]) -> Optional[Dict]:
                                                metadata={'repo': repo, 'module': mod_name,
                                                          'name': alias.name})))
                 statement = {'module': mod_name, 'name': alias.name, 'level': node.level}
+                if alias.asname:
+                    # The name the file binds, so pass 2 can follow a
+                    # re-export made under another name (#169).
+                    statement['asname'] = alias.asname
                 if statement not in import_statements.setdefault(imp_id, []):
                     import_statements[imp_id].append(statement)
     for imp_id, statements in import_statements.items():
@@ -583,12 +655,11 @@ def _parse_file(args: Tuple[str, str, str]) -> Optional[Dict]:
     def _emit_call_edges(func_id: str, func_node: Union[ast.FunctionDef, ast.AsyncFunctionDef],
                          local_types: Dict[str, str], class_name: Optional[str] = None,
                          class_id: Optional[str] = None):
-        """Emit one 'calls' edge per unique (caller, callee_name, receiver).
+        """Emit one 'calls' edge per unique (caller, callee_name, hints).
 
-        The receiver is part of the key because the resolution hints derive
-        from it: `x.save()` (type unknown) and `m.save()` (m = Model()) are
-        different calls even though the callee name is the same, and a
-        resolvable one must not be hidden behind an unresolvable one.
+        Receiver names with identical hints resolve the same way in pass 2.
+        Keep distinct types, imports, class/super contexts and bare calls
+        separate, but do not repeat resolution for each untyped variable.
 
         Calls made inside a closure defined in this function are included
         too, tagged via_closure=True, unless the function makes the same
@@ -607,7 +678,7 @@ def _parse_file(args: Tuple[str, str, str]) -> Optional[Dict]:
                                or if the receiver was imported (e.g. 'json' for
                                json.loads → 'json.loads')
             receiver:          raw receiver expression for attribute calls
-                               (kept for debugging / future heuristics)
+                               (pass 2 distinguishes bare calls from methods)
             is_super_call:     True for super().method() -- resolved in pass 2
                                against the caller's own inherits chain
                                instead of the bare-name fallback, which used
@@ -625,8 +696,12 @@ def _parse_file(args: Tuple[str, str, str]) -> Optional[Dict]:
         # handlers an `as_view()` call here is meant to reach.
         called_http_methods = sorted({
             _extract_callee_name(c) for c in own_calls + closure_calls
-            if _extract_callee_name(c) in _VIEW_HANDLERS and _extract_call_receiver(c)
+            if _extract_callee_name(c) in _VIEW_HANDLERS
+            and _builds_view_request(c, _extract_call_receiver(c))
         })
+        # Calls in the methods of a class defined inside this function: their
+        # self/cls/super() mean that class (#177).
+        nested_classes = nested_class_of_calls(func_node)
         scopes = ImportScopes(enclosing_imports, enclosing_alternatives)
         chains = call_scope_chains(func_node)
         expression_names = call_expression_scope_names(func_node)
@@ -658,6 +733,7 @@ def _parse_file(args: Tuple[str, str, str]) -> Optional[Dict]:
             # can be any of them: one edge per module (see ImportScopes).
             import_options: List[Optional[str]] = [None]
             is_super_call = receiver == 'super()'
+            receiver_path = False
             chain = chains[id(call)]
             receiver_is_local, local_type = (
                 local_scopes.lookup(receiver, outer_funcs + chain) if receiver else (False, None))
@@ -671,8 +747,15 @@ def _parse_file(args: Tuple[str, str, str]) -> Optional[Dict]:
                 # `if m is None: import a as m`): resolve through it.
                 receiver_is_local = False
 
+            nested_cls = nested_classes.get(id(call))
+            nested_cls_id = (_make_id(f"class_{repo}_{rel_path}_{qualnames[id(nested_cls)]}")
+                             if nested_cls is not None else None)
             if is_super_call:
                 pass  # resolved in pass 2 via the caller's own inherits chain
+            elif receiver in ('self', 'cls') and nested_cls is not None:
+                # In a nested class's method, not the outer class's self.
+                class_hint = nested_cls.name
+                class_hint_id = nested_cls_id
             elif receiver == 'self' and class_name is not None:
                 class_hint = class_name
                 # The exact class node, so pass 2 does not have to guess
@@ -693,13 +776,34 @@ def _parse_file(args: Tuple[str, str, str]) -> Optional[Dict]:
                     # an attribute call: v.foo() is a method call whatever v
                     # is, not a call of the imported function foo.
                     import_options = scopes.lookup_all(callee, call, chain) or [None]
+                else:
+                    # A dotted module path (`requests.utils.rewind_body()`
+                    # after `import requests`): the import binds only its
+                    # first name, so resolve that (#206). Pass 2 checks the
+                    # rest against the module files; when it names an object
+                    # rather than a module, the call stays a name match.
+                    head, _, rest = receiver.partition('.')
+                    if (rest and _DOTTED_NAME.fullmatch(rest)
+                            and head not in expression_names.get(id(call), ())
+                            and not local_scopes.lookup(head, outer_funcs + chain)[0]):
+                        head_bound = scopes.lookup_all(head, call, chain)
+                        if head_bound:
+                            import_options = [f"{b}.{rest}.{callee}" for b in head_bound]
+                            receiver_path = True
 
             for import_resolved in import_options:
-                hints_key = (func_id, callee, receiver, import_resolved, local_type_hint)
+                # Operator dispatch still needs every explicit receiver,
+                # including those whose equivalent call edge is skipped.
+                seen_call_targets.add((func_id, callee, receiver))
+                # Mirror _resolve_call and the deferred super-call path.
+                # Own calls are visited first, so direct beats via_closure
+                # without making closure provenance part of this key.
+                hints_key = (func_id, callee, class_hint_id, class_hint,
+                             local_type_hint, import_resolved, receiver is None,
+                             is_super_call, nested_cls_id if is_super_call else None)
                 if hints_key in seen_call_hints:
                     continue
                 seen_call_hints.add(hints_key)
-                seen_call_targets.add((func_id, callee, receiver))
 
                 call_meta = {
                     'unresolved': True,
@@ -710,6 +814,11 @@ def _parse_file(args: Tuple[str, str, str]) -> Optional[Dict]:
                     'import_resolved': import_resolved,
                     'is_super_call': is_super_call,
                 }
+                if is_super_call and nested_cls_id is not None:
+                    # super() walks the nested class's bases, not the caller's.
+                    call_meta['super_class_id'] = nested_cls_id
+                if receiver_path:
+                    call_meta['import_via_receiver_path'] = True
                 if in_closure:
                     call_meta['via_closure'] = True
                 if callee == 'as_view' and receiver and not is_super_call:
@@ -723,7 +832,8 @@ def _parse_file(args: Tuple[str, str, str]) -> Optional[Dict]:
                 )))
 
     def _emit_access_edges(func_id: str, func_node: Union[ast.FunctionDef, ast.AsyncFunctionDef],
-                           local_types: Dict[str, str], class_name: Optional[str] = None):
+                           local_types: Dict[str, str], class_name: Optional[str] = None,
+                           class_id: Optional[str] = None):
         """Emit one 'accesses' edge per unique (caller, attr_name) pair.
 
         Covers @property reads (obj.attr, never obj.attr()) that
@@ -749,11 +859,13 @@ def _parse_file(args: Tuple[str, str, str]) -> Optional[Dict]:
             seen_access_targets.add((func_id, attr_name))
 
             class_hint: Optional[str] = None
+            class_hint_id: Optional[str] = None
             local_type_hint: Optional[str] = None
             import_resolved: Optional[str] = None
 
             if receiver == 'self' and class_name is not None:
                 class_hint = class_name
+                class_hint_id = class_id  # this class, not any same-named one (#169)
             elif receiver and receiver in local_types:
                 local_type_hint = local_types[receiver]
             elif receiver and receiver in import_map:
@@ -765,13 +877,15 @@ def _parse_file(args: Tuple[str, str, str]) -> Optional[Dict]:
                     'unresolved': True,
                     'receiver': receiver,
                     'class_hint': class_hint,
+                    'class_hint_id': class_hint_id,
                     'local_type_hint': local_type_hint,
                     'import_resolved': import_resolved,
                 }
             )))
 
     def _emit_operator_edges(func_id: str, func_node: Union[ast.FunctionDef, ast.AsyncFunctionDef],
-                             local_types: Dict[str, str], class_name: Optional[str] = None):
+                             local_types: Dict[str, str], class_name: Optional[str] = None,
+                             class_id: Optional[str] = None):
         """Emit a 'calls' edge for operator dispatch sites (kg_construction#122).
 
         `a | b` never appears as an ast.Call, Python's own dispatch
@@ -785,10 +899,12 @@ def _parse_file(args: Tuple[str, str, str]) -> Optional[Dict]:
                 continue
 
             class_hint: Optional[str] = None
+            class_hint_id: Optional[str] = None
             local_type_hint: Optional[str] = None
 
             if receiver == 'self' and class_name is not None:
                 class_hint = class_name
+                class_hint_id = class_id  # this class, not any same-named one (#169)
             elif receiver in local_types:
                 local_type_hint = local_types[receiver]
             else:
@@ -806,6 +922,7 @@ def _parse_file(args: Tuple[str, str, str]) -> Optional[Dict]:
                     'unresolved': True,
                     'receiver': receiver,
                     'class_hint': class_hint,
+                    'class_hint_id': class_hint_id,
                     'local_type_hint': local_type_hint,
                     'import_resolved': None,
                     'is_super_call': False,
@@ -956,6 +1073,7 @@ def _parse_file(args: Tuple[str, str, str]) -> Optional[Dict]:
         parent_function: Optional[str] = None,
         enclosing_class_id: Optional[str] = None,
         bases: Optional[List[str]] = None,
+        self_class: Optional[Tuple[str, str]] = None,
     ):
         """Emit a function/method node (and everything nested inside it)
         and a 'contains' edge from container_id -- shared by a top-level
@@ -979,6 +1097,10 @@ def _parse_file(args: Tuple[str, str, str]) -> Optional[Dict]:
                                 function.
             bases: The enclosing class's own base names, for 'overrides'
                   guesses -- only meaningful when parent_class is set.
+            self_class: (name, ID) of the class `self` is an instance of
+                        in a closure, when the method around it takes `self`
+                        and the closure uses that `self` rather than its own
+                        (#169 item 5).
         """
         func_type = 'test_function' if func_node.name.startswith('test_') else (
             'method' if parent_class is not None else 'function'
@@ -1004,11 +1126,23 @@ def _parse_file(args: Tuple[str, str, str]) -> Optional[Dict]:
                 )))
 
         local_types = _collect_local_types(func_node)
-        _emit_call_edges(func_id, func_node, local_types, class_name=parent_class,
-                         class_id=enclosing_class_id if parent_class is not None else None)
-        _emit_access_edges(func_id, func_node, local_types, class_name=parent_class)
+        # The class `self` is an instance of here: this method's class, or,
+        # in a closure, the class of the method whose `self` it uses.
+        if parent_class is not None and enclosing_class_id is not None:
+            own_self = (parent_class, enclosing_class_id)
+            # Closures only see it through a real `self` parameter.
+            passed_self = own_self if _takes_self(func_node) else None
+        else:
+            own_self = self_class if self_class and not _binds_self(func_node) else None
+            passed_self = own_self
+        self_name, own_class_id = own_self if own_self else (parent_class, None)
+        _emit_call_edges(func_id, func_node, local_types, class_name=self_name,
+                         class_id=own_class_id)
+        _emit_access_edges(func_id, func_node, local_types, class_name=self_name,
+                           class_id=own_class_id)
         _emit_func_edges(func_id, func_node, class_name=parent_class)
-        _emit_operator_edges(func_id, func_node, local_types, class_name=parent_class)
+        _emit_operator_edges(func_id, func_node, local_types, class_name=self_name,
+                             class_id=own_class_id)
 
         # raises/decorated_by: unresolved here, resolved in _resolve_edges
         # against the repo's own class/function index, same pattern as
@@ -1032,6 +1166,7 @@ def _parse_file(args: Tuple[str, str, str]) -> Optional[Dict]:
                 _emit_function(
                     child, container_id=func_id, qualname=qualnames[id(child)],
                     parent_function=func_node.name, enclosing_class_id=enclosing_class_id,
+                    self_class=passed_self,
                 )
             else:
                 _emit_class(child, container_id=func_id, qualname=qualnames[id(child)])
@@ -1426,6 +1561,55 @@ class RepoASTParser:
         repo_module_names = indices['repo_module_names']
         repo_top_names = indices['repo_top_names']
 
+        # Resolving an import's module path to a repo file, the same way
+        # module_depends_on does (src/ layouts, packages, relative imports),
+        # and the definitions in each file by qualified name.
+        module_index = _ModuleIndex({
+            n['metadata'].get('path', '') for n in all_nodes if n['type'] in ('file', 'test_file')
+        })
+        defs_by_file: Dict[Tuple[str, str], List[str]] = defaultdict(list)
+        # (file, simple name) -> [(qualname, id)], to find a class defined
+        # inside one of a class's methods (#169).
+        defs_by_last_name: Dict[Tuple[str, str], List[Tuple[str, str]]] = defaultdict(list)
+        for n in all_nodes:
+            if n['type'] in ('function', 'method', 'test_function', 'class'):
+                meta_n = n.get('metadata', {})
+                if meta_n.get('filepath') and meta_n.get('qualname'):
+                    # A redefinition ('f#2': an @overload stub before the real
+                    # def, a property setter, if/else alternatives) is the
+                    # same name to an importer, so all of them are indexed.
+                    qualname = re.sub(r'#\d+', '', meta_n['qualname'])
+                    defs_by_file[(meta_n['filepath'], qualname)].append(n['id'])
+                    defs_by_last_name[(meta_n['filepath'], qualname.rsplit('.', 1)[-1])].append(
+                        (qualname, n['id']))
+
+        def _import_target(qualified: str, caller_filepath: Optional[str]) -> Tuple[Optional[str], List[str]]:
+            """(repo file, rest) for an import path: the file of the longest
+            module prefix of `qualified`, and the names after it (a function,
+            a class, or Class.method). (None, []) if no prefix is a repo
+            module. A relative path ('.a.b', '..c') is resolved from the
+            caller's own package (#212)."""
+            stripped = qualified.lstrip('.')
+            level = len(qualified) - len(stripped)
+            parts = stripped.split('.') if stripped else []
+            if level:
+                if not caller_filepath or level > module_index.package_depth(caller_filepath):
+                    return None, []
+                base = caller_filepath.split('/')[:-1]
+                base = base[:len(base) - (level - 1)]
+                for k in range(len(parts) - 1, -1, -1):
+                    found = module_index.find_relative(base, parts[:k] if k else ['__init__'])
+                    if found:
+                        return found, parts[k:]
+                return None, []
+            for k in range(len(parts) - 1, 0, -1):
+                found, ambiguous = module_index.find(parts[:k])
+                if ambiguous:
+                    return None, []
+                if found:
+                    return found, parts[k:]
+            return None, []
+
         def _imported_from_outside(meta: Dict) -> bool:
             """Whether an edge's name was imported from a module outside the
             repo (#211). A standard library module counts as outside unless it
@@ -1433,8 +1617,8 @@ class RepoASTParser:
             holds every nested directory and module name (#212), so a stdlib
             name like collections can be in it by coincidence."""
             qualified = meta.get('import_resolved')
-            if not qualified:
-                return False
+            if not qualified or qualified.startswith('.'):
+                return False  # a relative import is always into the repo
             top = qualified.split('.', 1)[0]
             if top in repo_top_names:
                 return False
@@ -1460,14 +1644,139 @@ class RepoASTParser:
                 return ids
             return [i for i in ids if i not in in_test_file]
 
-        def _base_matches(class_id: str, base: str) -> List[str]:
-            """Class nodes a base class expression can refer to. The class
-            itself is excluded: `class Foo(a.Foo)` names the OTHER Foo, and
-            matching by simple name alone would link Foo to itself."""
-            return _visible_from(class_id, [
+        # What each file's imports bind, so a name can be followed through a
+        # package that re-exports it (`from django.db import models` then
+        # `models.Model`, defined in django/db/models/base.py and re-exported
+        # by django/db/models/__init__.py). {path: {local name: qualified}},
+        # and {path: [module of each `from m import *`]}.
+        file_bindings: Dict[str, Dict[str, str]] = defaultdict(dict)
+        star_imports: Dict[str, List[str]] = defaultdict(list)
+        for raw in all_edges:
+            if raw['relation'] != 'imports':
+                continue
+            path = nodes_by_id.get(raw['source'], {}).get('metadata', {}).get('path')
+            if not path:
+                continue
+            for st in raw.get('metadata', {}).get('statements', []):
+                dots = '.' * (st.get('level') or 0)
+                if st['module'] is None:  # import a.b [as c]
+                    local = st.get('asname') or st['name'].split('.')[0]
+                    file_bindings[path][local] = st['name'] if st.get('asname') else local
+                    continue
+                prefix = f"{dots}{st['module']}." if st['module'] else dots
+                if st['name'] == '*':
+                    star_imports[path].append(prefix)
+                else:
+                    file_bindings[path][st.get('asname') or st['name']] = prefix + st['name']
+
+        def _defs_through_import(qualified: str, from_path: Optional[str], depth: int = 0) -> List[str]:
+            """The definitions an import path names, following re-exports:
+            when the module it names does not define the name itself but
+            imports it (a package __init__, a `from x import *`), the import
+            there is followed in turn, up to a few hops."""
+            target_file, rest = _import_target(qualified, from_path)
+            if target_file is None or not rest:
+                return []
+            hits = defs_by_file.get((target_file, '.'.join(rest)), [])
+            if hits or depth >= 6:
+                return list(hits)
+            return _defs_by_name_in_file(target_file, rest, depth + 1)
+
+        def _defs_by_name_in_file(path: str, parts: List[str], depth: int = 0) -> List[str]:
+            """The definitions a dotted name (`Base`, `Base.Meta`) refers to
+            in a file's module scope: one defined there, one it imports, or
+            one a `from x import *` brings in."""
+            hits = defs_by_file.get((path, '.'.join(parts)), [])
+            if hits:
+                return list(hits)
+            if depth >= 6:
+                return []
+            bound = file_bindings.get(path, {}).get(parts[0])
+            if bound is not None:
+                return _defs_through_import('.'.join([bound] + parts[1:]), path, depth + 1)
+            for prefix in star_imports.get(path, []):
+                hits = _defs_through_import(prefix + '.'.join(parts), path, depth + 1)
+                if hits:
+                    return hits
+            return []
+
+        def _class_ref(source_id: str, name: str, meta: Dict, kinds=('class',)) -> List[str]:
+            """The definitions a class name used in `source_id`'s file refers
+            to, found through that file's imports or its own definitions
+            rather than by name across the repo (#169). Empty when it can not
+            be followed (a dynamic import, a name from an enclosing function),
+            and the caller falls back to the name match."""
+            node = nodes_by_id.get(source_id, {})
+            path = node.get('metadata', {}).get('filepath') or node.get('metadata', {}).get('path')
+            expr = name.split('[', 1)[0]
+            qualified = meta.get('import_resolved')
+            if qualified:
+                ids = _defs_through_import(qualified, path) if path else []
+            elif path and re.fullmatch(r'[A-Za-z_]\w*(\.[A-Za-z_]\w*)*', expr):
+                parts = expr.split('.')
+                # The scopes around the use, innermost first: a class defined
+                # in a test function usually inherits from another class
+                # defined in that same function.
+                scope = re.sub(r'#\d+', '', node.get('metadata', {}).get('qualname', '')).split('.')
+                if node.get('type') == 'class':
+                    scope = scope[:-1]  # a class's bases are looked up around it
+                ids = []
+                for i in range(len(scope), 0, -1):
+                    ids = defs_by_file.get((path, '.'.join(scope[:i] + parts)), [])
+                    if ids:
+                        break
+                if not ids and node.get('type') == 'class' and len(parts) == 1:
+                    # A class's 'uses' come from all of its methods, so a
+                    # class defined inside one of them (a test method's
+                    # local form) is in scope for it.
+                    own = re.sub(r'#\d+', '', node.get('metadata', {}).get('qualname', '')) + '.'
+                    ids = [i for q, i in defs_by_last_name.get((path, parts[0]), [])
+                           if q.startswith(own)]
+                if not ids:
+                    ids = _defs_by_name_in_file(path, parts)
+            else:
+                ids = []
+            if any(nodes_by_id.get(i, {}).get('type') not in kinds for i in ids):
+                # The name is also bound to something else there (a function
+                # and a class both named Config): which one the code means
+                # is not known, so leave it to the name match and its
+                # confidence rules.
+                return []
+            return _visible_from(source_id, ids)
+
+        def _name_ref(source_id: str, name: str, meta: Dict, by_name: List[str],
+                      kinds=('class',)) -> Tuple[List[str], bool]:
+            """(what a class or decorator name refers to, whether it was
+            followed through the file's scopes and imports). Followed when it
+            can be (#169); otherwise the name match `by_name`, except when the
+            name says which definition it means through something static
+            resolution can not follow: a dotted name (`self.form_class.Meta`)
+            or an import into a repo module that assigns rather than defines
+            it (`register = registry.register`). Linking those to every
+            definition with the last name (Django has 1,108 classes named
+            Meta) is not a guess but noise, so they get no edge, as calls do."""
+            followed = _class_ref(source_id, name, meta, kinds)
+            if followed:
+                return followed, True
+            if len(by_name) > 1:
+                qualified = meta.get('import_resolved')
+                path = nodes_by_id.get(source_id, {}).get('metadata', {}).get('filepath')
+                into_repo = bool(qualified) and _import_target(qualified, path)[0] is not None
+                if into_repo or '.' in name.split('[', 1)[0]:
+                    return [], False
+            return by_name, False
+
+        def _base_matches(class_id: str, base: str, meta: Optional[Dict] = None) -> Tuple[List[str], bool]:
+            """(class nodes a base class expression can refer to, whether it
+            was followed through the file's imports). The class itself is
+            excluded: `class Foo(a.Foo)` names the OTHER Foo, and matching by
+            simple name alone would link Foo to itself."""
+            by_name = _visible_from(class_id, [
                 cid for cid in class_label_to_ids.get(_base_name(base), [])
                 if cid != class_id
             ])
+            matches, followed = _name_ref(class_id, base, meta or {}, by_name)
+            return [i for i in matches if i != class_id], followed
 
         # class ID -> parent class IDs, built from the raw inherits edges up
         # front so self.method() calls can follow the parent chain while
@@ -1477,9 +1786,46 @@ class RepoASTParser:
         for raw in all_edges:
             if (raw['relation'] == 'inherits' and raw.get('metadata', {}).get('unresolved')
                     and not _imported_from_outside(raw['metadata'])):
-                for parent_id in _base_matches(raw['source'], raw['target']):
+                for parent_id in _base_matches(raw['source'], raw['target'], raw['metadata'])[0]:
                     if parent_id not in base_ids_by_class[raw['source']]:
                         base_ids_by_class[raw['source']].append(parent_id)
+
+        property_ids: Set[str] = {i for ids in property_method_to_ids.values() for i in ids}
+
+        def _one_file(ids: List[str]) -> List[str]:
+            """`ids` if they are all in one file, else none: a class name
+            that could not be followed to one class and matches classes in
+            several files (`x = self.SessionStore()`, chosen at runtime) gives
+            no edge rather than one per same-named class (#169)."""
+            files = {nodes_by_id.get(i, {}).get('metadata', {}).get('filepath') for i in ids}
+            return ids if len(files) <= 1 else []
+
+        def _members(class_ids: List[str], name: str, properties_only: bool = False) -> List[str]:
+            """`name` on each of these classes: its own definition, else the
+            nearest one up its inheritance chain (#169). Looked up by class
+            ID, so a same-named class in another file is never a candidate."""
+            found: List[str] = []
+            for cid in class_ids:
+                own = class_methods_by_id.get((cid, name), [])
+                if properties_only:
+                    own = [i for i in own if i in property_ids]
+                hits = list(own)
+                if not hits:
+                    for parent_id in base_ids_by_class.get(cid, []):
+                        inherited = self._find_nearest_ancestor_method(
+                            parent_id, name, base_ids_by_class, class_methods_by_id)
+                        if inherited is not None and (not properties_only or inherited in property_ids):
+                            hits = [inherited]
+                            break
+                found += [h for h in hits if h not in found]
+            return found
+
+        def _typed_classes(meta: Dict, source_id: str) -> List[str]:
+            """The class a local's type hint names (`x = Foo()` makes `Foo`),
+            found through the caller's scopes and imports as base classes are
+            (#169). Empty when it can not be followed."""
+            local_hint = meta.get('local_type_hint')
+            return _class_ref(source_id, local_hint, {}) if local_hint else []
 
         def _resolve_access(meta: Dict, attr_name: str, source_id: str) -> Tuple[List[str], str]:
             """Resolve an accesses-edge target against known @property methods.
@@ -1489,20 +1835,37 @@ class RepoASTParser:
             hint is too weak a signal to link against every same-named
             property in the repo, so it is left unresolved instead.
             """
+            class_hint_id = meta.get('class_hint_id')
+            if class_hint_id:
+                # self.attr: this class and its parents, not a same-named
+                # class elsewhere (#169).
+                hits = _members([class_hint_id], attr_name, properties_only=True)
+                return (hits, 'qualified') if hits else ([], 'unresolved')
             class_hint = meta.get('class_hint')
             if class_hint:
                 hits = _visible_from(source_id, property_method_to_ids.get((class_hint, attr_name), []))
                 if hits:
                     return hits, 'qualified'
 
+            typed = _typed_classes(meta, source_id)
+            if typed:
+                hits = _visible_from(source_id, _members(typed, attr_name, properties_only=True))
+                return (hits, 'qualified') if hits else ([], 'unresolved')
             local_hint = meta.get('local_type_hint')
             if local_hint:
-                hits = _visible_from(source_id, property_method_to_ids.get((local_hint, attr_name), []))
+                hits = _one_file(_visible_from(source_id, property_method_to_ids.get((local_hint, attr_name), [])))
                 if hits:
                     return hits, 'qualified'
 
             qualified = meta.get('import_resolved')
             if qualified:
+                # `Foo.attr` with Foo imported: the class the import names.
+                path = nodes_by_id.get(source_id, {}).get('metadata', {}).get('filepath')
+                owners = [i for i in _defs_through_import(qualified.rsplit('.', 1)[0], path)
+                          if nodes_by_id.get(i, {}).get('type') == 'class']
+                if owners:
+                    hits = _visible_from(source_id, _members(owners, attr_name, properties_only=True))
+                    return (hits, 'qualified') if hits else ([], 'unresolved')
                 parts = qualified.rsplit('.', 2)
                 if len(parts) == 3:
                     hits = _visible_from(source_id, property_method_to_ids.get((parts[1], parts[2]), []))
@@ -1535,29 +1898,58 @@ class RepoASTParser:
                     return hits, 'qualified'
 
             local_hint = meta.get('local_type_hint')
-            if local_hint:
-                hits = _visible_from(source_id, class_method_to_ids.get((local_hint, callee_name), []))
+            typed = _typed_classes(meta, source_id)
+            if typed:
+                # x = Foo(); x.m(): the Foo the caller's file means, and m
+                # on it or its parents, not on every class named Foo (#169).
+                hits = _visible_from(source_id, _members(typed, callee_name))
+                if hits:
+                    return hits, 'qualified'
+            elif local_hint:
+                hits = _one_file(_visible_from(source_id, class_method_to_ids.get((local_hint, callee_name), [])))
                 if hits:
                     return hits, 'qualified'
 
             qualified = meta.get('import_resolved')
             if qualified:
-                hits = _visible_from(source_id, qualified_to_ids.get(qualified, []))
-                if hits:
-                    return hits, 'qualified'
-                parts = qualified.rsplit('.', 2)
+                # The module the import names, found among the repo's files
+                # (src/ layouts, packages and relative imports included), and
+                # the definition in it.
+                target_file, rest = _import_target(qualified, caller_filepath)
+                if target_file is not None and rest:
+                    hits = _visible_from(source_id, defs_by_file.get((target_file, '.'.join(rest)), []))
+                    if hits:
+                        return hits, 'qualified'
+                if not qualified.startswith('.'):
+                    hits = _visible_from(source_id, qualified_to_ids.get(qualified, []))
+                    if hits:
+                        return hits, 'qualified'
+                # The import names a class, defined in another module and
+                # re-exported (sympy's dfm.py does `from ._dfm import DFM`), or
+                # whose method comes from a parent: follow it to that one
+                # class, and the method on it or its parents (#169).
+                if '.' in qualified.lstrip('.'):
+                    owners = [i for i in _defs_through_import(qualified.rsplit('.', 1)[0], caller_filepath)
+                              if nodes_by_id.get(i, {}).get('type') == 'class']
+                    hits = _visible_from(source_id, _members(owners, callee_name)) if owners else []
+                    if hits:
+                        return hits, 'qualified'
+                # Otherwise matched on the class and method names, for
+                # relative imports too.
+                parts = qualified.lstrip('.').rsplit('.', 2)
                 if len(parts) == 3:
                     hits = _visible_from(source_id, class_method_to_ids.get((parts[1], parts[2]), []))
                     if hits:
                         return hits, 'qualified'
-                # The precise lookups missed. That is not proof the target is
-                # outside the repo (relative imports lose their package,
-                # src/ layouts and __init__ re-exports do not match path
-                # derived names), but an import whose top level name is not
-                # any directory or module in this repo cannot be a call into
-                # it. Drop it rather than let the bare name fallback below
-                # link `json.loads` to an unrelated repo method named loads.
-                if qualified.split('.', 1)[0] not in repo_module_names:
+                # An absolute import that names no repo module and does not
+                # start with one of the repo's top level packages is outside
+                # the repo (json, pprint, os.path), even if a nested module
+                # shares the name (#212). Drop it rather than let the name
+                # match below link it to an unrelated repo definition. A
+                # module that is in the repo but does not define the name
+                # (an __init__ re-export) falls through to the name match.
+                if (target_file is None and not qualified.startswith('.')
+                        and qualified.split('.', 1)[0] not in repo_top_names):
                     return [], 'unresolved'
 
             # Bare Foo(...) is a constructor call when Foo is a class, so
@@ -1606,7 +1998,8 @@ class RepoASTParser:
             # receiver whose type is unknown (`d.loads()`, `self.session.get()`)
             # is only a guess that the name is unique, so it gets its own
             # lower tier.
-            if meta.get('receiver') is None or meta.get('import_resolved'):
+            anchored = meta.get('import_resolved') and not meta.get('import_via_receiver_path')
+            if meta.get('receiver') is None or anchored:
                 return hits, 'exact'
             return hits, 'name_only'
 
@@ -1717,7 +2110,7 @@ class RepoASTParser:
             elif edge['relation'] == 'inherits' and meta.get('unresolved'):
                 if _imported_from_outside(meta):
                     continue
-                matches = _base_matches(edge['source'], edge['target'])
+                matches, _ = _base_matches(edge['source'], edge['target'], meta)
                 if not matches:
                     continue
                 confidence = 'exact' if len(matches) == 1 else 'ambiguous'
@@ -1738,7 +2131,9 @@ class RepoASTParser:
                 # external exceptions have nothing to match and are
                 # dropped, same "drop rather than guess" rule as calls.
                 exc_name = edge['target']
-                matches = _visible_from(edge['source'], class_label_to_ids.get(exc_name, []))
+                # Through the file's imports first (#169), then by name.
+                matches, _ = _name_ref(edge['source'], exc_name, meta,
+                                       _visible_from(edge['source'], class_label_to_ids.get(exc_name, [])))
                 if not matches:
                     continue
                 confidence = 'exact' if len(matches) == 1 else 'ambiguous'
@@ -1758,7 +2153,11 @@ class RepoASTParser:
                 # a class and function of the same name can both exist
                 # (kg_construction#135 review).
                 dec_name = edge['target']
-                matches = _visible_from(edge['source'], class_label_to_ids.get(dec_name, []) + label_to_ids.get(dec_name, []))
+                # Through the file's imports first (#169), then by name.
+                matches, _ = _name_ref(
+                    edge['source'], dec_name, meta,
+                    _visible_from(edge['source'], class_label_to_ids.get(dec_name, []) + label_to_ids.get(dec_name, [])),
+                    kinds=('class', 'function'))
                 if not matches:
                     continue
                 # A bare decorator name resolves via the decorated
@@ -1803,7 +2202,12 @@ class RepoASTParser:
             elif edge['relation'] == 'uses' and meta.get('unresolved'):
                 if _imported_from_outside(meta):
                     continue
-                matches = _visible_from(edge['source'], class_label_to_ids.get(edge['target'], []))
+                # Through the file's imports first (#169): a name that is
+                # an imported or locally defined class is a constructor call
+                # of that class, whatever else shares the name.
+                matches, followed = _name_ref(
+                    edge['source'], edge['target'], meta,
+                    _visible_from(edge['source'], class_label_to_ids.get(_base_name(edge['target']), [])))
                 if not matches:
                     continue
                 # The uppercase-first-letter heuristic that produced this
@@ -1814,7 +2218,8 @@ class RepoASTParser:
                 # in the repo, the "instantiation" is only a guess even when
                 # a single class name matches, so confidence is downgraded
                 # to 'ambiguous' rather than reported as 'exact'.
-                name_collides_with_callable = bool(_visible_from(edge['source'], label_to_ids.get(edge['target'], [])))
+                name_collides_with_callable = not followed and bool(
+                    _visible_from(edge['source'], label_to_ids.get(_base_name(edge['target']), [])))
                 if len(matches) > 1:
                     confidence = 'ambiguous'
                 elif name_collides_with_callable:
@@ -2141,6 +2546,9 @@ class RepoASTParser:
                 if nodes_by_id.get(cid, {}).get('metadata', {}).get('filepath') == caller_filepath
             ]
             caller_class_ids = same_file_candidates or candidates
+            if edge.get('metadata', {}).get('super_class_id'):
+                # A super() call in a nested class's method (#177).
+                caller_class_ids = [edge['metadata']['super_class_id']]
 
             method_name = edge['target']
             for caller_class_id in caller_class_ids:
@@ -2244,15 +2652,23 @@ class RepoKGBuilder:
             commit: Commit SHA to build the KG from.
 
         Returns:
-            KG dict ready for saving or querying.
+            KG dict ready for saving or querying. Its metadata also records
+            build_time_extraction_s (clone if needed, then git archive) and
+            extraction_cached (whether the bare clone was already there), so
+            a cold build can be told apart from a warm one (pycodekg#40).
         """
+        extraction_cached = self.repo_manager.is_cached(repo)
         with tempfile.TemporaryDirectory() as tmp:
             dest = Path(tmp) / 'src'
             print(f"Extracting {repo}@{commit[:8]}...")
+            extraction_start = time.perf_counter()
             self.repo_manager.extract_at_commit(repo, commit, dest)
+            extraction_time_s = time.perf_counter() - extraction_start
             print("Parsing source...")
             kg = self.ast_parser.parse_repo(repo, dest)
 
+        kg['metadata']['build_time_extraction_s'] = round(extraction_time_s, 3)
+        kg['metadata']['extraction_cached'] = extraction_cached
         kg['metadata']['base_commit'] = commit
         kg['metadata']['schema_version'] = SCHEMA_VERSION
         return kg

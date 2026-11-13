@@ -71,3 +71,33 @@ def test_same_named_views_are_told_apart_by_the_import(tmp_path):
         "test_views.py": "from site_views import Index\ndef test_it(request):\n    Index.as_view()(request)\n",
     }
     assert _handlers(tmp_path, files) == [("Index.post", "qualified")]
+
+
+ITEM_VIEW = """
+    from base import View
+    class ItemView(View):
+        def get(self, request): ...
+        def post(self, request): ...
+"""
+
+
+@pytest.mark.parametrize("body, expected", [
+    # rf builds the request, so only post is meant. The dict's .get(...) does not count.
+    ('def test_it(rf):\n    options = {}\n    options.get("timeout")\n'
+     '    ItemView.as_view()(rf.post("/item/"))\n', [("ItemView.post", "qualified")]),
+    # Only a dict lookup: no request is built, so the handler stays unknown (both).
+    ('def test_it():\n    cfg = {}\n    cfg.get("x")\n    ItemView.as_view()(object())\n',
+     [("ItemView.get", "name_only"), ("ItemView.post", "name_only")]),
+    # The test client, with a reverse() url.
+    ('def test_it(client):\n    client.post(reverse("item"))\n    ItemView.as_view()\n',
+     [("ItemView.post", "qualified")]),
+    # A url path as the first argument, whatever the receiver is called.
+    ('def test_it(c):\n    c.get("/item/")\n    ItemView.as_view()\n', [("ItemView.get", "qualified")]),
+    # An HTTP library or a DataFrame is not a request builder.
+    ('import requests\ndef test_it(df):\n    requests.get("https://example.com")\n    df.head()\n'
+     '    ItemView.as_view()\n', [("ItemView.get", "name_only"), ("ItemView.post", "name_only")]),
+])
+def test_only_a_call_that_builds_a_request_narrows_the_handlers(tmp_path, body, expected):
+    files = {"base.py": BASE, "views.py": ITEM_VIEW,
+             "test_views.py": "from views import ItemView\n" + body}
+    assert _handlers(tmp_path, files) == expected
