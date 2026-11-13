@@ -103,10 +103,20 @@ def _build_seed_block(seed: dict) -> str:
     )
 
 
+def _constants_section(items: list) -> str:
+    if not items:
+        return ""
+    parts = ["Module constants:"]
+    for item in items:
+        parts.append(f"{item['module']}:\n```python\n{item['source_code']}\n```")
+    return "\n".join(parts) + "\n"
+
+
 def _build_context(serialized: dict) -> str:
-    """The KG context block: one block per seed, then callers, callees,
-    sibling methods and related classes. No task wording: testgeneval adds
-    the instructions both arms share."""
+    """The KG context block: one block per seed, the module constants the
+    seeds reference, then callers, callees, sibling methods and related
+    classes. No task wording: testgeneval adds the instructions both arms
+    share."""
     # serialized["seed"] is a list -- a patch can change more than one
     # function/class in the same file (6/66 real django instances do),
     # so every seed gets its own block, not just the first.
@@ -116,6 +126,7 @@ def _build_context(serialized: dict) -> str:
     seed_blocks = "\n".join(_build_seed_block(seed) for seed in seeds)
 
     sections = "\n".join(filter(None, [
+        _constants_section(context.get("module_constants", [])),
         _snippet_section("Callers", context.get("callers", [])),
         _snippet_section("Callees", context.get("callees", [])),
         _snippet_section("Sibling methods", context.get("sibling_methods", [])),
@@ -147,6 +158,10 @@ def main():
     parser.add_argument("--depth", type=int, default=2,
                         help="BFS retrieval depth (default 2). Values above 2 expand "
                              "the subgraph but do not add prompt content with the current serializer.")
+    parser.add_argument("--without-module-constants", action="store_true",
+                        help="Leave out the module constants section. For measuring what "
+                             "the section adds (e.g. against a token budget) from the same "
+                             "KGs and code; prompts for a run keep it.")
     args = parser.parse_args()
     if args.depth > 2:
         logging.getLogger(__name__).warning(
@@ -180,6 +195,10 @@ def main():
     # where extract() itself completed, even if serialization later fails
     # that instance out of `prompts`.
     localization_stats = {}
+    # Instances whose seed-file constants could not be read from the
+    # post-patch file: their prompt has no constants section rather than the
+    # KG's pre-patch values (miggle711/pycodekg#114).
+    constants_unavailable_instances = []
 
     for row in rows:
         repo_slug = _repo_slug(row["repo"])
@@ -209,6 +228,7 @@ def main():
                 "edge_count": context.edge_count,
                 "cross_file_node_proportion": context.cross_file_node_proportion,
                 "relationship_type_counts": context.relationship_type_counts,
+                "constants_unavailable": context.constants_unavailable,
             }
             if context.stale_seed_labels:
                 stale_seed_instances.append((row["id"], context.stale_seed_labels))
@@ -217,8 +237,24 @@ def main():
                 "context_nodes": context.context_nodes,
                 "edges": context.edges,
                 "test_nodes": context.test_nodes,
+                # Fetch independently of BFS depth (a method's file is two
+                # containment hops away, and depth zero has no file context).
+                "file_nodes": [node
+                               for path in sorted({s.get("metadata", {}).get("filepath")
+                                                   or s.get("metadata", {}).get("path")
+                                                   for s in context.seeds} - {None})
+                               for node in engine.find_file_by_path(path, exact=True)],
+                # The seed file's constants from the post-patch file, as an
+                # overlay: the KG's file node keeps its pre-patch values.
+                "post_patch_constants": context.post_patch_constants,
+                "constants_unavailable": context.constants_unavailable,
             }
             serialized = LLMSerializer(repo=row["repo"]).serialize(context_dict)
+            if args.without_module_constants:
+                serialized["context"]["module_constants"] = []
+            if serialized.get("context", {}).get("module_constants_unavailable"):
+                constants_unavailable_instances.append(
+                    (row["id"], serialized["context"]["module_constants_unavailable"]))
             if not serialized.get("seed"):
                 failures.append((row["id"], "no seed extracted"))
                 continue
@@ -299,6 +335,13 @@ def main():
         print(f"{len(stale_seed_instances)} instance(s) with a stale (pre-patch) seed:")
         for instance_id, labels in stale_seed_instances:
             print(f"  {instance_id}: {labels}")
+    if constants_unavailable_instances:
+        # The post-patch focal file could not be reconstructed or parsed, so
+        # these prompts show no module constants at all.
+        print(f"{len(constants_unavailable_instances)} instance(s) with no module constants "
+              f"because the post-patch focal file was unavailable:")
+        for instance_id, items in constants_unavailable_instances:
+            print(f"  {instance_id}: " + "; ".join(f"{i['filepath']}: {i['reason']}" for i in items))
     if multi_seed_instances:
         # Real, not rare (6/66 real django instances) -- visible here so
         # a run's actual seed count per instance isn't only discoverable
