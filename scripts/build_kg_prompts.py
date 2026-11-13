@@ -158,6 +158,10 @@ def main():
     parser.add_argument("--depth", type=int, default=2,
                         help="BFS retrieval depth (default 2). Values above 2 expand "
                              "the subgraph but do not add prompt content with the current serializer.")
+    parser.add_argument("--without-module-constants", action="store_true",
+                        help="Leave out the module constants section. For measuring what "
+                             "the section adds (e.g. against a token budget) from the same "
+                             "KGs and code; prompts for a run keep it.")
     args = parser.parse_args()
     if args.depth > 2:
         logging.getLogger(__name__).warning(
@@ -246,6 +250,8 @@ def main():
                 "constants_unavailable": context.constants_unavailable,
             }
             serialized = LLMSerializer(repo=row["repo"]).serialize(context_dict)
+            if args.without_module_constants:
+                serialized["context"]["module_constants"] = []
             if serialized.get("context", {}).get("module_constants_unavailable"):
                 constants_unavailable_instances.append(
                     (row["id"], serialized["context"]["module_constants_unavailable"]))
