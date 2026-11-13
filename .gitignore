@@ -13,6 +13,9 @@ scripts/*
 !scripts/kg_diff.py
 !scripts/rq1_recheck_labels.py
 !scripts/check_function_signatures.py
+!scripts/kg_edge_audit.py
+!scripts/kg_edge_audit_sample.py
+!scripts/kg_edge_audit_prompt_reach.py
 
 # kg_output
 kg_output/
