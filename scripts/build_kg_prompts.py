@@ -40,6 +40,7 @@ Usage:
 
 import argparse
 import json
+import logging
 import sys
 from pathlib import Path
 
@@ -112,7 +113,10 @@ def _constants_section(items: list) -> str:
 
 
 def _build_context(serialized: dict) -> str:
-    """The KG context block, with no task wording or system message."""
+    """The KG context block: one block per seed, the module constants the
+    seeds reference, then callers, callees, sibling methods and related
+    classes. No task wording: testgeneval adds the instructions both arms
+    share."""
     # serialized["seed"] is a list -- a patch can change more than one
     # function/class in the same file (6/66 real django instances do),
     # so every seed gets its own block, not just the first.
@@ -151,8 +155,15 @@ def main():
     parser.add_argument("--dataset-path", type=str, required=True,
                          help="Local disk path to a saved dataset (load_from_disk).")
     parser.add_argument("--output", type=str, default="kg_prompts.json")
-    parser.add_argument("--depth", type=int, default=2)
+    parser.add_argument("--depth", type=int, default=2,
+                        help="BFS retrieval depth (default 2). Values above 2 expand "
+                             "the subgraph but do not add prompt content with the current serializer.")
     args = parser.parse_args()
+    if args.depth > 2:
+        logging.getLogger(__name__).warning(
+            "BFS depth above 2 expands the retrieved subgraph but does not add prompt content "
+            "with the current serializer. Use depths 1 and 2 for prompt-depth comparisons."
+        )
 
     from datasets import load_from_disk
     ds = load_from_disk(args.dataset_path)

@@ -5,6 +5,7 @@ Post-extraction validation for Knowledge Graphs.
 
 Runs after full KG construction but before subgraph extraction to catch
 Phase I extraction bugs early:
+  ✓ Every edge connects two real nodes (no dangling edges)
   ✓ No orphaned nodes (indicates bad extraction)
   ✓ No self-loops (indicates edge artifact)
   ✓ No cycles in dependency graph (indicates circular imports)
@@ -51,12 +52,39 @@ class KGValidator(ValidationBase):
         self.errors.clear()
         self.warnings.clear()
 
+        self._check_dangling_edges()
         self._check_orphaned_nodes()
         self._check_self_loops()
         self._check_cycles()
         self._check_metadata_consistency()
 
         return self._format_report()
+
+    def _check_dangling_edges(self) -> None:
+        """Flag edges whose source or target is not a node.
+
+        Everything downstream looks nodes up by id, so a dangling edge is
+        skipped or raises a KeyError, and the relation it carried is lost
+        (#225). The report counts them per relation and shows a few examples.
+        """
+        dangling = [e for e in self.edges
+                    if e['source'] not in self.node_ids or e['target'] not in self.node_ids]
+        if not dangling:
+            return
+
+        by_relation: Dict[str, int] = defaultdict(int)
+        for edge in dangling:
+            by_relation[edge['relation']] += 1
+        counts = ', '.join(f"{relation} {count}" for relation, count in sorted(by_relation.items()))
+        examples = [
+            f"{edge['relation']}: {self._node_label(edge['source'])} -> "
+            f"{self._node_label(edge['target'])}"
+            for edge in dangling[:3]
+        ]
+        self.errors.append(
+            f"Dangling edges ({len(dangling)}; {counts}): {'; '.join(examples)}"
+            f"{'...' if len(dangling) > 3 else ''}"
+        )
 
     def _check_orphaned_nodes(self) -> None:
         """Flag nodes with no incoming or outgoing edges (except files/imports).
