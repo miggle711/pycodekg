@@ -197,3 +197,19 @@ def test_sample_split_between_labellers(kg, tmp_path):
     plain = sample.main(["--kg-json", str(p), "--per-cell", "3", "--flagged-per-rule", "0",
                          "--seed", "7", "--out", str(tmp_path / "plain")])
     assert [(i["source"], i["target"]) for i in plain] == [(i["source"], i["target"]) for i in items]
+
+
+def test_prompt_reach_counts_flagged_edges_at_a_target(kg):
+    import kg_edge_audit_prompt_reach as reach
+    k = copy.deepcopy(kg)
+    i = _ids(k)
+    _edge(k, "calls", i["Thing.run"], i["Thing.run"], confidence="name_only")      # flagged self-loop
+    _edge(k, "calls", i["Other.go"], i["Base.run"], confidence="name_only")        # flagged, not at a target
+    insts = [{"id": "x-1", "repo": "fixture__repo", "file": "src/pkg/models.py", "targets": ["Thing.run"]},
+             {"id": "x-2", "repo": "fixture__repo", "file": "src/pkg/models.py", "targets": ["Missing.f"]}]
+    rows, summary = reach.reach_one(k, insts)
+    # Thing.run never calls `run`, so the self-loop breaks call_name too: one edge, two rules
+    assert sorted((r["rule"], r["instance"], r["role"]) for r in rows) == [
+        ("call_name", "x-1", "caller"), ("self_loop", "x-1", "caller")]
+    assert summary["instances_matched"] == 1
+    assert summary["flagged_reaching_edges"] == 1
