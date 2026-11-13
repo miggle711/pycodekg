@@ -82,6 +82,12 @@ print(report)
 
 `llm/llm_serializer.py` turns an extracted subgraph into the JSON that goes into a prompt. It leaves test code out of the callers, callees and related classes, so a prompt for writing tests does not show the model the tests that already exist.
 
+Retrieval defaults to `depth=2`. The serializer shows direct callers/callees and
+relationships through the seed's owning class, at most two graph hops away.
+Higher depths can expand the retrieved subgraph but do not add prompt content.
+Compare depths 1 and 2 for a prompt-depth ablation; `scripts/build_kg_prompts.py`
+logs one warning per invocation when `--depth` exceeds 2.
+
 ## Optional: pyright-backed type inference
 
 The uppercase-heuristic that detects `uses` edges (`x = SomeClass()`) can't see class
