@@ -200,7 +200,11 @@ MAX_FILE_LINES = 20000
 #    parents'; a closure's self.m() uses the method's class. A dotted name
 #    or class that can not be followed and matches definitions in several
 #    files gets no edge. Import statements record `asname`.
-SCHEMA_VERSION = 16
+# 19: an attribute call on a receiver nothing has typed or imported goes to the
+#    method or class of that name when a plain function shares it, as a
+#    name_only edge. It was dropped as ambiguous before (#202). Numbered after
+#    17 (class outlines, #241) and 18 (function signatures, #242).
+SCHEMA_VERSION = 19
 
 
 # A plain dotted name: `utils` or `a.b.c`, with no calls or subscripts.
