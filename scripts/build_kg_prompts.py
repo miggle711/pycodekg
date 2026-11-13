@@ -191,6 +191,10 @@ def main():
     # where extract() itself completed, even if serialization later fails
     # that instance out of `prompts`.
     localization_stats = {}
+    # Instances whose seed-file constants could not be read from the
+    # post-patch file: their prompt has no constants section rather than the
+    # KG's pre-patch values (miggle711/pycodekg#114).
+    constants_unavailable_instances = []
 
     for row in rows:
         repo_slug = _repo_slug(row["repo"])
@@ -220,6 +224,7 @@ def main():
                 "edge_count": context.edge_count,
                 "cross_file_node_proportion": context.cross_file_node_proportion,
                 "relationship_type_counts": context.relationship_type_counts,
+                "constants_unavailable": context.constants_unavailable,
             }
             if context.stale_seed_labels:
                 stale_seed_instances.append((row["id"], context.stale_seed_labels))
@@ -235,8 +240,15 @@ def main():
                                                    or s.get("metadata", {}).get("path")
                                                    for s in context.seeds} - {None})
                                for node in engine.find_file_by_path(path, exact=True)],
+                # The seed file's constants from the post-patch file, as an
+                # overlay: the KG's file node keeps its pre-patch values.
+                "post_patch_constants": context.post_patch_constants,
+                "constants_unavailable": context.constants_unavailable,
             }
             serialized = LLMSerializer(repo=row["repo"]).serialize(context_dict)
+            if serialized.get("context", {}).get("module_constants_unavailable"):
+                constants_unavailable_instances.append(
+                    (row["id"], serialized["context"]["module_constants_unavailable"]))
             if not serialized.get("seed"):
                 failures.append((row["id"], "no seed extracted"))
                 continue
@@ -317,6 +329,13 @@ def main():
         print(f"{len(stale_seed_instances)} instance(s) with a stale (pre-patch) seed:")
         for instance_id, labels in stale_seed_instances:
             print(f"  {instance_id}: {labels}")
+    if constants_unavailable_instances:
+        # The post-patch focal file could not be reconstructed or parsed, so
+        # these prompts show no module constants at all.
+        print(f"{len(constants_unavailable_instances)} instance(s) with no module constants "
+              f"because the post-patch focal file was unavailable:")
+        for instance_id, items in constants_unavailable_instances:
+            print(f"  {instance_id}: " + "; ".join(f"{i['filepath']}: {i['reason']}" for i in items))
     if multi_seed_instances:
         # Real, not rare (6/66 real django instances) -- visible here so
         # a run's actual seed count per instance isn't only discoverable

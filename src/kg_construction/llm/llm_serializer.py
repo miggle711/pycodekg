@@ -123,6 +123,10 @@ class LLMSerializer:
             test_context: Flat subgraph dict with seeds, context_nodes, edges, test_nodes.
                          Optional file_nodes supplies seed-file metadata outside
                          the BFS subgraph (e.g. at depth zero).
+                         Optional post_patch_constants ({path: {NAME: value}})
+                         and constants_unavailable ({path: reason}), from
+                         TestContext, make the seed's own-file constants come
+                         from the post-patch file instead of the file node.
 
         Returns:
             Hierarchical dict with 'seed', 'context', 'instructions' sections.
@@ -144,9 +148,14 @@ class LLMSerializer:
         context_section = self._build_context_section(
             seeds, context_nodes, edges, node_by_id
         )
-        context_section["module_constants"] = self._module_constants(
-            seeds, list(node_by_id.values()) + test_context.get("file_nodes", [])
+        constants, unavailable = self._module_constants(
+            seeds, list(node_by_id.values()) + test_context.get("file_nodes", []),
+            test_context.get("post_patch_constants"),
+            test_context.get("constants_unavailable", {}),
         )
+        context_section["module_constants"] = constants
+        if unavailable:
+            context_section["module_constants_unavailable"] = unavailable
 
         # Build Instructions section with coverage targets and conventions
         instructions_section = self._build_instructions_section(seeds)
@@ -201,21 +210,45 @@ class LLMSerializer:
             "source_code": metadata.get("source_code", ""),
         }
 
-    def _module_constants(self, seeds: List[Dict], nodes: List[Dict]) -> List[Dict]:
+    def _module_constants(self, seeds: List[Dict], nodes: List[Dict],
+                          post_patch: Optional[Dict[str, Dict[str, str]]] = None,
+                          unavailable: Optional[Dict[str, str]] = None):
         """Referenced module globals, limited to each seed's own file.
 
         Symbol tables exclude comments, strings, attribute names and locals
-        shadowing a module constant. File metadata can be supplied separately
-        from BFS context so depth zero still has the seed's module constants.
-        Values are the builder's source expressions, never evaluated here.
+        shadowing a module constant. Values are the builder's source
+        expressions, never evaluated here.
+
+        With post_patch given (TestContext.post_patch_constants), a seed's
+        file constants come from it: the post-patch focal file, so constants
+        the patch adds, changes or removes match the seed's (post-patch)
+        source. A file in `unavailable`, or missing from post_patch, gets no
+        constants and is returned with its reason, never the file node's
+        pre-patch values. Without post_patch (callers that predate it), the
+        file node's metadata is used, supplied separately from BFS context so
+        depth zero still has it.
+
+        Returns (constants section, [{"filepath", "reason"}] for files whose
+        constants could not be taken from the post-patch file).
         """
         files = {n.get("metadata", {}).get("path"): n.get("metadata", {})
                  for n in nodes if n.get("type") in ("file", "test_file")}
+        unavailable = unavailable or {}
+        skipped: Dict[str, str] = {}
         selected: Dict[str, Dict[str, str]] = {}
         for seed in seeds:
             meta = seed.get("metadata", {})
             path = meta.get("filepath") or meta.get("path")
-            constants = files.get(path, {}).get("constants", {})
+            if path in unavailable:
+                skipped[path] = unavailable[path]
+                continue
+            if post_patch is not None:
+                if path not in post_patch:
+                    skipped[path] = "no post-patch constants for this file"
+                    continue
+                constants = post_patch[path]
+            else:
+                constants = files.get(path, {}).get("constants", {})
             if not constants:
                 continue
             try:
@@ -227,9 +260,10 @@ class LLMSerializer:
                 if len(value) > MAX_CONSTANT_VALUE_CHARS:
                     value = value[:MAX_CONSTANT_VALUE_CHARS] + " ... # value truncated"
                 selected.setdefault(path, {})[name] = f"{name} = {value}"
-        return [{"module": _filepath_to_module(path), "filepath": path,
-                 "source_code": "\n".join(lines[name] for name in sorted(lines))}
-                for path, lines in sorted(selected.items())]
+        section = [{"module": _filepath_to_module(path), "filepath": path,
+                    "source_code": "\n".join(lines[name] for name in sorted(lines))}
+                   for path, lines in sorted(selected.items())]
+        return section, [{"filepath": p, "reason": r} for p, r in sorted(skipped.items())]
 
     def _build_context_section(
         self,

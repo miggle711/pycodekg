@@ -81,3 +81,14 @@ def test_no_kg_growth_uses_the_same_truncation_and_renderer():
 
 def test_nearest_rank_p90_and_median():
     assert distribution(list(range(1, 11))) == {"n": 10, "median": 5.5, "p90": 9, "max": 10}
+
+
+def test_post_patch_rendering_has_no_stale_or_missing_lines_even_when_the_base_differs():
+    before = "CHANGE = 10\nREMOVE = 3\ndef f():\n    return CHANGE + REMOVE\n"
+    after = "CHANGE = 20\nADD = 2\ndef f():\n    return CHANGE + REMOVE + ADD\n"
+    result = analyze_row(_row(before, after), lambda *_: [(3, 4)])
+    # The base-versus-post comparison still records what a KG-only lookup shows.
+    assert {c["kind"] for c in result["stale_constants"]} == {"added", "changed", "removed"}
+    # The prompt as built now shows exactly the post-patch assignments.
+    assert result["post_patch_rendering"] == {
+        "unavailable": None, "has_section": True, "stale_or_wrong": [], "missing": []}

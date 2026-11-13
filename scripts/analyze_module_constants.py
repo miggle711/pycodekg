@@ -14,7 +14,12 @@ Usage:
 Target ranges come from the supplied testgeneval checkout's actual
 swebench_docker/target_range.py; its hash is recorded in the output. The
 serializer's symtable helper and context renderer are reused directly.
-This script only measures stale expressions; it does not fix the serializer.
+The stale-value counts compare base (pre-patch) constants with post-patch
+ones: they describe what a KG-only lookup would show, and stay as measured.
+Separately, `post_patch_rendering` renders each instance the way prompts are
+now built (TestContext.post_patch_constants overlaying the KG's pre-patch file
+node) and checks every rendered `NAME = value` line against the post-patch
+file: any stale, missing or extra assignment there is counted.
 """
 
 import argparse
@@ -32,6 +37,7 @@ import sys
 import tempfile
 
 from kg_construction.ast.helpers import _collect_file_level_info
+from kg_construction.extraction.context import post_patch_file_constants
 from kg_construction.extraction.patch import (
     _iter_patch_lines, is_newly_created_file, reconstruct_post_patch_source,
 )
@@ -132,6 +138,32 @@ def analyze_row(row, resolve_targets):
         seeds.append({"id": str(i), "label": f"target_{i}", "type": "function",
                       "metadata": {"filepath": path, "source_code": source}})
 
+    def rendered_lines(serialized):
+        section = serialized["context"]["module_constants"]
+        return [line for item in section for line in item["source_code"].split("\n")]
+
+    def expected_line(name, value):
+        if len(value) > MAX_CONSTANT_VALUE_CHARS:
+            value = value[:MAX_CONSTANT_VALUE_CHARS] + " ... # value truncated"
+        return f"{name} = {value}"
+
+    # The prompt as now built: the post-patch overlay, with the pre-patch
+    # file node also present, so a fallback to it would show up as stale.
+    overlay, overlay_error = post_patch_file_constants(post)
+    rendered = LLMSerializer().serialize({
+        "seeds": seeds, "file_nodes": [{"id": "file", "type": "file",
+                                        "metadata": {"path": path, "constants": old}}],
+        "post_patch_constants": {path: overlay} if overlay is not None else {},
+        "constants_unavailable": {path: overlay_error} if overlay_error else {}})
+    shown = rendered_lines(rendered)
+    want = [expected_line(n, new[n]) for n in sorted(references & new.keys())]
+    post_patch_rendering = {
+        "unavailable": overlay_error,
+        "has_section": bool(shown),
+        "stale_or_wrong": sorted(set(shown) - set(want)),
+        "missing": sorted(set(want) - set(shown)),
+    }
+
     def rendered_growth(values):
         context = {"seeds": seeds, "file_nodes": [{"id": "file", "type": "file",
                    "metadata": {"path": path, "constants": values}}]}
@@ -154,7 +186,8 @@ def analyze_row(row, resolve_targets):
             "truncated_values": [n for n in referenced_new if len(new[n]) > MAX_CONSTANT_VALUE_CHARS],
             "base_kg_truncated_values": [n for n in sorted(references & old.keys())
                                          if len(old[n]) > MAX_CONSTANT_VALUE_CHARS],
-            "stale_constants": changes}
+            "stale_constants": changes,
+            "post_patch_rendering": post_patch_rendering}
 
 
 def distribution(values):
@@ -221,6 +254,12 @@ def main():
               "instances_with_truncation": sum(bool(r["truncated_values"]) for r in rows),
               "base_kg_truncated_value_occurrences": sum(len(r["base_kg_truncated_values"]) for r in rows),
               "stale_instances": sum(bool(r["stale_constants"]) for r in rows),
+              "post_patch_rendering": {
+                  "instances_with_section": sum(r["post_patch_rendering"]["has_section"] for r in rows),
+                  "unavailable": sum(bool(r["post_patch_rendering"]["unavailable"]) for r in rows),
+                  "instances_with_stale_or_wrong_lines": sum(bool(r["post_patch_rendering"]["stale_or_wrong"]) for r in rows),
+                  "instances_with_missing_lines": sum(bool(r["post_patch_rendering"]["missing"]) for r in rows),
+              },
               "stale_value_occurrences": dict(Counter(c["kind"] for r in rows for c in r["stale_constants"])),
               "failures": failures, "rows": rows}
     args.output.write_text(json.dumps(result, indent=2) + "\n")
