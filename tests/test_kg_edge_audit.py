@@ -154,3 +154,24 @@ def test_overrides_non_ancestor(kg):
 ])
 def test_resolve_relative(dotted, from_path, expected):
     assert audit._resolve_relative(dotted, from_path) == expected
+
+
+def test_sample_is_seeded_and_blind(kg, tmp_path):
+    import json as _json
+    import kg_edge_audit_sample as sample
+    p = tmp_path / "fixture__repo.json"
+    p.write_text(_json.dumps(kg))
+    outs = []
+    for run in ("a", "b"):
+        stem = str(tmp_path / run)
+        sample.main(["--kg-json", str(p), "--per-cell", "2", "--flagged-per-rule", "2",
+                     "--seed", "7", "--out", stem])
+        outs.append((Path(stem + ".md").read_text(), Path(stem + ".key.csv").read_text()))
+    assert outs[0] == outs[1]
+    sheet, key = outs[0]
+    assert "## 1." in sheet and "**To**" in sheet
+    # the labelling sheet does not lead the label
+    for word in ("name_only", "qualified", "exact", "flagged", "random"):
+        assert word not in sheet
+    assert key.splitlines()[0].startswith("item,repo,relation,confidence")
+    assert Path(str(tmp_path / "a") + ".csv").read_text().splitlines()[0] == "item,repo,label,reason"

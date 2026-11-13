@@ -14,6 +14,7 @@ scripts/*
 !scripts/rq1_recheck_labels.py
 !scripts/check_function_signatures.py
 !scripts/kg_edge_audit.py
+!scripts/kg_edge_audit_sample.py
 
 # kg_output
 kg_output/

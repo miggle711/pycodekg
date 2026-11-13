@@ -239,7 +239,15 @@ class ModuleMap:
         return "attribute_path" if len(names) > 1 else "elsewhere"
 
 
-def audit(kg):
+def _flag(flagged, rule, e):
+    if flagged is not None:
+        flagged.setdefault(rule, []).append((e["relation"], e["source"], e["target"]))
+
+
+def audit(kg, flagged=None):
+    """Returns (found, counted, notes). If `flagged` is a dict, it is also
+    filled with rule -> [(relation, source id, target id)] for the edge
+    checks, so a sampler can find the flagged edges themselves."""
     nodes, edges = kg["nodes"], kg["edges"]
     by_id = {}
     found = {k: [] for k in HARD + CHECKS}
@@ -354,6 +362,7 @@ def audit(kg):
                 ok = True
                 notes["call_name: dunder with operator syntax or super()"] += 1
             if not ok:
+                _flag(flagged, "call_name", e)
                 found["call_name"].append((tname, label(e["source"]), label(e["target"]), meta.get("confidence")))
 
             q = meta.get("import_resolved")
@@ -365,6 +374,7 @@ def audit(kg):
                 elif where == "attribute_path":
                     notes["qualified_module: not checkable, the path continues through an attribute"] += 1
                 elif where != "direct":
+                    _flag(flagged, "qualified_module", e)
                     found["qualified_module"].append((where, q, label(e["source"]), label(e["target"])))
 
             if e["source"] == e["target"]:
@@ -372,6 +382,7 @@ def audit(kg):
                 own = by_id[method_class[e["source"]]]["label"] if e["source"] in method_class else None
                 recv = cs.names.get(tname, set()) | ({""} if tname in cs.decorator_names else set())
                 if not recv & {"", "self", "cls", "Call", own}:
+                    _flag(flagged, "self_loop", e)
                     found["self_loop"].append((tname, sorted(recv), label(e["source"])))
 
             cls = method_class.get(e["source"])
@@ -381,6 +392,7 @@ def audit(kg):
                 tcls = method_class.get(e["target"])
                 family = {cls} | closure(cls, bases) | closure(cls, subs)
                 if tcls not in family:
+                    _flag(flagged, "self_call_class", e)
                     found["self_call_class"].append((tname, label(e["source"]), label(e["target"])))
                 elif tcls in closure(cls, subs):
                     notes["self_call_class: lands on a subclass override"] += 1
@@ -389,6 +401,7 @@ def audit(kg):
             counted["accesses_property"] += 1
             decs = (t.get("metadata") or {}).get("decorators") or []
             if not any(str(d).split(".")[-1].split("(")[0] in PROPERTY_DECORATORS for d in decs):
+                _flag(flagged, "accesses_property", e)
                 found["accesses_property"].append((tname, decs, label(e["source"]), label(e["target"])))
 
         elif rel == "inherits":
@@ -401,12 +414,14 @@ def audit(kg):
                 if al & names:
                     local.add(orig)
             if tname not in local:
+                _flag(flagged, "inherits_base", e)
                 found["inherits_base"].append((tname, sb, label(e["source"]), label(e["target"])))
 
         elif rel == "overrides":
             counted["overrides_parent"] += 1
             sc, tc = method_class.get(e["source"]), method_class.get(e["target"])
             if s["label"] != tname or tc is None or sc is None or tc not in closure(sc, bases):
+                _flag(flagged, "overrides_parent", e)
                 found["overrides_parent"].append((label(e["source"]), label(e["target"])))
 
     return found, counted, notes
