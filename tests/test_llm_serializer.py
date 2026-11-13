@@ -282,7 +282,8 @@ class TestSerializeContextSection:
         }
         used_node = {
             "id": "used", "label": "HTTPAdapter", "type": "class",
-            "metadata": {"filepath": "requests/adapters.py"},
+            "metadata": {"filepath": "requests/adapters.py",
+                         "source_code": "class HTTPAdapter:\n    def send(self): ..."},
         }
         instance = {
             "seeds": [seed_node],
@@ -300,6 +301,7 @@ class TestSerializeContextSection:
         assert related[0]["type"] == "instantiation"
         assert related[0]["module"] == "requests.adapters"
         assert related[0]["source"] == "seed"
+        assert related[0]["source_code"].startswith("class HTTPAdapter:")  # #142
 
     def test_ambiguous_uses_edge_is_excluded(self):
         # An instantiated-class candidate name that collides with another

@@ -52,13 +52,21 @@ class TestRelatedSection:
         assert "Base (m), parent class of the seed" in result
         assert "class Base: ..." in result
 
-    def test_instantiation_has_no_source_code_block(self):
+    def test_instantiation_includes_its_outline(self):
         related = [{
             "type": "instantiation", "name": "Helper", "module": "m",
-            "source": "seed_class",
+            "source_code": "class Helper:\n    def __init__(self, x): ...", "source": "seed_class",
         }]
         result = _related_section(related)
-        assert "Helper (m), instantiated by the seed's class" in result
+        assert "Helper (m), instantiated by the seed's class:\n```python\nclass Helper:" in result
+
+    def test_class_without_source_has_no_empty_code_block(self):
+        related = [{
+            "type": "parent_class", "name": "Base", "module": "m",
+            "source_code": "", "source": "seed",
+        }]
+        result = _related_section(related)
+        assert "Base (m), parent class of the seed" in result
         assert "```python" not in result
 
     def test_source_seed_vs_seed_class_is_distinguished(self):
