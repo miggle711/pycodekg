@@ -26,9 +26,11 @@ based on the right-hand side.
 """
 
 import json
+import queue
 import shutil
 import subprocess
 import threading
+import time
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -37,6 +39,12 @@ from typing import Dict, List, Optional, Tuple
 STARTUP_TIMEOUT = 30
 # Wall-clock budget per hover request.
 HOVER_TIMEOUT = 10
+# A hover that times out is skipped (pyright may still be analysing the
+# project when the first ones arrive), but after this many in a row the
+# server is treated as hung: the run stops and keeps what it has.
+MAX_CONSECUTIVE_HOVER_TIMEOUTS = 3
+# Wall-clock budget for the shutdown request at the end of a run.
+SHUTDOWN_TIMEOUT = 5
 
 
 class PyrightUnavailableError(Exception):
@@ -48,13 +56,36 @@ def is_available() -> bool:
     return shutil.which("pyright-langserver") is not None
 
 
+class _RequestTimeout(Exception):
+    """A request got no response within its deadline."""
+
+
 class _LSPClient:
-    """Minimal JSON-RPC-over-stdio client for a single pyright-langserver session."""
+    """Minimal JSON-RPC-over-stdio client for a single pyright-langserver session.
+
+    A background thread reads messages off the server's stdout into a queue,
+    so request() can wait on the queue with a deadline. Reading the pipe
+    directly would block forever on a server that hangs.
+    """
 
     def __init__(self, proc: subprocess.Popen):
         self._proc = proc
         self._next_id = 1
         self._lock = threading.Lock()
+        self._messages: "queue.Queue[Optional[Dict]]" = queue.Queue()
+        threading.Thread(target=self._pump, daemon=True).start()
+
+    def _pump(self) -> None:
+        """Move messages from the server's stdout onto the queue until it
+        closes. A None on the queue means the server is gone."""
+        while True:
+            try:
+                message = self._read_message()
+            except Exception:
+                message = None
+            self._messages.put(message)
+            if message is None:
+                return
 
     def _send(self, message: Dict) -> None:
         body = json.dumps(message).encode("utf-8")
@@ -84,23 +115,42 @@ class _LSPClient:
     def notify(self, method: str, params: Dict) -> None:
         self._send({"jsonrpc": "2.0", "method": method, "params": params})
 
-    def request(self, method: str, params: Dict) -> Optional[Dict]:
-        """Send a request and read messages until the matching response arrives.
+    def request(self, method: str, params: Dict, timeout: float) -> Optional[Dict]:
+        """Send a request and wait up to `timeout` seconds for its response.
 
-        Diagnostics and other server-initiated notifications may interleave
-        before the response; those are silently skipped.
+        Diagnostics and other notifications may interleave before the
+        response and are skipped, however many there are. A message that
+        carries a `method` came from the server (a notification, or a
+        request of its own that happens to reuse our id); it is never our
+        response. Server requests are answered with an empty result so the
+        server is not left waiting on us.
+
+        Returns None if the server has exited. Raises _RequestTimeout if no
+        response arrives in time (a late response is ignored by later
+        requests, which match on their own id).
         """
         with self._lock:
             request_id = self._next_id
             self._next_id += 1
             self._send({"jsonrpc": "2.0", "id": request_id, "method": method, "params": params})
-            for _ in range(50):
-                message = self._read_message()
+            deadline = time.monotonic() + timeout
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise _RequestTimeout(f"{method} timed out after {timeout}s")
+                try:
+                    message = self._messages.get(timeout=remaining)
+                except queue.Empty:
+                    raise _RequestTimeout(f"{method} timed out after {timeout}s") from None
                 if message is None:
+                    self._messages.put(None)  # keep later requests from waiting
                     return None
+                if "method" in message:
+                    if "id" in message:
+                        self._send({"jsonrpc": "2.0", "id": message["id"], "result": None})
+                    continue
                 if message.get("id") == request_id:
                     return message
-            return None
 
 
 def resolve_types(
@@ -138,6 +188,7 @@ def _resolve_types_inner(
     sites_by_file: Dict[str, List[Tuple[int, int]]],
 ) -> Dict[Tuple[str, int, int], str]:
     resolved: Dict[Tuple[str, int, int], str] = {}
+    clean_exit = False
 
     proc = subprocess.Popen(
         ["pyright-langserver", "--stdio"],
@@ -164,8 +215,9 @@ def _resolve_types_inner(
                 "textDocument": {"hover": {"contentFormat": ["plaintext"]}},
                 "workspace": {"workspaceFolders": True},
             },
-        })
+        }, timeout=STARTUP_TIMEOUT)
         client.notify("initialized", {})
+        consecutive_timeouts = 0
 
         for rel_path, sites in sites_by_file.items():
             abs_path = repo_dir / rel_path
@@ -182,19 +234,36 @@ def _resolve_types_inner(
             })
 
             for line, col in sites:
-                response = client.request("textDocument/hover", {
-                    "textDocument": {"uri": uri},
-                    "position": {"line": line, "character": col},
-                })
+                try:
+                    response = client.request("textDocument/hover", {
+                        "textDocument": {"uri": uri},
+                        "position": {"line": line, "character": col},
+                    }, timeout=HOVER_TIMEOUT)
+                except _RequestTimeout:
+                    consecutive_timeouts += 1
+                    if consecutive_timeouts >= MAX_CONSECUTIVE_HOVER_TIMEOUTS:
+                        # The server looks hung. Keep what was resolved;
+                        # the finally block kills the process.
+                        return resolved
+                    continue
+                consecutive_timeouts = 0
                 type_name = _parse_hover_type(response)
                 if type_name:
                     resolved[(rel_path, line, col)] = type_name
 
             client.notify("textDocument/didClose", {"textDocument": {"uri": uri}})
 
-        client.request("shutdown", {})
-        client.notify("exit", {})
+        try:
+            client.request("shutdown", {}, timeout=SHUTDOWN_TIMEOUT)
+            client.notify("exit", {})
+            clean_exit = True
+        except (_RequestTimeout, OSError):
+            pass
     finally:
+        # Anything other than a clean shutdown (a timeout, an exception, an
+        # early return) can leave a hung server behind; do not wait on it.
+        if not clean_exit:
+            proc.kill()
         try:
             proc.wait(timeout=5)
         except subprocess.TimeoutExpired:
