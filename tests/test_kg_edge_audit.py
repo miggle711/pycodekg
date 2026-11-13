@@ -174,4 +174,26 @@ def test_sample_is_seeded_and_blind(kg, tmp_path):
     for word in ("name_only", "qualified", "exact", "flagged", "random"):
         assert word not in sheet
     assert key.splitlines()[0].startswith("item,repo,relation,confidence")
-    assert Path(str(tmp_path / "a") + ".csv").read_text().splitlines()[0] == "item,repo,label,reason"
+    assert Path(str(tmp_path / "a") + ".csv").read_text().splitlines()[0] == "item,repo,relation,label,reason"
+
+
+def test_sample_split_between_labellers(kg, tmp_path):
+    import csv as _csv
+    import json as _json
+    import kg_edge_audit_sample as sample
+    p = tmp_path / "fixture__repo.json"
+    p.write_text(_json.dumps(kg))
+    stem = str(tmp_path / "s")
+    items = sample.main(["--kg-json", str(p), "--per-cell", "3", "--flagged-per-rule", "0",
+                         "--seed", "7", "--labellers", "Joe", "Mun", "--shared", "2", "--out", stem])
+    sheets = {n: {r["item"] for r in _csv.DictReader(open(f"{stem}.{n}.csv"))} for n in ("Joe", "Mun")}
+    shared = sheets["Joe"] & sheets["Mun"]
+    assert len(shared) == 2
+    assert sheets["Joe"] | sheets["Mun"] == {str(it["item"]) for it in items}
+    assert abs(len(sheets["Joe"]) - len(sheets["Mun"])) <= 1
+    key = {r["item"]: r["labeller"] for r in _csv.DictReader(open(stem + ".key.csv"))}
+    assert {i for i, w in key.items() if w == "all"} == shared
+    # the split does not change which edges are drawn
+    plain = sample.main(["--kg-json", str(p), "--per-cell", "3", "--flagged-per-rule", "0",
+                         "--seed", "7", "--out", str(tmp_path / "plain")])
+    assert [(i["source"], i["target"]) for i in plain] == [(i["source"], i["target"]) for i in items]

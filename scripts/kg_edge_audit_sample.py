@@ -18,12 +18,17 @@ are in the key file, joined back by item number after labelling.
         --kg-json kgs/psf__requests.json kgs/django__django.json \\
         --per-cell 10 --flagged-per-rule 10 --seed 20261114 --out edge_sample
 
-writes edge_sample.md (one section per item: the call site lines with their
-line numbers, the caller's import of the name, the target's definition, and
-other definitions with the same name), edge_sample.csv (item, repo, blank
-`label` and `reason`) and edge_sample.key.csv (item, stratum, relation,
-confidence, rules, ids, cell size). Labels: `correct` (at runtime this site
-can call this target), `wrong`, or `unclear` with a reason.
+writes edge_sample.md (the rubric, then one section per item: the call site
+lines with their line numbers, the caller's import of the name, the target's
+definition, and other definitions with the same name), edge_sample.csv (item,
+repo, relation, blank `label` and `reason`) and edge_sample.key.csv (item,
+stratum, relation, confidence, rules, labeller, ids, cell size).
+
+With --labellers A B --shared K, each labeller gets their own sheet
+(<stem>.A.md/.csv): their share of the items plus K items every labeller
+labels blind, for agreement before adjudication. The split uses its own seed
+derived from --seed, so it does not change which edges are drawn.
+--per-cell 0 draws the flagged strata only.
 
 The KGs come from kg_edge_audit.py --save-dir, so the sample and the audit
 table describe the same build. Same KGs, same seed and same arguments give
@@ -162,28 +167,49 @@ def draw(repos, relations, per_cell, flagged_per_rule, seed):
     return [dict(items[k], item=i) for i, k in enumerate(order, 1)]
 
 
-def write(repos, items, out):
+RUBRIC = """\
+Rubric (frozen before labelling; change it only by a team decision, and never mid-sheet):
+
+- `calls` edge: `correct` if the call site shown can reach this target under a feasible
+  execution consistent with the program (types, imports, class hierarchy). A matching name is
+  not enough. `wrong` if it cannot; say what it does reach if you can tell (another definition,
+  a library, a builtin). `unclear` if you cannot decide after reading the code; say why.
+- `accesses` edge: `correct` if the attribute read shown can resolve to this property under a
+  feasible execution; `wrong` and `unclear` as above.
+- `unclear` labels are reported as their own count and left out of the defect counts; they are
+  not counted as correct or as wrong.
+
+Read the repository's code when the excerpt is not enough. Label alone: do not discuss items,
+and do not open anyone else's sheet or the key file, until every item is labelled.
+"""
+
+
+def assign(items, labellers, shared, seed):
+    """Split items between labellers, with `shared` items labelled by all of
+    them, chosen with a seed of its own so the split does not move the draw."""
+    if not labellers:
+        for it in items:
+            it["labeller"] = ""
+        return
+    order = sorted(it["item"] for it in items)
+    random.Random(f"{seed}/labellers").shuffle(order)
+    both = set(order[:shared])
+    rest = order[shared:]
+    who = {n: labellers[i % len(labellers)] for i, n in enumerate(rest)}
+    for it in items:
+        it["labeller"] = "all" if it["item"] in both else who[it["item"]]
+
+
+def _sheet(repos, items, out, title):
     by_name = {r.name: r for r in repos}
     with open(out + ".csv", "w", newline="") as f:
         w = csv.writer(f)
-        w.writerow(["item", "repo", "label", "reason"])
+        w.writerow(["item", "repo", "relation", "label", "reason"])
         for it in items:
-            w.writerow([it["item"], it["repo"], "", ""])
-    with open(out + ".key.csv", "w", newline="") as f:
-        w = csv.writer(f)
-        w.writerow(["item", "repo", "relation", "confidence", "strata", "cells", "cell_sizes",
-                    "rules", "source_id", "target_id"])
-        for it in items:
-            st = sorted(it["cells"])
-            w.writerow([it["item"], it["repo"], it["relation"], it["confidence"], ";".join(st),
-                        ";".join(it["cells"][s][0] for s in st), ";".join(str(it["cells"][s][1]) for s in st),
-                        ";".join(it["rules"]), it["source"], it["target"]])
+            w.writerow([it["item"], it["repo"], it["relation"], "", ""])
     with open(out + ".md", "w") as f:
-        f.write("# KG edge sample: labelling sheet\n\n"
-                "For each item: at runtime, can this call site reach this target? Label it in the CSV "
-                "as `correct`, `wrong` or `unclear`, with a short reason (for `wrong`, what the site "
-                "really calls if you can tell). Read the repository's code when the excerpt is not "
-                "enough. Do not open the key file until every item is labelled.\n\n")
+        f.write(f"# {title}\n\n{len(items)} items. For each: can this site reach this target? "
+                "Put the label and a short reason in the CSV, by item number.\n\n" + RUBRIC + "\n")
         for it in items:
             ev = by_name[it["repo"]].evidence(it["relation"], it["source"], it["target"])
             f.write(f"## {it['item']}. {it['repo']}: {it['relation']}\n\n"
@@ -203,19 +229,47 @@ def write(repos, items, out):
                         + (f"- and {more} more\n" if more else "") + "\n")
 
 
+def write(repos, items, out, labellers=()):
+    """The key file, and one sheet per labeller (their own items and the
+    shared ones), or a single sheet when no labellers are named."""
+    with open(out + ".key.csv", "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["item", "repo", "relation", "confidence", "strata", "cells", "cell_sizes",
+                    "rules", "labeller", "source_id", "target_id"])
+        for it in items:
+            st = sorted(it["cells"])
+            w.writerow([it["item"], it["repo"], it["relation"], it["confidence"], ";".join(st),
+                        ";".join(it["cells"][s][0] for s in st), ";".join(str(it["cells"][s][1]) for s in st),
+                        ";".join(it["rules"]), it.get("labeller", ""), it["source"], it["target"]])
+    if not labellers:
+        _sheet(repos, items, out, "KG edge sample: labelling sheet")
+        return [out]
+    stems = []
+    for name in labellers:
+        mine = [it for it in items if it["labeller"] in (name, "all")]
+        _sheet(repos, mine, f"{out}.{name}", f"KG edge sample: {name}'s labelling sheet")
+        stems.append(f"{out}.{name}")
+    return stems
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--kg-json", nargs="+", required=True, help="KGs saved by kg_edge_audit.py --save-dir")
     ap.add_argument("--relations", nargs="+", default=["calls", "accesses"])
-    ap.add_argument("--per-cell", type=int, default=10)
+    ap.add_argument("--per-cell", type=int, default=10, help="0 for the flagged strata only")
     ap.add_argument("--flagged-per-rule", type=int, default=10)
     ap.add_argument("--seed", type=int, default=20261114)
-    ap.add_argument("--out", required=True, help="output stem: <stem>.md, <stem>.csv, <stem>.key.csv")
+    ap.add_argument("--labellers", nargs="*", default=[], help="one sheet per name")
+    ap.add_argument("--shared", type=int, default=0, help="items every labeller labels, for agreement")
+    ap.add_argument("--out", required=True, help="output stem")
     args = ap.parse_args(argv)
     repos = [Repo(Path(p).stem, json.load(open(p))) for p in args.kg_json]
     items = draw(repos, set(args.relations), args.per_cell, args.flagged_per_rule, args.seed)
-    write(repos, items, args.out)
-    print(f"{len(items)} items -> {args.out}.md, {args.out}.csv, {args.out}.key.csv")
+    assign(items, args.labellers, args.shared, args.seed)
+    stems = write(repos, items, args.out, args.labellers)
+    print(f"{len(items)} items -> {args.out}.key.csv and sheets " + ", ".join(f"{s}.md/.csv" for s in stems))
+    for name in args.labellers:
+        print(f"  {name}: {sum(it['labeller'] in (name, 'all') for it in items)} items")
     return items
 
 
