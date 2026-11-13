@@ -279,6 +279,9 @@ class LLMSerializer:
             # this filter). Test classes are skipped like test callers: a name
             # match can link a production class to one in a test file, which
             # would name that file in the prompt (testgeneval#87).
+            # A class's source_code is its outline (signatures, attributes and
+            # __init__; kg.builder's _get_class_outline, #142), for parent
+            # classes, instantiated classes and class callees alike.
             elif (
                 relation == "inherits"
                 and (src_id in seed_ids or src_id in seed_class_ids)
@@ -310,6 +313,7 @@ class LLMSerializer:
                         "type": "instantiation",
                         "name": tgt_node.get("label", ""),
                         "module": _filepath_to_module(tgt_node.get("metadata", {}).get("filepath", "")),
+                        "source_code": tgt_node.get("metadata", {}).get("source_code", ""),
                         "source": "seed" if src_id in seed_ids else "seed_class",
                     }
                 )

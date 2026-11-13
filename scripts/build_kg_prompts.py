@@ -36,6 +36,7 @@ Usage:
 
 import argparse
 import json
+import logging
 import sys
 from pathlib import Path
 
@@ -92,9 +93,9 @@ def _snippet_section(title: str, items: list) -> str:
 
 
 def _related_section(items: list) -> str:
-    # related has two entry shapes (parent_class has source_code,
-    # instantiation doesn't), so it needs its own renderer instead of
-    # _snippet_section's single generic shape.
+    # A related class is named with how the seed relates to it, then its
+    # outline (#142). No code block when there is no source (a KG built
+    # before schema 17), rather than an empty one.
     if not items:
         return ""
     parts = ["Related classes:"]
@@ -103,12 +104,11 @@ def _related_section(items: list) -> str:
         module = item.get("module", "")
         via = "the seed" if item.get("source") == "seed" else "the seed's class"
         if item.get("type") == "parent_class":
-            parts.append(
-                f"- {name} ({module}), parent class of {via}:\n"
-                f"```python\n{item.get('source_code', '')}\n```"
-            )
+            line = f"- {name} ({module}), parent class of {via}"
         else:
-            parts.append(f"- {name} ({module}), instantiated by {via}")
+            line = f"- {name} ({module}), instantiated by {via}"
+        code = item.get("source_code", "")
+        parts.append(f"{line}:\n```python\n{code}\n```" if code else line)
     return "\n".join(parts) + "\n"
 
 
@@ -165,8 +165,15 @@ def main():
     parser.add_argument("--dataset-path", type=str, required=True,
                          help="Local disk path to a saved dataset (load_from_disk).")
     parser.add_argument("--output", type=str, default="kg_prompts.json")
-    parser.add_argument("--depth", type=int, default=2)
+    parser.add_argument("--depth", type=int, default=2,
+                        help="BFS retrieval depth (default 2). Values above 2 expand "
+                             "the subgraph but do not add prompt content with the current serializer.")
     args = parser.parse_args()
+    if args.depth > 2:
+        logging.getLogger(__name__).warning(
+            "BFS depth above 2 expands the retrieved subgraph but does not add prompt content "
+            "with the current serializer. Use depths 1 and 2 for prompt-depth comparisons."
+        )
 
     from datasets import load_from_disk
     ds = load_from_disk(args.dataset_path)

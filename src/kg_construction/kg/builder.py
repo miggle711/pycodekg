@@ -59,6 +59,7 @@ from kg_construction.ast.helpers import (
     _extract_property_accesses,
     _extract_operator_dispatches,
     _collect_local_types,
+    _get_class_outline,
     _get_docstring,
     _get_decorators,
     _get_bare_decorator_names,
@@ -200,6 +201,12 @@ MAX_FILE_LINES = 20000
 #    parents'; a closure's self.m() uses the method's class. A dotted name
 #    or class that can not be followed and matches definitions in several
 #    files gets no edge. Import statements record `asname`.
+# 17: class nodes get 'signature' (the class line) and 'source_code', an
+#    outline of the class: method bodies left out except __init__,
+#    __new__ and __post_init__, capped at 200 lines (#142).
+# 18: function signatures preserve their own decorators and complete inline
+#    suites, and exclude decorators belonging to a nested first statement.
+#    Function source_code is unchanged.
 # 19: an attribute call on a receiver nothing has typed or imported goes to the
 #    method or class of that name when a plain function shares it, as a
 #    name_only edge. It was dropped as ambiguous before (#202). Numbered after
@@ -985,6 +992,7 @@ def _parse_file(args: Tuple[str, str, str]) -> Optional[Dict]:
         """
         bases = _get_base_names(class_node)
         class_id = _make_id(f"class_{repo}_{rel_path}_{qualname}")
+        class_signature, class_outline = _get_class_outline(class_node, source_lines)
         nodes.append(asdict(KGNode(
             id=class_id, type='class', label=class_node.name,
             metadata={
@@ -994,6 +1002,8 @@ def _parse_file(args: Tuple[str, str, str]) -> Optional[Dict]:
                 'decorators': _get_decorators(class_node),
                 'docstring': _get_docstring(class_node),
                 'attributes': _get_class_attributes(class_node),
+                'signature': class_signature,
+                'source_code': class_outline,
             }
         )))
         edges.append(asdict(KGEdge(source=container_id, target=class_id, relation='contains')))
