@@ -1,7 +1,7 @@
 """
 build_kg_prompts.py
 
-Pre-computes KG-only test-generation prompts for a set of TestGenEval
+Pre-computes KG context blocks for a set of TestGenEval
 instances, targeting TestGenEval's `full` setting (generate a complete
 test file from scratch, no existing test content shown to either arm).
 
@@ -13,19 +13,23 @@ class), callers/callees/siblings, and related classes it inherits from
 or instantiates.
 
 Also writes each seed's function name (and enclosing class, if any) as a
-separate field per instance, meant to be merged into the `instruct` arm's
-dataset construction on the testgeneval side so both arms can be told to
-focus on the same changed function(s) -- without which the two arms
-answer different tasks (kg_only implicitly focuses on the seed(s);
-instruct's generic `full`-setting prompt does not name any function at
-all). See miggle711/pycodekg#125 and miggle711/testgeneval#6.
+separate field per instance. Testgeneval reads these same targets for both
+arms and adds the shared task text after each arm's context. The context
+here supplies code and structural information; testgeneval owns the system
+message, testing instructions and output-format requirements.
 
 Run from repo-kg-construction's own environment (not testgeneval's --
 pycodekg isn't installed there by design, to keep the two projects'
 dependency stacks decoupled). Writes one JSON file mapping instance id ->
-{prompt, target_functions, target_classes} (both lists, one entry per
+{context, target_functions, target_classes} (both lists, one entry per
 seed), meant to be merged into the dataset on the testgeneval side before
 running inference.
+
+`context` is only the KG-derived context block. The task wording (what to
+test, coverage, error cases, output format) and the system message are
+added on the testgeneval side, from the one template both arms share
+(testgeneval's inference/configs/shared_task.py), so the two arms can not
+drift apart in their instructions (fyp-paper#5, decision B).
 
 Usage:
     python scripts/build_kg_prompts.py \
@@ -44,14 +48,6 @@ from kg_construction.kg.query import KGQueryEngine
 from kg_construction.extraction.context import TestContextExtractor
 from kg_construction.llm.llm_serializer import LLMSerializer
 
-SYSTEM_MESSAGE = (
-    "You are an expert Python software testing assistant. Your job is to "
-    "generate a complete test file for the given code, using structural "
-    "context about the function under test (no full source file is "
-    "provided -- work from the function's own source and its "
-    "callers/callees/related tests)."
-)
-
 SEED_BLOCK_TEMPLATE = """Function under test: {function_name}
 Module: {module}
 Class: {class_name}
@@ -63,22 +59,6 @@ Source:
 ```
 
 Declared exceptions: {exceptions}
-"""
-
-PROMPT_TEMPLATE = """{seed_blocks}
-{sections}
-Your job is to output a corresponding unit test file for {function_or_functions} that obtains
-high coverage, including error cases and boundary conditions.
-
-Each unit test must be a function starting with test_. Include all your test imports and setup
-before your first test. Do not run the tests in the file, just output a series of tests. Do not
-include a main method to run the tests.
-
-Only output the unit test Python file in this format:
-
-```python
-Unit test Python code (file level)
-```
 """
 
 
@@ -123,7 +103,10 @@ def _build_seed_block(seed: dict) -> str:
     )
 
 
-def _build_prompt(serialized: dict) -> str:
+def _build_context(serialized: dict) -> str:
+    """The KG context block: one block per seed, then callers, callees,
+    sibling methods and related classes. No task wording: testgeneval adds
+    the instructions both arms share."""
     # serialized["seed"] is a list -- a patch can change more than one
     # function/class in the same file (6/66 real django instances do),
     # so every seed gets its own block, not just the first.
@@ -139,11 +122,7 @@ def _build_prompt(serialized: dict) -> str:
         _related_section(context.get("related", [])),
     ]))
 
-    return PROMPT_TEMPLATE.format(
-        seed_blocks=seed_blocks,
-        sections=sections,
-        function_or_functions="this function" if len(seeds) == 1 else "these functions",
-    )
+    return f"{seed_blocks}\n{sections}".rstrip() + "\n"
 
 
 def _repo_slug(repo: str) -> str:
@@ -247,9 +226,8 @@ def main():
             seeds = serialized["seed"]
             if len(seeds) > 1:
                 multi_seed_instances.append((row["id"], [s.get("function_name") for s in seeds]))
-            prompt_text = _build_prompt(serialized)
             prompts[row["id"]] = {
-                "prompt": prompt_text,
+                "context": _build_context(serialized),
                 "target_functions": [s.get("function_name", "") for s in seeds],
                 "target_classes": [s.get("class_name") or None for s in seeds],
             }
