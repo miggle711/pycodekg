@@ -757,16 +757,12 @@ def _get_signature_and_source_text(
     func_node: Union[ast.FunctionDef, ast.AsyncFunctionDef],
     source_lines: Optional[List[str]],
 ) -> Tuple[str, str]:
-    """Slice a function's own `def` line(s) and full source text out of its
-    enclosing file, via the AST node's line range.
+    """Slice the decorated signature and full function source from its file.
 
-    Both are LLM-facing convenience fields (LLMSerializer renders them
-    directly into a test-generation prompt) -- distinct from `params`,
-    which is structured data for programmatic use. Prior to this, neither
-    was ever populated, so the KG-augmented arm's prompt showed a
-    docstring and a param-name list but never the actual code being
-    tested (see kg-test-generation#51/#25/#28 -- several test-quality
-    bugs trace back to the model never seeing the function's real body).
+    Inline suites are kept whole, including continued expressions, so the
+    signature stays parseable. Block suites stop before the first statement's
+    decorators. The separate source field retains its existing def-to-end
+    range; current kg_only renderers show that source, not the signature.
 
     Returns:
         (signature, source_code) -- both "" if source_lines isn't given,
@@ -778,12 +774,9 @@ def _get_signature_and_source_text(
 
     source_code = "".join(source_lines[func_node.lineno - 1 : func_node.end_lineno])
 
-    # The signature is everything from the `def`/`async def` line up to
-    # (not including) the first body statement -- covers multi-line
-    # signatures (wrapped params) without pulling in the function body.
-    first_body_lineno = func_node.body[0].lineno
-    signature_end = first_body_lineno - 1 if first_body_lineno > func_node.lineno else func_node.lineno
-    signature = "".join(source_lines[func_node.lineno - 1 : signature_end]).rstrip()
+    signature_end = (func_node.end_lineno if _body_on_header_line(func_node, source_lines)
+                     else _stmt_start(func_node.body[0]) - 1)
+    signature = "".join(source_lines[_stmt_start(func_node) - 1:signature_end]).rstrip()
     return signature, source_code
 
 

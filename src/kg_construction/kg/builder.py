@@ -204,7 +204,10 @@ MAX_FILE_LINES = 20000
 # 17: class nodes get 'signature' (the class line) and 'source_code', an
 #    outline of the class: method bodies left out except __init__,
 #    __new__ and __post_init__, capped at 200 lines (#142).
-SCHEMA_VERSION = 17
+# 18: function signatures preserve their own decorators and complete inline
+#    suites, and exclude decorators belonging to a nested first statement.
+#    Function source_code is unchanged.
+SCHEMA_VERSION = 18
 
 
 # A plain dotted name: `utils` or `a.b.c`, with no calls or subscripts.
