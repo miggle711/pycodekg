@@ -3,7 +3,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "scripts"))
 
-from build_kg_prompts import _build_prompt, _related_section, _repo_slug  # noqa: E402
+from build_kg_prompts import _build_context, _related_section, _repo_slug  # noqa: E402
 
 
 def _serialized(seed_overrides=None, related=None):
@@ -30,17 +30,30 @@ def _serialized(seed_overrides=None, related=None):
 
 class TestSeedBlockDocstring:
     def test_docstring_is_rendered(self):
-        prompt = _build_prompt(_serialized({"docstring": "Does the thing."}))
+        prompt = _build_context(_serialized({"docstring": "Does the thing."}))
         assert "Docstring: Does the thing." in prompt
 
     def test_missing_docstring_renders_as_none(self):
-        prompt = _build_prompt(_serialized({"docstring": ""}))
+        prompt = _build_context(_serialized({"docstring": ""}))
         assert "Docstring: (none)" in prompt
+
+
+class TestContextHasNoTaskWording:
+    """The task wording and output format come from testgeneval's shared
+    template, the same for both arms (fyp-paper#5, decision B), so the KG
+    context must not carry its own."""
+
+    def test_context_holds_the_seed_and_no_instructions(self):
+        context = _build_context(_serialized())
+        assert "Function under test: foo" in context
+        assert "def foo(): ..." in context
+        for wording in ("Your job", "Unit test Python code", "test_", "coverage"):
+            assert wording not in context
 
 
 class TestRelatedSection:
     def test_no_related_omits_section_entirely(self):
-        prompt = _build_prompt(_serialized(related=[]))
+        prompt = _build_context(_serialized(related=[]))
         assert "Related classes" not in prompt
 
     def test_parent_class_includes_source_code(self):
