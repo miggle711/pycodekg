@@ -59,6 +59,7 @@ from kg_construction.ast.helpers import (
     _extract_property_accesses,
     _extract_operator_dispatches,
     _collect_local_types,
+    _get_class_outline,
     _get_docstring,
     _get_decorators,
     _get_bare_decorator_names,
@@ -200,11 +201,18 @@ MAX_FILE_LINES = 20000
 #    parents'; a closure's self.m() uses the method's class. A dotted name
 #    or class that can not be followed and matches definitions in several
 #    files gets no edge. Import statements record `asname`.
-# 20: a call of `X.as_view()` in a function also gets calls edges to the
+# 17: class nodes get 'signature' (the class line) and 'source_code', an
+#    outline of the class: method bodies left out except __init__,
+#    __new__ and __post_init__, capped at 200 lines (#142).
+# 18: function signatures preserve their own decorators and complete inline
+#    suites, and exclude decorators belonging to a nested first statement.
+#    Function source_code is unchanged.
+# 19: a call of `X.as_view()` in a function also gets calls edges to the
 #    view's get, post, put, patch, delete and head methods (narrowed to the
-#    ones the function builds a request for), tagged via='as_view'. Numbered
-#    after 17 (#241), 18 (#242) and 19 (#240).
-SCHEMA_VERSION = 20
+#    ones the function builds a request for), tagged via='as_view' (#119).
+#    #240 (originally expected as 19) was deferred before the rebuild and
+#    never merged, so this branch is renumbered from 20 to 19.
+SCHEMA_VERSION = 19
 
 
 # A plain dotted name: `utils` or `a.b.c`, with no calls or subscripts.
@@ -1029,6 +1037,7 @@ def _parse_file(args: Tuple[str, str, str]) -> Optional[Dict]:
         """
         bases = _get_base_names(class_node)
         class_id = _make_id(f"class_{repo}_{rel_path}_{qualname}")
+        class_signature, class_outline = _get_class_outline(class_node, source_lines)
         nodes.append(asdict(KGNode(
             id=class_id, type='class', label=class_node.name,
             metadata={
@@ -1038,6 +1047,8 @@ def _parse_file(args: Tuple[str, str, str]) -> Optional[Dict]:
                 'decorators': _get_decorators(class_node),
                 'docstring': _get_docstring(class_node),
                 'attributes': _get_class_attributes(class_node),
+                'signature': class_signature,
+                'source_code': class_outline,
             }
         )))
         edges.append(asdict(KGEdge(source=container_id, target=class_id, relation='contains')))

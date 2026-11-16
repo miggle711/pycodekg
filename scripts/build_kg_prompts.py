@@ -1,7 +1,7 @@
 """
 build_kg_prompts.py
 
-Pre-computes KG-only test-generation prompts for a set of TestGenEval
+Pre-computes KG context blocks for a set of TestGenEval
 instances, targeting TestGenEval's `full` setting (generate a complete
 test file from scratch, no existing test content shown to either arm).
 
@@ -13,19 +13,23 @@ class), callers/callees/siblings, and related classes it inherits from
 or instantiates.
 
 Also writes each seed's function name (and enclosing class, if any) as a
-separate field per instance, meant to be merged into the `instruct` arm's
-dataset construction on the testgeneval side so both arms can be told to
-focus on the same changed function(s) -- without which the two arms
-answer different tasks (kg_only implicitly focuses on the seed(s);
-instruct's generic `full`-setting prompt does not name any function at
-all). See miggle711/pycodekg#125 and miggle711/testgeneval#6.
+separate field per instance. Testgeneval reads these same targets for both
+arms and adds the shared task text after each arm's context. The context
+here supplies code and structural information; testgeneval owns the system
+message, testing instructions and output-format requirements.
 
 Run from repo-kg-construction's own environment (not testgeneval's --
 pycodekg isn't installed there by design, to keep the two projects'
 dependency stacks decoupled). Writes one JSON file mapping instance id ->
-{prompt, target_functions, target_classes} (both lists, one entry per
+{context, target_functions, target_classes} (both lists, one entry per
 seed), meant to be merged into the dataset on the testgeneval side before
 running inference.
+
+`context` is only the KG-derived context block. The task wording (what to
+test, coverage, error cases, output format) and the system message are
+added on the testgeneval side, from the one template both arms share
+(testgeneval's inference/configs/shared_task.py), so the two arms can not
+drift apart in their instructions (fyp-paper#5, decision B).
 
 Usage:
     python scripts/build_kg_prompts.py \
@@ -36,20 +40,13 @@ Usage:
 
 import argparse
 import json
+import logging
 import sys
 from pathlib import Path
 
 from kg_construction.kg.query import KGQueryEngine
 from kg_construction.extraction.context import TestContextExtractor
 from kg_construction.llm.llm_serializer import LLMSerializer
-
-SYSTEM_MESSAGE = (
-    "You are an expert Python software testing assistant. Your job is to "
-    "generate a complete test file for the given code, using structural "
-    "context about the function under test (no full source file is "
-    "provided -- work from the function's own source and its "
-    "callers/callees/related tests)."
-)
 
 SEED_BLOCK_TEMPLATE = """Function under test: {function_name}
 Module: {module}
@@ -64,22 +61,6 @@ Source:
 Declared exceptions: {exceptions}
 """
 
-PROMPT_TEMPLATE = """{seed_blocks}
-{sections}
-Your job is to output a corresponding unit test file for {function_or_functions} that obtains
-high coverage, including error cases and boundary conditions.
-
-Each unit test must be a function starting with test_. Include all your test imports and setup
-before your first test. Do not run the tests in the file, just output a series of tests. Do not
-include a main method to run the tests.
-
-Only output the unit test Python file in this format:
-
-```python
-Unit test Python code (file level)
-```
-"""
-
 
 def _snippet_section(title: str, items: list) -> str:
     if not items:
@@ -92,9 +73,9 @@ def _snippet_section(title: str, items: list) -> str:
 
 
 def _related_section(items: list) -> str:
-    # related has two entry shapes (parent_class has source_code,
-    # instantiation doesn't), so it needs its own renderer instead of
-    # _snippet_section's single generic shape.
+    # A related class is named with how the seed relates to it, then its
+    # outline (#142). No code block when there is no source (a KG built
+    # before schema 17), rather than an empty one.
     if not items:
         return ""
     parts = ["Related classes:"]
@@ -103,12 +84,11 @@ def _related_section(items: list) -> str:
         module = item.get("module", "")
         via = "the seed" if item.get("source") == "seed" else "the seed's class"
         if item.get("type") == "parent_class":
-            parts.append(
-                f"- {name} ({module}), parent class of {via}:\n"
-                f"```python\n{item.get('source_code', '')}\n```"
-            )
+            line = f"- {name} ({module}), parent class of {via}"
         else:
-            parts.append(f"- {name} ({module}), instantiated by {via}")
+            line = f"- {name} ({module}), instantiated by {via}"
+        code = item.get("source_code", "")
+        parts.append(f"{line}:\n```python\n{code}\n```" if code else line)
     return "\n".join(parts) + "\n"
 
 
@@ -123,7 +103,10 @@ def _build_seed_block(seed: dict) -> str:
     )
 
 
-def _build_prompt(serialized: dict) -> str:
+def _build_context(serialized: dict) -> str:
+    """The KG context block: one block per seed, then callers, callees,
+    sibling methods and related classes. No task wording: testgeneval adds
+    the instructions both arms share."""
     # serialized["seed"] is a list -- a patch can change more than one
     # function/class in the same file (6/66 real django instances do),
     # so every seed gets its own block, not just the first.
@@ -139,11 +122,7 @@ def _build_prompt(serialized: dict) -> str:
         _related_section(context.get("related", [])),
     ]))
 
-    return PROMPT_TEMPLATE.format(
-        seed_blocks=seed_blocks,
-        sections=sections,
-        function_or_functions="this function" if len(seeds) == 1 else "these functions",
-    )
+    return f"{seed_blocks}\n{sections}".rstrip() + "\n"
 
 
 def _repo_slug(repo: str) -> str:
@@ -165,8 +144,15 @@ def main():
     parser.add_argument("--dataset-path", type=str, required=True,
                          help="Local disk path to a saved dataset (load_from_disk).")
     parser.add_argument("--output", type=str, default="kg_prompts.json")
-    parser.add_argument("--depth", type=int, default=2)
+    parser.add_argument("--depth", type=int, default=2,
+                        help="BFS retrieval depth (default 2). Values above 2 expand "
+                             "the subgraph but do not add prompt content with the current serializer.")
     args = parser.parse_args()
+    if args.depth > 2:
+        logging.getLogger(__name__).warning(
+            "BFS depth above 2 expands the retrieved subgraph but does not add prompt content "
+            "with the current serializer. Use depths 1 and 2 for prompt-depth comparisons."
+        )
 
     from datasets import load_from_disk
     ds = load_from_disk(args.dataset_path)
@@ -240,9 +226,8 @@ def main():
             seeds = serialized["seed"]
             if len(seeds) > 1:
                 multi_seed_instances.append((row["id"], [s.get("function_name") for s in seeds]))
-            prompt_text = _build_prompt(serialized)
             prompts[row["id"]] = {
-                "prompt": prompt_text,
+                "context": _build_context(serialized),
                 "target_functions": [s.get("function_name", "") for s in seeds],
                 "target_classes": [s.get("class_name") or None for s in seeds],
             }

@@ -11,6 +11,8 @@ scripts/*
 !scripts/build_kg_prompts.py
 !scripts/aggregate_build_times.py
 !scripts/kg_diff.py
+!scripts/rq1_recheck_labels.py
+!scripts/check_function_signatures.py
 
 # kg_output
 kg_output/

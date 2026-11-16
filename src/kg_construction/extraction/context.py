@@ -268,7 +268,10 @@ class TestContextExtractor:
                 - patch: Unified diff of code changes
                 - code_file: Relative path to code file (e.g. 'requests/sessions.py')
                 - test_file: Relative path to test file (e.g. 'tests/test_sessions.py')
-            depth: BFS depth for context expansion (default 2).
+            depth: BFS depth for context expansion (default 2). The current
+                   LLMSerializer renders only seed-adjacent calls and relations
+                   through the seed's class (at most two hops). A larger depth
+                   can grow this subgraph without adding rendered prompt content.
             edge_filter: Set of edge relations to traverse during BFS.
                         If None, uses smart defaults: contains, calls, inherits, tests, uses.
                         Excludes depends_on (imports) as it is primarily noise for test generation.

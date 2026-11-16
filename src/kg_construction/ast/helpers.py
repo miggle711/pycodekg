@@ -757,16 +757,12 @@ def _get_signature_and_source_text(
     func_node: Union[ast.FunctionDef, ast.AsyncFunctionDef],
     source_lines: Optional[List[str]],
 ) -> Tuple[str, str]:
-    """Slice a function's own `def` line(s) and full source text out of its
-    enclosing file, via the AST node's line range.
+    """Slice the decorated signature and full function source from its file.
 
-    Both are LLM-facing convenience fields (LLMSerializer renders them
-    directly into a test-generation prompt) -- distinct from `params`,
-    which is structured data for programmatic use. Prior to this, neither
-    was ever populated, so the KG-augmented arm's prompt showed a
-    docstring and a param-name list but never the actual code being
-    tested (see kg-test-generation#51/#25/#28 -- several test-quality
-    bugs trace back to the model never seeing the function's real body).
+    Inline suites are kept whole, including continued expressions, so the
+    signature stays parseable. Block suites stop before the first statement's
+    decorators. The separate source field retains its existing def-to-end
+    range; current kg_only renderers show that source, not the signature.
 
     Returns:
         (signature, source_code) -- both "" if source_lines isn't given,
@@ -778,13 +774,96 @@ def _get_signature_and_source_text(
 
     source_code = "".join(source_lines[func_node.lineno - 1 : func_node.end_lineno])
 
-    # The signature is everything from the `def`/`async def` line up to
-    # (not including) the first body statement -- covers multi-line
-    # signatures (wrapped params) without pulling in the function body.
-    first_body_lineno = func_node.body[0].lineno
-    signature_end = first_body_lineno - 1 if first_body_lineno > func_node.lineno else func_node.lineno
-    signature = "".join(source_lines[func_node.lineno - 1 : signature_end]).rstrip()
+    signature_end = (func_node.end_lineno if _body_on_header_line(func_node, source_lines)
+                     else _stmt_start(func_node.body[0]) - 1)
+    signature = "".join(source_lines[_stmt_start(func_node) - 1:signature_end]).rstrip()
     return signature, source_code
+
+
+# Most body lines a class outline keeps; the rest becomes a "# ... N more
+# lines not shown" comment. Measured at the current heads: the cap cuts 35 of
+# Django's 11,140 classes (0.3%, median outline 5 lines) and 70 of SymPy's
+# 2,395 (2.9%, median 23). Django's Model (2,030 lines) outlines to 321 lines
+# and SymPy's Basic (2,199) to 285, so both are cut.
+CLASS_OUTLINE_MAX_LINES = 200
+
+# Methods an outline keeps in full: they say how the class is built.
+_OUTLINE_FULL_METHODS = {'__init__', '__new__', '__post_init__'}
+
+
+def _stmt_start(stmt: ast.stmt) -> int:
+    """First line of a statement, counting its decorators."""
+    return min([d.lineno for d in getattr(stmt, 'decorator_list', [])] + [stmt.lineno])
+
+
+def _body_on_header_line(stmt: ast.stmt, source_lines: List[str]) -> bool:
+    """True when a def or class has its body on the header's last line.
+
+    `def f(): ...`, and the typed-overload form whose signature wraps and
+    closes with `) -> T: ...`. Only simple statements can follow the colon,
+    so such a body is one logical line and the statement is kept whole.
+    """
+    first = stmt.body[0]
+    if getattr(first, 'decorator_list', None):
+        return False  # a decorated statement starts its own line
+    line = source_lines[first.lineno - 1].encode('utf-8')
+    return bool(line[:first.col_offset].strip())
+
+
+def _outline_lines(stmts: List[ast.stmt], source_lines: List[str]) -> List[str]:
+    out: List[str] = []
+    for stmt in stmts:
+        start = _stmt_start(stmt)
+        is_def = isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef))
+        is_class = isinstance(stmt, ast.ClassDef)
+        if (is_def and stmt.name not in _OUTLINE_FULL_METHODS or is_class) \
+                and not _body_on_header_line(stmt, source_lines):
+            # Header lines only (decorators and the def/class line,
+            # wrapped parameters included). The header ends where the first
+            # body statement starts, and that statement's own decorators
+            # are part of it, not of the header.
+            body_start = _stmt_start(stmt.body[0])
+            out.extend(line.rstrip('\n') for line in source_lines[start - 1:body_start - 1])
+            if is_class:
+                out.extend(_outline_lines(stmt.body, source_lines))
+            else:
+                header = source_lines[stmt.lineno - 1]
+                indent = header[:len(header) - len(header.lstrip())]
+                out.append(indent + '    ...')
+        else:
+            out.extend(line.rstrip('\n') for line in source_lines[start - 1:stmt.end_lineno])
+    return out
+
+
+def _get_class_outline(
+    class_node: ast.ClassDef,
+    source_lines: Optional[List[str]],
+    max_lines: int = CLASS_OUTLINE_MAX_LINES,
+) -> Tuple[str, str]:
+    """(header, outline) of a class, for the prompt (pycodekg#142).
+
+    The outline is the class as written, minus method bodies: decorators and
+    the class line, the docstring, class-level statements (attributes,
+    nested classes, Meta), __init__/__new__/__post_init__ in full, and every
+    other method as its signature followed by `...`. A class's full source
+    can be thousands of lines; this keeps what a test writer needs to build
+    and use the class. Both are "" without source_lines.
+    """
+    if not source_lines or not class_node.body:
+        return "", ""
+    start = _stmt_start(class_node)
+    if _body_on_header_line(class_node, source_lines):  # class A: pass
+        text = "".join(source_lines[start - 1:class_node.end_lineno]).rstrip()
+        return text, text
+    first_body = _stmt_start(class_node.body[0])
+    header_lines = [line.rstrip('\n') for line in source_lines[start - 1:first_body - 1]]
+    body_lines = _outline_lines(class_node.body, source_lines)
+    if len(body_lines) > max_lines:
+        first = source_lines[first_body - 1]
+        indent = first[:len(first) - len(first.lstrip())]
+        hidden = len(body_lines) - max_lines
+        body_lines = body_lines[:max_lines] + [f"{indent}# ... {hidden} more lines not shown"]
+    return "\n".join(header_lines).rstrip(), "\n".join(header_lines + body_lines).rstrip()
 
 
 def _get_exceptions(node: Union[ast.FunctionDef, ast.AsyncFunctionDef]) -> Dict:
