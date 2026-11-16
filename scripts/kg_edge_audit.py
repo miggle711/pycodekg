@@ -361,6 +361,11 @@ def audit(kg, flagged=None):
             if not ok and tname.startswith("__") and tname.endswith("__") and (cs.operators or cs.super_call):
                 ok = True
                 notes["call_name: dunder with operator syntax or super()"] += 1
+            if not ok and meta.get("via") == "as_view":
+                # `X.as_view()` dispatches to the view's get, post, ... (#119),
+                # which the caller never names.
+                ok = True
+                notes["call_name: view method reached through as_view()"] += 1
             if not ok:
                 _flag(flagged, "call_name", e)
                 found["call_name"].append((tname, label(e["source"]), label(e["target"]), meta.get("confidence")))

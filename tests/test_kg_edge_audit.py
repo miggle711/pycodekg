@@ -213,3 +213,19 @@ def test_prompt_reach_counts_flagged_edges_at_a_target(kg):
         ("call_name", "x-1", "caller"), ("self_loop", "x-1", "caller")]
     assert summary["instances_matched"] == 1
     assert summary["flagged_reaching_edges"] == 1
+
+
+def test_as_view_edges_are_not_call_name_cases(tmp_path):
+    # X.as_view() reaches get and post, which the caller never names (#119).
+    pkg = tmp_path / "pkg"
+    pkg.mkdir()
+    (pkg / "views.py").write_text(
+        "class V:\n    def get(self, request):\n        return 1\n"
+        "    def post(self, request):\n        return 2\n"
+        "    @classmethod\n    def as_view(cls):\n        return cls()\n")
+    (pkg / "urls.py").write_text("from .views import V\n\ndef routes():\n    return [V.as_view()]\n")
+    kg = RepoKGBuilder(max_workers=1).build_from_dir("fixture__views", tmp_path)
+    assert any((e.get("metadata") or {}).get("via") == "as_view" for e in kg["edges"])
+    broken, counted, notes = _broken(kg)
+    assert broken == {}
+    assert notes["call_name: view method reached through as_view()"] == 2

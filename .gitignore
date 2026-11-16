@@ -12,10 +12,12 @@ scripts/*
 !scripts/aggregate_build_times.py
 !scripts/kg_diff.py
 !scripts/rq1_recheck_labels.py
+!scripts/analyze_module_constants.py
 !scripts/check_function_signatures.py
 !scripts/kg_edge_audit.py
 !scripts/kg_edge_audit_sample.py
 !scripts/kg_edge_audit_prompt_reach.py
+!scripts/measure_chained_receivers.py
 
 # kg_output
 kg_output/

@@ -1,7 +1,7 @@
 """
 build_kg_prompts.py
 
-Pre-computes KG-only test-generation prompts for a set of TestGenEval
+Pre-computes KG context blocks for a set of TestGenEval
 instances, targeting TestGenEval's `full` setting (generate a complete
 test file from scratch, no existing test content shown to either arm).
 
@@ -13,19 +13,23 @@ class), callers/callees/siblings, and related classes it inherits from
 or instantiates.
 
 Also writes each seed's function name (and enclosing class, if any) as a
-separate field per instance, meant to be merged into the `instruct` arm's
-dataset construction on the testgeneval side so both arms can be told to
-focus on the same changed function(s) -- without which the two arms
-answer different tasks (kg_only implicitly focuses on the seed(s);
-instruct's generic `full`-setting prompt does not name any function at
-all). See miggle711/pycodekg#125 and miggle711/testgeneval#6.
+separate field per instance. Testgeneval reads these same targets for both
+arms and adds the shared task text after each arm's context. The context
+here supplies code and structural information; testgeneval owns the system
+message, testing instructions and output-format requirements.
 
 Run from repo-kg-construction's own environment (not testgeneval's --
 pycodekg isn't installed there by design, to keep the two projects'
 dependency stacks decoupled). Writes one JSON file mapping instance id ->
-{prompt, target_functions, target_classes} (both lists, one entry per
+{context, target_functions, target_classes} (both lists, one entry per
 seed), meant to be merged into the dataset on the testgeneval side before
 running inference.
+
+`context` is only the KG-derived context block. The task wording (what to
+test, coverage, error cases, output format) and the system message are
+added on the testgeneval side, from the one template both arms share
+(testgeneval's inference/configs/shared_task.py), so the two arms can not
+drift apart in their instructions (fyp-paper#5, decision B).
 
 Usage:
     python scripts/build_kg_prompts.py \
@@ -44,14 +48,6 @@ from kg_construction.kg.query import KGQueryEngine
 from kg_construction.extraction.context import TestContextExtractor
 from kg_construction.llm.llm_serializer import LLMSerializer
 
-SYSTEM_MESSAGE = (
-    "You are an expert Python software testing assistant. Your job is to "
-    "generate a complete test file for the given code, using structural "
-    "context about the function under test (no full source file is "
-    "provided -- work from the function's own source and its "
-    "callers/callees/related tests)."
-)
-
 SEED_BLOCK_TEMPLATE = """Function under test: {function_name}
 Module: {module}
 Class: {class_name}
@@ -63,22 +59,6 @@ Source:
 ```
 
 Declared exceptions: {exceptions}
-"""
-
-PROMPT_TEMPLATE = """{seed_blocks}
-{sections}
-Your job is to output a corresponding unit test file for {function_or_functions} that obtains
-high coverage, including error cases and boundary conditions.
-
-Each unit test must be a function starting with test_. Include all your test imports and setup
-before your first test. Do not run the tests in the file, just output a series of tests. Do not
-include a main method to run the tests.
-
-Only output the unit test Python file in this format:
-
-```python
-Unit test Python code (file level)
-```
 """
 
 
@@ -123,7 +103,20 @@ def _build_seed_block(seed: dict) -> str:
     )
 
 
-def _build_prompt(serialized: dict) -> str:
+def _constants_section(items: list) -> str:
+    if not items:
+        return ""
+    parts = ["Module constants:"]
+    for item in items:
+        parts.append(f"{item['module']}:\n```python\n{item['source_code']}\n```")
+    return "\n".join(parts) + "\n"
+
+
+def _build_context(serialized: dict) -> str:
+    """The KG context block: one block per seed, the module constants the
+    seeds reference, then callers, callees, sibling methods and related
+    classes. No task wording: testgeneval adds the instructions both arms
+    share."""
     # serialized["seed"] is a list -- a patch can change more than one
     # function/class in the same file (6/66 real django instances do),
     # so every seed gets its own block, not just the first.
@@ -133,17 +126,14 @@ def _build_prompt(serialized: dict) -> str:
     seed_blocks = "\n".join(_build_seed_block(seed) for seed in seeds)
 
     sections = "\n".join(filter(None, [
+        _constants_section(context.get("module_constants", [])),
         _snippet_section("Callers", context.get("callers", [])),
         _snippet_section("Callees", context.get("callees", [])),
         _snippet_section("Sibling methods", context.get("sibling_methods", [])),
         _related_section(context.get("related", [])),
     ]))
 
-    return PROMPT_TEMPLATE.format(
-        seed_blocks=seed_blocks,
-        sections=sections,
-        function_or_functions="this function" if len(seeds) == 1 else "these functions",
-    )
+    return f"{seed_blocks}\n{sections}".rstrip() + "\n"
 
 
 def _repo_slug(repo: str) -> str:
@@ -168,6 +158,10 @@ def main():
     parser.add_argument("--depth", type=int, default=2,
                         help="BFS retrieval depth (default 2). Values above 2 expand "
                              "the subgraph but do not add prompt content with the current serializer.")
+    parser.add_argument("--without-module-constants", action="store_true",
+                        help="Leave out the module constants section. For measuring what "
+                             "the section adds (e.g. against a token budget) from the same "
+                             "KGs and code; prompts for a run keep it.")
     args = parser.parse_args()
     if args.depth > 2:
         logging.getLogger(__name__).warning(
@@ -201,6 +195,10 @@ def main():
     # where extract() itself completed, even if serialization later fails
     # that instance out of `prompts`.
     localization_stats = {}
+    # Instances whose seed-file constants could not be read from the
+    # post-patch file: their prompt has no constants section rather than the
+    # KG's pre-patch values (miggle711/pycodekg#114).
+    constants_unavailable_instances = []
 
     for row in rows:
         repo_slug = _repo_slug(row["repo"])
@@ -230,6 +228,7 @@ def main():
                 "edge_count": context.edge_count,
                 "cross_file_node_proportion": context.cross_file_node_proportion,
                 "relationship_type_counts": context.relationship_type_counts,
+                "constants_unavailable": context.constants_unavailable,
             }
             if context.stale_seed_labels:
                 stale_seed_instances.append((row["id"], context.stale_seed_labels))
@@ -238,8 +237,24 @@ def main():
                 "context_nodes": context.context_nodes,
                 "edges": context.edges,
                 "test_nodes": context.test_nodes,
+                # Fetch independently of BFS depth (a method's file is two
+                # containment hops away, and depth zero has no file context).
+                "file_nodes": [node
+                               for path in sorted({s.get("metadata", {}).get("filepath")
+                                                   or s.get("metadata", {}).get("path")
+                                                   for s in context.seeds} - {None})
+                               for node in engine.find_file_by_path(path, exact=True)],
+                # The seed file's constants from the post-patch file, as an
+                # overlay: the KG's file node keeps its pre-patch values.
+                "post_patch_constants": context.post_patch_constants,
+                "constants_unavailable": context.constants_unavailable,
             }
             serialized = LLMSerializer(repo=row["repo"]).serialize(context_dict)
+            if args.without_module_constants:
+                serialized["context"]["module_constants"] = []
+            if serialized.get("context", {}).get("module_constants_unavailable"):
+                constants_unavailable_instances.append(
+                    (row["id"], serialized["context"]["module_constants_unavailable"]))
             if not serialized.get("seed"):
                 failures.append((row["id"], "no seed extracted"))
                 continue
@@ -247,9 +262,8 @@ def main():
             seeds = serialized["seed"]
             if len(seeds) > 1:
                 multi_seed_instances.append((row["id"], [s.get("function_name") for s in seeds]))
-            prompt_text = _build_prompt(serialized)
             prompts[row["id"]] = {
-                "prompt": prompt_text,
+                "context": _build_context(serialized),
                 "target_functions": [s.get("function_name", "") for s in seeds],
                 "target_classes": [s.get("class_name") or None for s in seeds],
             }
@@ -321,6 +335,13 @@ def main():
         print(f"{len(stale_seed_instances)} instance(s) with a stale (pre-patch) seed:")
         for instance_id, labels in stale_seed_instances:
             print(f"  {instance_id}: {labels}")
+    if constants_unavailable_instances:
+        # The post-patch focal file could not be reconstructed or parsed, so
+        # these prompts show no module constants at all.
+        print(f"{len(constants_unavailable_instances)} instance(s) with no module constants "
+              f"because the post-patch focal file was unavailable:")
+        for instance_id, items in constants_unavailable_instances:
+            print(f"  {instance_id}: " + "; ".join(f"{i['filepath']}: {i['reason']}" for i in items))
     if multi_seed_instances:
         # Real, not rare (6/66 real django instances) -- visible here so
         # a run's actual seed count per instance isn't only discoverable
