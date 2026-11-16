@@ -44,6 +44,21 @@ from kg_construction.extraction.patch import (
 )
 
 
+def post_patch_file_constants(source: Optional[str]) -> Tuple[Optional[Dict[str, str]], Optional[str]]:
+    """Module constants of a post-patch focal file, by the builder's rule
+    (_collect_file_level_info: UPPER_CASE module-level assignments, values as
+    source expressions). Returns (constants, None), or (None, reason) when the
+    post-patch file could not be reconstructed or parsed, so the caller can
+    report it instead of falling back to the KG's pre-patch values."""
+    if source is None:
+        return None, "post-patch focal file could not be reconstructed from the patch"
+    try:
+        tree = ast.parse(source)
+    except SyntaxError as e:
+        return None, f"post-patch focal file does not parse: {e.msg} (line {e.lineno})"
+    return _collect_file_level_info(tree)[2], None
+
+
 @dataclass
 class TestContext:
     """Structured subgraph extracted for test generation.
@@ -60,6 +75,12 @@ class TestContext:
             stored, pre-patch value). Empty in the normal case -- non-empty
             means a real run should look into why, not just that this one
             instance's seed source is stale.
+        post_patch_constants: {focal file path: {NAME: value}} read from the
+            reconstructed post-patch focal file. An overlay for the
+            serializer: the KG's file node (pre-patch) is not changed.
+        constants_unavailable: {focal file path: reason} when the post-patch
+            focal file could not be reconstructed or parsed. The serializer
+            then shows no constants for it rather than pre-patch values.
         pinned_seed_ids: IDs of seeds whose own `def` line is one the patch
             changed, so the seed is that definition and not a guess among
             same-named ones. Two same-named seeds that are both pinned (two
@@ -103,6 +124,8 @@ class TestContext:
     base_commit: str
     stale_seed_labels: List[str] = field(default_factory=list)
     pinned_seed_ids: List[str] = field(default_factory=list)
+    post_patch_constants: Dict[str, Dict[str, str]] = field(default_factory=dict)
+    constants_unavailable: Dict[str, str] = field(default_factory=dict)
     retrieval_time_s: Optional[float] = None
     localization_outcome: Optional[str] = None
     node_count: Optional[int] = None
@@ -125,6 +148,8 @@ class TestContext:
             'test_nodes': self.test_nodes,
             'stale_seed_labels': self.stale_seed_labels,
             'pinned_seed_ids': self.pinned_seed_ids,
+            'post_patch_constants': self.post_patch_constants,
+            'constants_unavailable': self.constants_unavailable,
             'stats': {
                 'num_seeds': len(self.seeds),
                 'num_context_nodes': len(self.context_nodes),
@@ -161,6 +186,8 @@ class TestContext:
             base_commit=data['base_commit'],
             stale_seed_labels=data.get('stale_seed_labels', []),
             pinned_seed_ids=data.get('pinned_seed_ids', []),
+            post_patch_constants=data.get('post_patch_constants', {}),
+            constants_unavailable=data.get('constants_unavailable', {}),
             retrieval_time_s=data.get('retrieval_time_s'),
             localization_outcome=data.get('localization_outcome'),
             node_count=data.get('node_count'),
@@ -325,6 +352,10 @@ class TestContextExtractor:
         post_patch_source = reconstruct_post_patch_source(
             pre_patch_source, instance['patch'], instance['code_file']
         )
+        # The seed's own-file constants follow the same rule as its source:
+        # read from the post-patch file, so a constant the patch adds or
+        # changes is shown as the tests will see it (miggle711/pycodekg#114).
+        file_constants, constants_error = post_patch_file_constants(post_patch_source)
         # Post-patch def nodes, looked up by the same unique qualname the KG
         # node carries in metadata['qualname'] (ast.helpers.assign_qualnames),
         # with the older (label, enclosing class) key as a fallback for KG
@@ -528,6 +559,10 @@ class TestContextExtractor:
             base_commit=instance['base_commit'],
             stale_seed_labels=stale_seed_labels,
             pinned_seed_ids=[n['id'] for n in seed_nodes if n['id'] in pinned_seed_ids],
+            post_patch_constants=({instance['code_file']: file_constants}
+                                  if file_constants is not None else {}),
+            constants_unavailable=({instance['code_file']: constants_error}
+                                   if constants_error else {}),
             localization_outcome=localization_outcome,
             node_count=len(seed_nodes) + len(context_nodes),
             edge_count=len(subgraph_edges),
@@ -635,7 +670,7 @@ class TestContextExtractor:
             )
 
         tree = ast.parse(source)
-        import_map, _, _ = _collect_file_level_info(tree)
+        import_map, _, file_constants = _collect_file_level_info(tree)
         source_lines = split_source_lines(source)
         repo = instance['repo']
         rel_path = instance['code_file']
@@ -690,6 +725,7 @@ class TestContextExtractor:
             repo=instance['repo'],
             base_commit=instance['base_commit'],
             localization_outcome="new_file",
+            post_patch_constants={rel_path: file_constants},
             node_count=len(seed_nodes),
             edge_count=0,
             cross_file_node_proportion=0.0,

@@ -37,7 +37,8 @@ def test_cli_warns_once_for_the_run_and_preserves_requested_depth(depth, tmp_pat
                     "filepath": "module.py", "source_code": "def f(): return 1"}}],
                 context_nodes=[], edges=[], test_nodes=[], retrieval_time_s=0,
                 localization_outcome="exact", node_count=1, edge_count=0,
-                cross_file_node_proportion=0, relationship_type_counts={}, stale_seed_labels=[])
+                cross_file_node_proportion=0, relationship_type_counts={}, stale_seed_labels=[],
+                post_patch_constants={"module.py": {}}, constants_unavailable={})
 
     monkeypatch.setattr(builder, "TestContextExtractor", Extractor)
     output = tmp_path / "prompts.json"
