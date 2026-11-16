@@ -80,7 +80,7 @@ def test_annotated_seed_keeps_source_and_docstring_without_dead_type_hints(tmp_p
     source = 'def f(x: int) -> int:\n    """Return the input."""\n    return x\n'
     result = _serialize(tmp_path, source)
     assert "type_hints" not in result["seed"][0]
-    assert "type_hints" not in result["context"]["patterns"]
+    assert "patterns" not in result["context"]
     prompt = _build_context(result)
     assert "Docstring: Return the input." in prompt
     assert "def f(x: int) -> int:" in prompt

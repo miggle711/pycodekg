@@ -291,7 +291,6 @@ class LLMSerializer:
               flat single-function extraction (the baseline arm) can
               never provide, since it has no notion of "what else does
               this class define" (see issue #50 in kg-test-generation).
-            - patterns: Control flow and error handling patterns
 
         existing_tests is deliberately not included: instruct's full-setting
         prompt shows no existing test content, and full-only generation is
@@ -428,15 +427,11 @@ class LLMSerializer:
                 if len(sibling_methods) < MAX_CONTEXT_ITEMS_PER_CATEGORY:
                     sibling_methods.append(self._node_to_snippet(tgt_node))
 
-        # Extract patterns from seed nodes
-        patterns = self._extract_patterns(seeds, context_nodes)
-
         return {
             "callers": callers,
             "callees": callees,
             "related": related,
             "sibling_methods": sibling_methods,
-            "patterns": patterns,
         }
 
     def _build_instructions_section(self, seeds: List[Dict]) -> Dict:
@@ -483,23 +478,3 @@ class LLMSerializer:
             "docstring": metadata.get("docstring", ""),
             "source_code": metadata.get("source_code", ""),
         }
-
-    def _extract_patterns(self, seeds: List[Dict], context_nodes: List[Dict]) -> Dict:
-        """Extract control-flow and error-handling patterns."""
-        patterns = {
-            "control_flow": [],
-            "error_handling": [],
-        }
-
-        for node in seeds + context_nodes:
-            metadata = node.get("metadata", {})
-
-            # Control flow branches
-            if "branch_count" in metadata:
-                patterns["control_flow"].append(f"Branches: {metadata['branch_count']}")
-
-            # Error handling
-            if "exceptions" in metadata and metadata["exceptions"]:
-                patterns["error_handling"].extend(metadata["exceptions"])
-
-        return patterns
