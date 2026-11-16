@@ -207,11 +207,17 @@ MAX_FILE_LINES = 20000
 # 18: function signatures preserve their own decorators and complete inline
 #    suites, and exclude decorators belonging to a nested first statement.
 #    Function source_code is unchanged.
-# 19: an attribute call on a receiver nothing has typed or imported goes to the
+# 19: a call of `X.as_view()` in a function also gets calls edges to the
+#    view's get, post, put, patch, delete and head methods (narrowed to the
+#    ones the function builds a request for), tagged via='as_view' (#119).
+#    #240 (originally expected as 19) was deferred before the rebuild and
+#    never merged, so this branch is renumbered from 20 to 19.
+# 20: an attribute call on a receiver nothing has typed or imported goes to the
 #    method or class of that name when a plain function shares it, as a
 #    name_only edge. It was dropped as ambiguous before (#202). Numbered after
-#    17 (class outlines, #241) and 18 (function signatures, #242).
-SCHEMA_VERSION = 19
+#    17 (class outlines, #241), 18 (function signatures, #242) and 19
+#    (as_view dispatch, #223).
+SCHEMA_VERSION = 20
 
 
 # A plain dotted name: `utils` or `a.b.c`, with no calls or subscripts.
@@ -298,6 +304,36 @@ class KGEdge:
 # ---------------------------------------------------------------------------
 
 _CALL_CONFIDENCE_RANK = {'qualified': 3, 'exact': 2, 'name_only': 1, 'ambiguous': 0}
+
+# The methods a class based view dispatches an HTTP request to. `X.as_view()`
+# returns a function that builds an X and calls one of these. `options` is
+# left out: the base View defines it for every view.
+_VIEW_HANDLERS = ('get', 'post', 'put', 'patch', 'delete', 'head')
+
+# Receivers that build a request for a view: Django's request factory and test
+# client, under the names tests give them. A dict's `.get(...)` or a DataFrame's
+# `.head()` is not one, so a call named after an HTTP method counts only when
+# its receiver is one of these or its first argument is a URL (a path starting
+# with `/`, or a `reverse(...)`).
+_REQUEST_BUILDER_NAMES = {'rf', 'client', 'async_client', 'async_rf', 'api_client',
+                          'factory', 'request_factory', 'api_rf'}
+_REQUEST_BUILDER_CLASSES = ('RequestFactory', 'AsyncRequestFactory', 'Client',
+                            'AsyncClient', 'APIClient', 'APIRequestFactory')
+
+
+def _builds_view_request(call: ast.Call, receiver: Optional[str]) -> bool:
+    """Whether `call` (named after an HTTP method) builds a request to send to a view."""
+    if not receiver:
+        return False
+    last = receiver.rsplit('.', 1)[-1]
+    if last in _REQUEST_BUILDER_NAMES or last.rstrip('()') in _REQUEST_BUILDER_CLASSES:
+        return True
+    first = call.args[0] if call.args else None
+    if isinstance(first, ast.Constant) and isinstance(first.value, str):
+        return first.value.startswith('/')
+    if isinstance(first, ast.Call):
+        return _extract_callee_name(first) in ('reverse', 'reverse_lazy')
+    return False
 
 
 def _add_call_edge(
@@ -668,6 +704,14 @@ def _parse_file(args: Tuple[str, str, str]) -> Optional[Dict]:
                          same function body twice for the same data.
         """
         own_calls, closure_calls = iter_calls_by_scope(func_node)
+        # HTTP methods this function itself makes calls named after (`rf.put(...)`
+        # builds the request a test sends to a view): they say which of a view's
+        # handlers an `as_view()` call here is meant to reach.
+        called_http_methods = sorted({
+            _extract_callee_name(c) for c in own_calls + closure_calls
+            if _extract_callee_name(c) in _VIEW_HANDLERS
+            and _builds_view_request(c, _extract_call_receiver(c))
+        })
         # Calls in the methods of a class defined inside this function: their
         # self/cls/super() mean that class (#177).
         nested_classes = nested_class_of_calls(func_node)
@@ -790,6 +834,12 @@ def _parse_file(args: Tuple[str, str, str]) -> Optional[Dict]:
                     call_meta['import_via_receiver_path'] = True
                 if in_closure:
                     call_meta['via_closure'] = True
+                if callee == 'as_view' and receiver and not is_super_call:
+                    # `View.as_view()(request)` reaches the view's get/post/...
+                    # in pass 2 (see _resolve_view_handlers).
+                    call_meta['dispatch_class'] = receiver
+                    if called_http_methods:
+                        call_meta['dispatch_methods'] = called_http_methods
                 edges.append(asdict(KGEdge(
                     source=func_id, target=callee, relation='calls', metadata=call_meta
                 )))
@@ -1985,6 +2035,49 @@ class RepoASTParser:
                 return hits, 'exact'
             return hits, 'name_only'
 
+        def _resolve_view_handlers(meta: Dict, source_id: str, caller_filepath: Optional[str]) -> Tuple[List[str], str]:
+            """The get/post/... methods a `X.as_view()` call can dispatch to.
+
+            X must be one class in the repo (an import of it, or the caller's
+            own file, decides between same named classes; otherwise the call
+            is left alone). A handler X does not define is looked up on its
+            in-repo parents. If the caller also calls `put(...)`, `post(...)`
+            and so on, only those handlers count. One handler is certain
+            enough to be `qualified`; with several, which one runs depends on
+            the request, so each is `name_only`.
+            """
+            class_name = meta['dispatch_class'].rsplit('.', 1)[-1]
+            candidates = _visible_from(source_id, class_label_to_ids.get(class_name, []))
+            if len(candidates) > 1:
+                imported = meta.get('import_resolved')
+                if imported and imported.endswith('.as_view'):
+                    candidates = [c for c in qualified_to_ids.get(imported[:-len('.as_view')], [])
+                                  if c in candidates] or candidates
+            if len(candidates) > 1:
+                candidates = [c for c in candidates
+                              if nodes_by_id.get(c, {}).get('metadata', {}).get('filepath') == caller_filepath]
+            if len(candidates) != 1:
+                return [], 'unresolved'
+            class_id = candidates[0]
+            found: Dict[str, str] = {}
+            for name in _VIEW_HANDLERS:
+                own = class_methods_by_id.get((class_id, name), [])
+                if own:
+                    found[name] = own[0]
+                    continue
+                for parent_id in base_ids_by_class.get(class_id, []):
+                    inherited = self._find_nearest_ancestor_method(
+                        parent_id, name, base_ids_by_class, class_methods_by_id)
+                    if inherited is not None:
+                        found[name] = inherited
+                        break
+            # The caller builds a request with one of the HTTP methods: that
+            # is the handler it exercises, if the view has it.
+            wanted = meta.get('dispatch_methods') or []
+            narrowed = {name: hid for name, hid in found.items() if name in wanted}
+            handlers = list((narrowed or found).values())
+            return handlers, 'qualified' if len(handlers) == 1 else 'name_only'
+
         resolved_edges: List[Dict] = []
         seen_edges: Set[Tuple] = set()
         # The resolved calls edge for each (source, target), so a later call
@@ -2012,6 +2105,15 @@ class RepoASTParser:
             if edge['relation'] == 'calls' and meta.get('unresolved'):
                 callee_name = edge['target']
                 caller_filepath = nodes_by_id.get(edge['source'], {}).get('metadata', {}).get('filepath')
+                if meta.get('dispatch_class'):
+                    handlers, handler_confidence = _resolve_view_handlers(meta, edge['source'], caller_filepath)
+                    for handler_id in handlers:
+                        handler_meta = {'confidence': handler_confidence, 'import_resolved': None,
+                                        'via': 'as_view'}
+                        if meta.get('via_closure'):
+                            handler_meta['via_closure'] = True
+                        _add_call_edge(call_edges, resolved_edges, seen_edges,
+                                       edge['source'], handler_id, handler_meta)
                 matches, confidence = _resolve_call(meta, callee_name, caller_filepath, edge['source'])
                 if not matches:
                     continue
