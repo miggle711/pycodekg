@@ -212,7 +212,12 @@ MAX_FILE_LINES = 20000
 #    ones the function builds a request for), tagged via='as_view' (#119).
 #    #240 (originally expected as 19) was deferred before the rebuild and
 #    never merged, so this branch is renumbered from 20 to 19.
-SCHEMA_VERSION = 19
+# 20: an attribute call on a receiver nothing has typed or imported goes to the
+#    method or class of that name when a plain function shares it, as a
+#    name_only edge. It was dropped as ambiguous before (#202). Numbered after
+#    17 (class outlines, #241), 18 (function signatures, #242) and 19
+#    (as_view dispatch, #223).
+SCHEMA_VERSION = 20
 
 
 # A plain dotted name: `utils` or `a.b.c`, with no calls or subscripts.
@@ -1986,6 +1991,22 @@ class RepoASTParser:
                 ]
                 if len(same_file_hits) == 1:
                     return same_file_hits, 'exact'
+
+            # An attribute call (`v.cross(w)`) on a receiver nothing has typed
+            # or imported is a call on an object, so a plain module level
+            # function of that name is not a candidate: those are reached by
+            # a bare name or through an imported module, and both have hints
+            # above. When a method or class shares the name, keep only those,
+            # so the call is not dropped as ambiguous (#202).
+            # Not for self/cls calls: their class is known, so a method that is
+            # not on it or its parents comes from outside the repo, and a
+            # same-named method elsewhere is the wrong one.
+            if (len(hits) > 1 and meta.get('receiver') is not None and not qualified
+                    and not class_hint_id and not class_hint):
+                on_objects = [hid for hid in hits
+                              if nodes_by_id.get(hid, {}).get('type') in ('method', 'class')]
+                if on_objects:
+                    hits = on_objects
 
             if len(hits) != 1:
                 # 0 hits: genuinely nothing in this repo has that name
