@@ -186,6 +186,43 @@ def recheck(row, kg):
     return out
 
 
+# The test-source sample (rq1_test/rq1_test_sample.csv, drawn 14 Oct) names its
+# columns differently from rq1_sample.csv; these are read as the main names.
+TEST_SAMPLE_COLUMNS = {
+    "id": "sample_id", "relation_type": "relation",
+    "source_label": "source_name", "source_path": "source_file", "source_lineno": "source_line",
+    "target_label": "target_name", "target_path": "target_file", "target_lineno": "target_line",
+}
+REQUIRED = ["sample_id", "stratum", "repo", "commit", "relation", "source_type", "source_name",
+            "source_file", "target_type", "target_name", "target_file"]
+# Labels that the test-source sample carries in its own rows.
+IN_FILE_LABEL_COLS, IN_FILE_AGREED_COL = ["label_Mun", "label_Joe"], "agreed_label"
+
+
+def read_sample(path):
+    """Rows of one sample CSV with the main sample's column names. Refuses a
+    file that lacks a column the re-check needs, naming the columns it has."""
+    with open(path, newline="") as f:
+        reader = csv.DictReader(f)
+        header = reader.fieldnames or []
+        rename = {} if "sample_id" in header else TEST_SAMPLE_COLUMNS
+        names = [rename.get(c, c) for c in header]
+        missing = [c for c in REQUIRED if c not in names]
+        if missing:
+            raise ValueError(f"{path}: no column for {', '.join(missing)} (columns: {', '.join(header)})")
+        return [{rename.get(k, k): v for k, v in r.items()} for r in reader]
+
+
+def pick_label(given, agreed):
+    """The agreed label, else the one label given, else 'disagree' if they differ."""
+    given = [g for g in given if g]
+    if agreed:
+        return agreed
+    if len(set(given)) == 1:
+        return given[0]
+    return "disagree" if given else ""
+
+
 def read_labels(path, id_col, label_cols, agreed_col):
     """{sample id: label} from the labelling sheet: the agreed label where
     there is one, otherwise the one annotator's label, otherwise 'disagree'
@@ -196,15 +233,9 @@ def read_labels(path, id_col, label_cols, agreed_col):
             sid = (r.get(id_col) or "").strip()
             if not sid:
                 continue
-            agreed = (r.get(agreed_col) or "").strip()
-            given = [(r.get(c) or "").strip() for c in label_cols]
-            given = [g for g in given if g]
-            if agreed:
-                labels[sid] = agreed
-            elif len(set(given)) == 1:
-                labels[sid] = given[0]
-            elif given:
-                labels[sid] = "disagree"
+            label = pick_label([(r.get(c) or "").strip() for c in label_cols], (r.get(agreed_col) or "").strip())
+            if label:
+                labels[sid] = label
     return labels
 
 
@@ -222,13 +253,22 @@ def main(argv=None):
 
     rows = []
     for path in args.sample:
-        with open(path, newline="") as f:
-            rows.extend(csv.DictReader(f))
+        rows.extend(read_sample(path))
+    seen = Counter(r["sample_id"] for r in rows)
+    dup = sorted(i for i, n in seen.items() if n > 1)
+    if dup:
+        raise ValueError(f"sample ids appear more than once across the sample files: {', '.join(dup[:10])}")
     labels = read_labels(args.labels, args.id_col, args.label_cols, args.agreed_col) if args.labels else {}
+    for r in rows:   # labels carried in the sample itself, where the sheet has none
+        if r["sample_id"] not in labels:
+            label = pick_label([(r.get(c) or "").strip() for c in IN_FILE_LABEL_COLS],
+                               (r.get(IN_FILE_AGREED_COL) or "").strip())
+            if label:
+                labels[r["sample_id"]] = label
 
-    by_kg = defaultdict(list)
+    by_kg = defaultdict(list)   # one group per KG file: the samples give 40- or 12-character commits
     for r in rows:
-        by_kg[(r["repo"], r["commit"])].append(r)
+        by_kg[(r["repo"], r["commit"][:8])].append(r)
 
     report, strata_now = [], Counter()
     for (repo, commit), group in sorted(by_kg.items()):
