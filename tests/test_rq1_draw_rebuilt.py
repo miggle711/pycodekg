@@ -109,3 +109,21 @@ def test_new_id_clashing_with_the_sample_is_refused(tmp_path):
         assert "RQ1-111" in str(e)
     else:
         raise AssertionError("a clashing id was accepted")
+
+
+def test_equal_chance_can_reach_a_cell_the_allocation_rounds_to_zero(tmp_path):
+    # allocation of 1 draw over inherits 3 / uses 2 always takes inherits; equal chance must reach uses
+    seen = set()
+    for seed in range(40):
+        d = tmp_path / str(seed)
+        d.mkdir()
+        rows = dr.main(setup(d, OLD) + ["--seed", str(seed), "--first-id", "111", "--out", str(d / "o.csv"),
+                                        "--draw", "test_resolved_ambiguous=1", "--equal-chance"])
+        assert len(rows) == 1 and ("T0", "X") != (rows[0]["source_name"], rows[0]["target_name"])
+        seen.add(rows[0]["relation"])
+    assert seen == {"inherits", "uses"}
+
+
+def test_census_is_the_same_with_equal_chance(tmp_path):
+    rows = run(tmp_path, "--census", "resolved_ambiguous", "--equal-chance")
+    assert sorted((r["source_name"], r["target_name"]) for r in rows) == [("A", "X"), ("B", "Y")]

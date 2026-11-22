@@ -8,6 +8,11 @@ the edges that replace the gone ones (fyp-paper#5, decision of 21 Nov):
 
   --census STRATUM     every edge of the stratum (resolved_ambiguous: 8)
   --draw STRATUM=N     N edges at random (test_resolved_ambiguous=10)
+  --equal-chance       draw them as one simple random sample of the stratum
+                       (decision of 22 Nov: with 10 draws, the per-cell
+                       allocation gave about 2,000 of the 28,474 edges no
+                       chance of selection, so 10 labels could not stand
+                       for the stratum)
 
 Strata, the test-code rule and the per-cell draw are rq1_sample_stratified.py's
 (11 Oct): edges go to (repository, relation) cells by the largest remainder
@@ -20,7 +25,7 @@ Usage (on M3, in a Slurm job; each KG is up to a few GB in memory):
     python scripts/rq1_draw_rebuilt.py --kg-dir <rebuilt kg_output> \\
         --sample <rq1/v3/rq1_sample.csv> --sample <rq1_test/rq1_test_sample.csv> \\
         --census resolved_ambiguous --draw test_resolved_ambiguous=10 \\
-        --seed 20261121 --first-id 111 --out rq1_new_sample.csv
+        --equal-chance --seed 20261122 --first-id 111 --out rq1_new_sample.csv
 """
 
 import argparse
@@ -113,6 +118,9 @@ def main(argv=None):
                     help="an existing sample CSV; its repos and commits name the KGs, its edges are excluded")
     ap.add_argument("--census", action="append", default=[], help="take every edge of this stratum")
     ap.add_argument("--draw", action="append", default=[], help="STRATUM=N: draw N edges at random")
+    ap.add_argument("--equal-chance", action="store_true",
+                    help="draw as one simple random sample of the stratum, so every edge has the same chance; "
+                         "the per-cell allocation gives cells rounded to 0 no chance at all")
     ap.add_argument("--seed", type=int, required=True)
     ap.add_argument("--first-id", type=int, required=True, help="number of the first new RQ1-NNN id")
     ap.add_argument("--annotator", default="both")
@@ -181,11 +189,17 @@ def main(argv=None):
             print(f"   {key[1]:28s} {key[2]:10s} {len(sc[key]):>7}  taken {k}")
             if k == 0:
                 continue
-            if stratum in draw:
+            if stratum not in draw:
+                rows.extend(sc[key])
+            elif not args.equal_chance:
                 rng = random.Random(f"{args.seed}|{stratum}|{key[1]}|{key[2]}")
                 rows.extend(rng.sample(sc[key], k))
-            else:
-                rows.extend(sc[key])
+        if stratum in draw and args.equal_chance:
+            pool = [r for key in sorted(sc, key=lambda k: (k[1], k[2])) for r in sc[key]]
+            picked = random.Random(f"{args.seed}|{stratum}").sample(pool, draw[stratum])
+            print(f"   equal chance: {draw[stratum]} of {len(pool)} edges at random; by cell: "
+                  f"{dict(Counter((r['repo'], r['relation']) for r in picked))}")
+            rows.extend(picked)
 
     for i, r in enumerate(rows, args.first_id):
         r["sample_id"] = f"RQ1-{i:03d}"
