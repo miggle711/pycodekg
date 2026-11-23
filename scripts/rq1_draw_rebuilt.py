@@ -4,7 +4,8 @@ rq1_recheck_labels.py found that the rebuild (pycodekg#169, 11 Nov) removed
 almost all ambiguous edges: 26 of the 30 sampled resolved_ambiguous edges and
 all 10 sampled test_resolved_ambiguous edges are gone, and resolved_ambiguous
 has 8 edges left in the 11 KGs. The kept labels carry over; this script draws
-the edges that replace the gone ones (fyp-paper#5, decision of 21 Nov):
+the edges that replace the gone ones (fyp-paper#5 section 5, decision of 22 Nov;
+the estimator is recorded there too):
 
   --census STRATUM     every edge of the stratum (resolved_ambiguous: 8)
   --draw STRATUM=N     N edges at random (test_resolved_ambiguous=10)
