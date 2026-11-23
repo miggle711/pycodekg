@@ -152,3 +152,77 @@ def test_csv_written_with_one_row_per_sampled_edge(tmp_path):
     run(tmp_path)
     with open(tmp_path / "out.csv", newline="") as f:
         assert [r["sample_id"] for r in csv.DictReader(f)] == [r["sample_id"] for r in SAMPLE]
+
+
+# The test-source sample's own header, copied from rq1_test/rq1_test_sample.csv on M3 (21 Nov).
+TEST_SAMPLE_HEADER = ("id,assigned_to,repo,commit,stratum,relation_type,confidence,rendered_main,rendered_current,"
+                      "source_type,source_label,source_path,source_lineno,source_url,target_type,target_label,"
+                      "target_path,target_lineno,target_url,source_context,target_context,label_Mun,label_Joe,"
+                      "agreed_label,notes").split(",")
+
+
+def ts_row(i, stratum, rel, conf, s, t, **labels):
+    return {"id": i, "assigned_to": "Mun", "repo": REPO, "commit": COMMIT[:12], "stratum": stratum,
+            "relation_type": rel, "confidence": conf, "source_type": s[0], "source_label": s[1],
+            "source_path": s[2], "source_lineno": s[3], "target_type": t[0], "target_label": t[1],
+            "target_path": t[2], "target_lineno": t[3], **labels}
+
+
+def test_test_source_sample_columns_are_read(tmp_path):
+    kg_dir = tmp_path / "kg"
+    kg_dir.mkdir()
+    (kg_dir / f"kg_django_django_{COMMIT[:8]}.json").write_text(json.dumps(REBUILT))
+    test_sample = write(tmp_path, "t.csv", [
+        ts_row("81", "test_resolved_confident", "inherits", "ambiguous", FIELD, TESTMODEL, label_Mun="correct"),
+        ts_row("82", "test_resolved_confident", "calls", "exact", SAVE, HELPER,
+                 label_Mun="incorrect", label_Joe="correct", agreed_label="incorrect"),
+    ], TEST_SAMPLE_HEADER)
+    rep = {r["sample_id"]: r for r in rc.main([
+        "--kg-dir", str(kg_dir), "--sample", write(tmp_path, "s.csv", SAMPLE, SAMPLE_COLS),
+        "--sample", test_sample, "--out", str(tmp_path / "o.csv")])}
+    assert len(rep) == len(SAMPLE) + 2
+    assert rep["81"]["status"] == "kept_restratified"            # edge there; its source is not test code now
+    assert rep["81"]["stratum_now"] == "resolved_ambiguous"
+    assert rep["81"]["source"] == "Field (django/db/models/fields.py)"
+    assert rep["82"]["status"] == "kept_restratified"
+    assert (rep["81"]["label"], rep["82"]["label"]) == ("correct", "incorrect")
+    assert rep["RQ1-001"]["status"] == "kept"                     # the main sample is unaffected
+
+
+def test_short_and_full_commit_load_one_kg_once(tmp_path, capsys):
+    # the test-source sample gives 12-character commits, the main sample 40: same KG, counted once
+    kg_dir = tmp_path / "kg"
+    kg_dir.mkdir()
+    (kg_dir / f"kg_django_django_{COMMIT[:8]}.json").write_text(json.dumps(REBUILT))
+    test_sample = write(tmp_path, "t.csv", [ts_row("81", "test_syntactic", "contains", "", MODEL, SAVE)],
+                        TEST_SAMPLE_HEADER)
+    rc.main(["--kg-dir", str(kg_dir), "--sample", write(tmp_path, "s.csv", SAMPLE, SAMPLE_COLS),
+             "--sample", test_sample, "--out", str(tmp_path / "o.csv")])
+    out = capsys.readouterr().out
+    assert out.count("kg_django_django_98cfb901.json") == 1
+    assert "resolved_confident         sample's              now          3" in out
+
+
+def test_sample_missing_a_needed_column_is_refused(tmp_path):
+    cols = [c for c in SAMPLE_COLS if c != "source_name"]
+    bad = write(tmp_path, "s.csv", [{k: v for k, v in r.items() if k in cols} for r in SAMPLE], cols)
+    kg_dir = tmp_path / "kg"
+    kg_dir.mkdir()
+    try:
+        rc.main(["--kg-dir", str(kg_dir), "--sample", bad, "--out", str(tmp_path / "o.csv")])
+    except ValueError as e:
+        assert "source_name" in str(e)
+    else:
+        raise AssertionError("a sample without source_name was accepted")
+
+
+def test_duplicate_sample_ids_are_refused(tmp_path):
+    kg_dir = tmp_path / "kg"
+    kg_dir.mkdir()
+    s = write(tmp_path, "s.csv", SAMPLE, SAMPLE_COLS)
+    try:
+        rc.main(["--kg-dir", str(kg_dir), "--sample", s, "--sample", s, "--out", str(tmp_path / "o.csv")])
+    except ValueError as e:
+        assert "RQ1-001" in str(e)
+    else:
+        raise AssertionError("duplicate sample ids were accepted")
